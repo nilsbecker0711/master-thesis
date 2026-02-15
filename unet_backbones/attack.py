@@ -222,7 +222,8 @@ def main(args):
     model = nn.Sequential(Normalize(mean = mean, std = std), model)
 
     if args.path is not None:
-        checkpoint = torch.load(args.path)
+        #TODO: Change cpu execution!
+        checkpoint = torch.load(args.path, map_location=torch.device("cpu"))
         model.load_state_dict(checkpoint['model_state_dict'])       
     
     params = [p for p in model.parameters() if p.requires_grad]

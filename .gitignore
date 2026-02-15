@@ -4,6 +4,8 @@ unet_backbones/slurm/*
 unet_backbones/experiments/*
 unet_backbones/results/*
 unet_backbones/datasets/data/*
+/datasets/
+/pychache/
 *.zip
 *.png
 *.pt
@@ -14,6 +16,8 @@ unet_backbones/datasets/data/*
 __pycache__/
 *.py[cod]
 *$py.class
+*.pyc
+*.cpython*
 
 # C extensions
 *.so

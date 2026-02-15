@@ -160,7 +160,7 @@ def main(args):
     random.seed(seed) """
     set_seed(args.seed)
     dataset_path={"pascalvoc2012": {"num_classes":21, "data_root": "datasets/data/VOCdevkit/VOC2012", "crop_size":256},
-            "cityscapes": {"num_classes":19, "data_root": "datasets/data/cityscapes", "crop_size":512}}
+            "cityscapes": {"num_classes":19, "data_root": "datasets/data", "crop_size":512}}
 
     args.data_root = dataset_path[args.dataset]["data_root"] 
     args.crop_size = dataset_path[args.dataset]["crop_size"] 
