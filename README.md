@@ -47,3 +47,5 @@ Or the following plain text citation:
 ```
 Agnihotri, S., Jung, S. &; Keuper, M.. (2024). CosPGD: an efficient white-box adversarial attack for pixel-wise prediction tasks. Proceedings of the 41st International Conference on Machine Learning, in Proceedings of Machine Learning Research 235:416–451 Available from proceedings.mlr.press/v235/agnihotri24b.html.
 ```
+--
+Workspace Path:  /pfs/work9/workspace/scratch/ma_nilbecke-master_thesis
