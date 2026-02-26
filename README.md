@@ -49,4 +49,5 @@ Agnihotri, S., Jung, S. &; Keuper, M.. (2024). CosPGD: an efficient white-box ad
 ```
 --
 Workspace Path:  /pfs/work9/workspace/scratch/ma_nilbecke-master_thesis
-Conda Path: /pfs/data6/home/ma/ma_ma/ma_nilbecke/miniforge3
+
+Conda Path: /pfs/work9/workspace/scratch/ma_nilbecke-master_thesis/miniforge3
