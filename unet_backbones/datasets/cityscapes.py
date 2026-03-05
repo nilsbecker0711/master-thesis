@@ -71,9 +71,7 @@ class Cityscapes(data.Dataset):
     #id_to_train_id = np.array([c.category_id for c in classes], dtype='uint8') - 1
 
     def __init__(self, root, split='train', mode='fine', target_type='semantic', transform=None):
-        #self.root = os.path.expanduser(root)
-        #changed for workspace path
-        self.root = " /pfs/work9/workspace/scratch/ma_nilbecke-master_thesis"
+        self.root = os.path.expanduser(root)
         self.mode = 'gtFine'
         self.target_type = target_type
         self.images_dir = os.path.join(self.root, 'leftImg8bit', split)
