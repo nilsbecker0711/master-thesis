@@ -72,6 +72,7 @@ class Cityscapes(data.Dataset):
 
     def __init__(self, root, split='train', mode='fine', target_type='semantic', transform=None):
         self.root = os.path.expanduser(root)
+        print(self.root)
         self.mode = 'gtFine'
         self.target_type = target_type
         self.images_dir = os.path.join(self.root, 'leftImg8bit', split)
@@ -88,6 +89,8 @@ class Cityscapes(data.Dataset):
                              ' or split="val"')
         print(self.images_dir)
         print(self.targets_dir)
+        print(not os.path.isdir(self.images_dir))
+        print(not os.path.isdir(self.targets_dir))
         if not os.path.isdir(self.images_dir) or not os.path.isdir(self.targets_dir):
             raise RuntimeError('Dataset not found or incomplete. Please make sure all required folders for the'
                                ' specified "split" and "mode" are inside the "root" directory')
