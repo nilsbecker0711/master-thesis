@@ -43,7 +43,13 @@ from . import lap as lap_mod
 from . import placement as placement_mod
 from . import shape as shape_mod
 
-MODES = ("raw", "gan", "raw_ganinit", "lap")
+# 'conditional' is not selectable from any CLI — add_patch_args() deliberately
+# does not list it. It exists so ONE generated patch can be frozen into a Patch
+# (conditional_generator.as_patch) and pushed through the existing diagnostic
+# suite unchanged. Behaviourally it is identical to 'raw': sigmoid rendering,
+# no regularisers, no reference. Only the label differs, so diagnostics.txt
+# reports the run's real provenance instead of claiming patch_mode=raw.
+MODES = ("raw", "gan", "raw_ganinit", "lap", "conditional")
 
 
 @dataclass
