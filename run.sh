@@ -35,7 +35,7 @@ python --version
     #--lap_freeze_edges --lap_edge_thresh 0.15 --target_class 13 \
 python scripts/train.py \
     --arch segformer \
-    --cityscapes_root /hkfs/work/workspace/scratch/ma_nilbecke-thesis/data/cityscapes \
+    --cityscapes_root /pfs/work9/workspace/scratch/ma_nilbecke-thesis/data/cityscapes \
     --patch_mode lap --loss_fn ce \
     --reference refs/sign_cut.png \
     --shape alpha \

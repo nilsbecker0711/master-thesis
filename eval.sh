@@ -39,4 +39,4 @@ CS="/hkfs/work/workspace/scratch/ma_nilbecke-thesis/data/cityscapes"
  #       --arch segformer --cityscapes_root ${CS} --img_h 512 --img_w 1024
 
 python scripts/evaluate.py --checkpoint "/hkfs/work/workspace/scratch/ma_nilbecke-thesis/patch-reach/results/runs/segformer_lap_cospgd_512x1024_a0_smoke_s42/best.pt" \
-        --arch segformer --cityscapes_root "/hkfs/work/workspace/scratch/ma_nilbecke-thesis/data/cityscapes" --img_h 512 --img_w 1024
+        --arch segformer --cityscapes_root "/pfs/work9/workspace/scratch/ma_nilbecke-thesis/data/cityscapes" --img_h 512 --img_w 1024
