@@ -1,0 +1,119 @@
+# Block F — image-conditioned patch generator.
+#
+# A DIFFERENT THREAT MODEL FROM BLOCKS A-E, not another rung on the realism
+# ladder. Blocks A-E optimise ONE patch tensor (universal, or per-image in
+# overfit.py). Here theta is shared across the dataset and the PATCH is a
+# function of the image:
+#
+#     p_i = G_theta(x_i, r_i, M_i)
+#
+# so an unseen image is attacked with a forward pass and no test-time
+# optimisation. Numbers from this block are NOT comparable with universal-patch
+# numbers from train.py, and not with per-image numbers from overfit.py either.
+# Report the three side by side as baselines A / B / C, never merged.
+#
+# HYPOTHESIS (nothing stronger is claimed until measured):
+#   we investigate whether image-conditioned generation combined with
+#   segmentation-specific sensitivity localisation and LAP constraints can
+#   produce more perceptually coherent adversarial patches for semantic
+#   segmentation.
+#
+# Run with:
+#   python scripts/train_conditional_generator.py \
+#       --config configs/experiments/F_conditional_generator.yaml \
+#       --cityscapes_root $CS --gen_placement gradcam --tag B-gradcam
+#
+# The `sweep` block below is DOCUMENTATION of the intended ablations, in the
+# same style as E_realism.yaml — the loader reads scalar keys only, so launch
+# each rung as its own command with the flags shown.
+
+arch: segformer
+loss_fn: cospgd
+img_h: 512
+img_w: 1024
+epochs: 30
+batch_size: 4
+lr: 2.0e-4
+exclude_footprint: true
+
+patch_size: 128
+patch_scale: 0.25
+
+gen_cond: image+ref+cam
+gen_residual: logit
+gen_depth: 3
+gen_base_ch: 32
+gen_noise_dim: 0          # deterministic generation
+
+cam_objective: attack     # S_seg = -L_cospgd, i.e. the attack's own objective
+cam_target: pred          # LABEL-FREE: the model's own argmax, matching the
+                          # assumption --placement semantic already makes.
+                          # 'gt' is a strictly stronger attacker — declare it.
+cam_layer: -1
+cam_module: backbone
+
+gen_placement: gradcam
+gen_lap_alpha: 0.0        # see the note under rungs C/D before changing
+gen_lap_beta: 0.0
+gen_lap_gamma: 0.0
+
+val_images: 20
+val_every: 1
+panel_images: "0 2 5"
+
+sweep:
+  # ── A vs B: does sensitivity-guided localisation contribute anything? ─────
+  - {gen_placement: center,  tag: A-center}
+  - {gen_placement: gradcam, tag: B-gradcam}
+
+  # ── C vs D: the LAP constraint ────────────────────────────────────────────
+  # D (alpha=0) is the DEFAULT and must be run FIRST. L_rat and L_tv are SUMS
+  # over the patch (1e2-1e4) while the attack losses are per-pixel MEANS
+  # (1e-2 to 20), so copying Tan et al.'s alpha=1e-4 lets the constraint swamp
+  # the attack by orders of magnitude. Read alpha from the END-OF-RUN
+  # magnitude report of rung D, NOT the step-1 one: the generator head is
+  # zero-initialised, so p_i == r_i exactly at step 0 and L_rat is identically
+  # zero there. The values below are PLACEHOLDERS until that report exists.
+  - {gen_lap_alpha: 0.0,  tag: D-no-lap}
+  - {gen_lap_alpha: 1.0,  tag: C-lap-a1}
+  - {gen_lap_alpha: 5.0,  tag: C-lap-a5}
+
+  # ── E: conditioning ───────────────────────────────────────────────────────
+  # r_i stays the residual BASE in every setting, so this varies what the
+  # generator KNOWS, not how its output is parameterised.
+  - {gen_cond: image,           tag: E-image}
+  - {gen_cond: image+ref,       tag: E-image-ref}
+  - {gen_cond: image+ref+cam,   tag: E-image-ref-cam}
+
+  # ── F: the segmentation target of the sensitivity map ─────────────────────
+  - {cam_objective: attack,        tag: F-attack}
+  - {cam_objective: ce,            tag: F-ce}
+  - {cam_objective: ipatch_cospgd, target_class: 8, tag: F-ipatch-veg}
+  - {cam_target: gt,               tag: F-label-aware}
+
+# ── baselines to report alongside every rung ────────────────────────────────
+# A  p_i = r_i, no generator. Measured automatically at the start of every
+#    training run (--eval_baseline_reference, on by default) AND standalone:
+#
+#      python scripts/export_conditional_patches.py --method reference \
+#          --arch segformer --cityscapes_root $CS --images fixed10
+#
+# B  per-image direct optimisation — the approximate upper bound. A DIFFERENT
+#    procedure (it runs gradient descent per image), so it is not launched from
+#    here. Match patch geometry or the comparison is confounded by patch AREA:
+#
+#      python scripts/overfit.py --arch segformer --cityscapes_root $CS \
+#          --patch_mode raw --loss_fn cospgd --image 2 --steps 300 \
+#          --patch_size 128 --patch_scale 0.25
+#
+# C  the generator itself, evaluated with NO test-time optimisation:
+#
+#      python scripts/export_conditional_patches.py \
+#          --checkpoint results/conditional/<run_id>/checkpoints/best.pt \
+#          --arch segformer --cityscapes_root $CS --images fixed10
+#
+# Optional isolation of the localisation contribution — no retraining needed,
+# the placement policy is an evaluation-time override:
+#
+#      python scripts/export_conditional_patches.py \
+#          --checkpoint <same> --gen_placement center ...
