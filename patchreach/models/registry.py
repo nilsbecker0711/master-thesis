@@ -50,7 +50,8 @@ class ArchSpec:
         return BRACKETS.get(self.bracket, self.bracket)
 
 
-_W = "/hkfs/work/workspace/scratch/ma_nilbecke-thesis"
+_W = "/pfs/work9/workspace/scratch/ma_nilbecke-thesis"
+#/pfs/work9/workspace/scratch/ma_nilbecke-thesis/master-thesis
 
 REGISTRY = {
     # ── DCNv3, no global attention ───────────────────────────────────────────
