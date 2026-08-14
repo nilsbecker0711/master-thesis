@@ -20,9 +20,10 @@ module --ignore_cache load "cuda/11.8"
 # initialize YOUR conda
 
 source ~/miniconda3/etc/profile.d/conda.sh
-conda activate /hkfs/work/workspace/scratch/ma_nilbecke-thesis/miniconda3/envs/thesis_backup2
-export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/hkfs/work/workspace/scratch/ma_nilbecke-thesis/miniconda3/lib
-export CS=/hkfs/work/workspace/scratch/ma_nilbecke-thesis/data/cityscapes
+conda activate /pfs/work9/workspace/scratch/ma_nilbecke-thesis/miniconda3/envs/thesis_backup3
+export PYTHONNOUSERSITE=1
+export LD_LIBRARY_PATH=$/pfs/work9/workspace/scratch/ma_nilbecke-thesis/miniconda3/lib
+export CS=/pfs/work9/workspace/scratch/ma_nilbecke-thesis/data/cityscapes
 export RES="--img_h 512 --img_w 1024"     # revisit after Phase 0.1
 export BASE="--arch segformer --cityscapes_root $CS"
 echo "Python path:"
