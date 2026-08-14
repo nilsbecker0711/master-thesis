@@ -597,6 +597,50 @@ def lpips_distances(metric, patches: torch.Tensor, references: torch.Tensor
 
 
 # ═════════════════════════════════════════════════════════════════════════════
+#  Diagnostics bridge
+# ═════════════════════════════════════════════════════════════════════════════
+
+def as_patch(patch01: torch.Tensor, placement: Tuple[int, int], scale: float,
+             device, mean_t, std_t, reference: Optional[torch.Tensor] = None):
+    r"""
+    Freeze ONE generated patch into a real `Patch` object.
+
+    WHY THIS EXISTS
+    ---------------
+    For a single image the generator's output IS a patch plus a placement —
+    exactly what `Patch` already models. Freezing it into one lets the ENTIRE
+    existing diagnostic suite (report.run, report.panels_for_images, the ERF
+    probe, reach curves, confusion/flow tables, margin and entropy figures) run
+    on the conditional attack with no parallel implementation and no changes to
+    diagnostics code.
+
+    The alternative — a duck-typed adapter — would have to re-expose .param,
+    .apply(), .render(), .cfg, .placement and .shape_mask, and would silently
+    drift from Patch's semantics. This returns the real thing instead.
+
+    `param` is seeded through logit_seed so sigmoid(param) == patch01 exactly,
+    which matters for the ERF probe: geometric.receptive_field() overwrites
+    param with noise and restores it afterwards, so the probe measures the
+    architecture's reach AT THE PLACEMENT THE GENERATOR CHOSE. That is the
+    correct control for this attack and is directly comparable with the probe
+    run for every other patch mode.
+
+    NOT for training or checkpointing — it is a diagnostic snapshot of one
+    image's result. The generator is the model; this is one of its outputs.
+    """
+    from .spec import Patch, PatchConfig
+
+    S = int(patch01.shape[-1])
+    obj = Patch(PatchConfig(mode="conditional", size=S, scale=scale),
+                device, mean_t, std_t)
+    obj.param = lap_mod.logit_seed(patch01.detach()).clone()
+    obj.placement = (int(placement[0]), int(placement[1]))
+    if reference is not None:
+        obj.reference = reference.detach()
+    return obj
+
+
+# ═════════════════════════════════════════════════════════════════════════════
 #  Checkpointing
 # ═════════════════════════════════════════════════════════════════════════════
 

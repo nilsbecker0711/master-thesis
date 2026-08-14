@@ -62,7 +62,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from _common import (add_model_args, add_generator_args, build_generator_config,
                      setup_model)
 from patchreach.data.cityscapes import CityscapesSeg, norm_tensors, upsample_to
-from patchreach.diagnostics import conditional as cviz
+from patchreach.diagnostics import conditional as cviz, report
 from patchreach.losses import adversarial
 from patchreach.metrics.miou import SegMetric
 from patchreach.patch import conditional_generator as cg
@@ -110,6 +110,14 @@ def build_parser():
     p.add_argument("--panel_images", type=str, default="0 2 5",
                    help="val indices to render the full panel for at every "
                         "validation. '' disables.")
+    # Same two flags train.py uses, same meaning, so a conditional run leaves
+    # the same figure suite behind as every other experiment block.
+    p.add_argument("--diag_image", type=int, default=2,
+                   help="val image used for the post-training figure suite "
+                        "(ERF probe, reach curves, confusion/margin).")
+    p.add_argument("--no_diagnostics", action="store_true",
+                   help="skip the post-training figure suite. The ERF probe "
+                        "costs n_probes extra forward passes.")
     p.add_argument("--lpips_net", default="alex", choices=["alex", "vgg", "squeeze"])
     p.add_argument("--no_lpips", action="store_true",
                    help="skip the perceptual metric. It is EVALUATION ONLY in "
@@ -260,6 +268,73 @@ def summarise(tag: str, ev: dict, target_class=None, log=print):
 # ═════════════════════════════════════════════════════════════════════════════
 #  Panels
 # ═════════════════════════════════════════════════════════════════════════════
+
+def frozen_patch_for(attack, dataset, idx, device, scale):
+    """
+    (img, label, Patch, ConditionalAttack output) for ONE validation image.
+
+    The generator's result for a single image IS a patch plus a placement, so
+    it is frozen into a real Patch and handed to the EXISTING diagnostic suite
+    unchanged — same figures, same ERF probe, same reach curves as every other
+    patch mode, and therefore directly comparable with them.
+    """
+    img, label = dataset[idx]
+    img = img.unsqueeze(0).to(device)
+    label = label.unsqueeze(0).to(device)
+    was_training = attack.generator.training if attack.generator else False
+    if attack.generator is not None:
+        attack.generator.eval()
+    with torch.no_grad():
+        out = attack(img, label, deterministic_noise=True)
+    if was_training and attack.generator is not None:
+        attack.generator.train()
+    patch = cg.as_patch(out["patches"][0], out["placements"][0], scale, device,
+                        attack.mean_t, attack.std_t,
+                        reference=out["references"][0])
+    return img, label, patch, out
+
+
+def per_class_panels(attack, model, dataset, indices, device, out_dir, a, tgt,
+                     mean_t, std_t, log=print):
+    """
+    The standard labelled panels + per-class IoU chart, per image.
+
+    report.panels_for_images() takes ONE patch for the whole list, which is the
+    assumption this attack breaks — so it is called once per image with that
+    image's own frozen patch. img_h is passed as None deliberately: the
+    generator already resolved placement from its sensitivity map, and letting
+    panels_for_images re-resolve it would overwrite that with the `center`
+    default and silently mis-report where the patch actually sat.
+    """
+    out = {}
+    for i in indices:
+        _, _, patch, _ = frozen_patch_for(attack, dataset, i, device,
+                                          a.patch_scale)
+        out.update(report.panels_for_images(
+            model, dataset, [i], patch, out_dir, mean_t, std_t,
+            a.num_classes, tgt, None, None, log=log))
+    return out
+
+
+def run_diagnostics(attack, model, dataset, idx, device, out_dir, a, tgt,
+                    mean_t, std_t, log=print):
+    """
+    The full diagnostic suite on ONE image — ERF probe, reach curves, confusion
+    or margin suite, entropy, winner margin.
+
+    The ERF probe overwrites the frozen patch's param with random noise and
+    restores it, so it measures the architecture's reach AT THE PLACEMENT THE
+    GENERATOR CHOSE. Under `--gen_placement gradcam` that is the honest control:
+    it answers "how far could ANY patch reach from here", separating the
+    geometric ceiling from what this generator achieved.
+    """
+    img, label, patch, out = frozen_patch_for(attack, dataset, idx, device,
+                                              a.patch_scale)
+    log(f"\n[diag] val image #{idx}  placement {tuple(out['placements'][0])}  "
+        f"patch {out['patch_side']}px")
+    return report.run(model, img, label, patch, out_dir, a.loss_fn,
+                      a.num_classes, tgt, mean_t, std_t, log=log)
+
 
 def render_panels(attack, dataset, indices, device, out_dir, mean_t, std_t,
                   title="", log=print):
@@ -529,13 +604,38 @@ def main():
         "wall_clock_s": time.time() - t0,
         "history": history,
     }
-    with open(out_dir / "results.json", "w") as f:
-        json.dump(results, f, indent=2)
-
     if panel_idx:
         render_panels(attack, val_full, panel_idx, device,
                       out_dir / "panels" / "final", mean_t, std_t,
                       title="final")
+
+    # ── labelled figures, same suite as train.py ────────────────────────────
+    # Panel (b) is the CLEAN PREDICTION rather than ground truth: the attack's
+    # effect is (clean pred -> adv pred), and scoring against GT would fold the
+    # model's own errors into what reads as attack damage.
+    if panel_idx:
+        print(f"\n[panels] rendering {len(panel_idx)} labelled image(s)")
+        results["per_class_iou"] = {
+            str(k): v for k, v in per_class_panels(
+                attack, model, val_full, panel_idx, device,
+                out_dir / "panels" / "labelled", a, tgt, mean_t,
+                std_t).items()}
+
+    # ── post-training figure suite ──────────────────────────────────────────
+    # Numbers alone do not show WHERE the attack acted or WHAT it converted
+    # pixels into, and for this attack family they also cannot show whether the
+    # sensitivity-guided placement bought anything. The ERF probe answers the
+    # second question directly.
+    if not a.no_diagnostics and a.diag_image < len(val_full):
+        print("\n" + "=" * 70)
+        print(f" FIGURES on val image #{a.diag_image}")
+        print("=" * 70)
+        results["diagnostics"] = run_diagnostics(
+            attack, model, val_full, a.diag_image, device,
+            out_dir / "diagnostics", a, tgt, mean_t, std_t)
+
+    with open(out_dir / "results.json", "w") as f:
+        json.dump(results, f, indent=2)
     cam.close()
 
     # ── report ──────────────────────────────────────────────────────────────
