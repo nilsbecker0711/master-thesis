@@ -1,0 +1,29 @@
+# Block E — realism ladder. InternImage ONLY.
+#
+# SegFormer is saturated (99.9% flip with a plain square), so it has no headroom
+# to show the cost of any constraint — every rung would read "no effect".
+# InternImage at ~21% has room in both directions.
+#
+# Each rung adds one constraint. Report drop_remote, any_flip_rate,
+# ASI/AGI/ADE, silhouette_frac and placement_px at every rung: the deliverable
+# is a quantified cost curve, not "we made it look realistic".
+arch: internimage
+loss_fn: cospgd
+img_h: 512
+img_w: 1024
+epochs: 100
+exclude_footprint: true
+reference: refs/pothole.png
+
+sweep:
+  - {patch_mode: raw,  tag: rung1-baseline}
+  - {patch_mode: lap,  lap_alpha: 0,     tag: rung2-init-only}
+  # alpha values are PLACEHOLDERS. Run rung 2 first and read the suggested
+  # weights from its magnitude_report — the paper's 1e-4 is calibrated to
+  # YOLO-scale summed losses and is 3-5 orders too large here.
+  - {patch_mode: lap,  lap_alpha: 4e-6,  tag: rung3a}
+  - {patch_mode: lap,  lap_alpha: 1e-5,  tag: rung3b}
+  - {patch_mode: lap,  lap_alpha: 5e-5,  tag: rung3c}
+  - {patch_mode: lap,  lap_alpha: 1e-5, shape: auto, tag: rung4-shape}
+  - {patch_mode: lap,  lap_alpha: 1e-5, shape: auto,
+     placement: semantic, placement_class: 0, tag: rung5-pothole}

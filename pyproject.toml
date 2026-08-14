@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "patchreach"
+version = "0.1.0"
+description = "Geometric and semantic bounds on adversarial patch reach in semantic segmentation"
+requires-python = ">=3.9"
+# torch / mmcv / mmseg are NOT listed: they are pinned by the cluster conda
+# environment (torch 1.11 + mmcv 1.x + mmseg 0.x) and pip would happily install
+# an incompatible newer set.
+dependencies = ["numpy", "pillow", "pyyaml", "pandas", "matplotlib", "tqdm"]
+
+[tool.setuptools.packages.find]
+include = ["patchreach*"]
