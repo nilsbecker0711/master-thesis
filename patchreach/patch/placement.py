@@ -24,6 +24,48 @@ import torch.nn.functional as F
 
 
 @torch.no_grad()
+def find_max_response_placement(score_map: torch.Tensor, p: int,
+                                centre_if_constant: bool = False
+                                ) -> Tuple[int, int]:
+    r"""
+    Top-left of the p x p window with the highest MEAN response.
+
+        (top, left) = argmax_{(u,v)} MeanPool( score_map[u:u+p, v:v+p] )
+
+    score_map : [H,W] float, any non-negative response — a class indicator
+                (semantic placement) or a normalised sensitivity map (gradcam
+                placement). An average-pool with kernel p and stride 1 IS the
+                windowed mean at every position, so one argmax finishes it.
+
+    centre_if_constant : tie-break for a CONSTANT map, where every window
+                scores identically. argmax then returns index 0 — the top-left
+                corner — which reads as a deliberate placement and is not.
+
+                DEFAULT False, which reproduces the historical behaviour of
+                find_semantic_placement() EXACTLY. That path can hit a constant
+                map when the target class covers the whole prediction, and
+                changing where the patch lands in that case would silently
+                alter existing semantic-placement runs.
+
+                The gradcam path passes True: a fully-suppressed Grad-CAM (ReLU
+                zeroed every channel) produces a constant map, and there the
+                map carries no localisation information at all, so falling back
+                to the documented default position is the honest choice.
+    """
+    H, W = score_map.shape
+    if p >= H or p >= W:
+        return 0, 0
+    if centre_if_constant and float(score_map.max() - score_map.min()) <= 0.0:
+        return (H - p) // 2, (W - p) // 2
+
+    score = F.avg_pool2d(score_map.float().view(1, 1, H, W),
+                         kernel_size=p, stride=1)
+    flat = int(score.view(-1).argmax().item())
+    top, left = divmod(flat, score.shape[-1])
+    return int(top), int(left)
+
+
+@torch.no_grad()
 def find_semantic_placement(clean_pred: torch.Tensor, cls: int, p: int
                             ) -> Tuple[int, int]:
     """
@@ -44,10 +86,7 @@ def find_semantic_placement(clean_pred: torch.Tensor, cls: int, p: int
     if m.sum() == 0:
         return (H - p) // 2, (W - p) // 2
 
-    score = F.avg_pool2d(m, kernel_size=p, stride=1)
-    flat = int(score.view(-1).argmax().item())
-    top, left = divmod(flat, score.shape[-1])
-    return int(top), int(left)
+    return find_max_response_placement(m.view(H, W), p)
 
 
 def resolve(policy: str, H: int, W: int, p: int,

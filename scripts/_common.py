@@ -88,6 +88,98 @@ def add_patch_args(p):
     return p
 
 
+def add_generator_args(p):
+    r"""
+    Image-conditioned generator (--mode conditional_generator).
+
+    A SEPARATE argument group from add_patch_args on purpose. The generator is
+    a different threat model, not another patch_mode: raw/lap/gan/raw_ganinit
+    all optimise ONE patch tensor, while here theta is shared across the
+    dataset and the patch is a FUNCTION of the image. Folding it into
+    --patch_mode would have let it inherit reference/shape/init_from semantics
+    that do not apply, and would have put a second meaning on Patch.param.
+    """
+    g = p.add_argument_group("conditional generator")
+
+    # ── geometry ─────────────────────────────────────────────────────────────
+    g.add_argument("--patch_size", type=int, default=128,
+                   help="S — the generator's output resolution")
+    g.add_argument("--patch_scale", type=float, default=0.25,
+                   help="patch side as a fraction of image HEIGHT; "
+                        "p = int(H*scale), the same rule Patch.apply() uses")
+
+    # ── architecture (saved as generator_config) ─────────────────────────────
+    g.add_argument("--gen_base_ch", type=int, default=32)
+    g.add_argument("--gen_depth", type=int, default=3,
+                   help="U-Net downsampling levels; patch_size must be "
+                        "divisible by 2**depth")
+    g.add_argument("--gen_cond", default="image+ref+cam",
+                   choices=["image", "image+ref", "image+ref+cam"],
+                   help="ABLATION E. What G_theta is conditioned on. The "
+                        "residual base stays r_i in every setting, so this "
+                        "isolates conditioning from parameterisation.")
+    g.add_argument("--gen_residual", default="logit",
+                   choices=["logit", "clip", "none"],
+                   help="logit: p=sigmoid(logit_seed(r)+D) — matches spec.py's "
+                        "sigmoid parameterisation, no dead gradients at 0/1. "
+                        "clip: p=clamp(r+tanh(D),0,1). none: p=sigmoid(D), "
+                        "ignoring r as a base.")
+    g.add_argument("--gen_residual_scale", type=float, default=1.0)
+    g.add_argument("--gen_noise_dim", type=int, default=0,
+                   help="z_i channels. 0 = deterministic generation (default). "
+                        "Evaluation always uses the prior mean (zeros) so the "
+                        "reported test-time patch is reproducible.")
+
+    # ── sensitivity map ──────────────────────────────────────────────────────
+    g.add_argument("--cam_objective", default="attack",
+                   choices=["attack", "ce", "cospgd", "ipatch_cospgd"],
+                   help="ABLATION F. Scalar S_seg differentiated for the CAM. "
+                        "'attack' reuses --loss_fn so the map and the attack "
+                        "share one objective. S_seg = -L, because every loss "
+                        "in adversarial.py is MINIMISED to attack while "
+                        "Grad-CAM needs a score to increase.")
+    g.add_argument("--cam_target", default="pred", choices=["pred", "gt"],
+                   help="labels for S_seg. 'pred' uses the model's own argmax, "
+                        "keeping the LABEL-FREE threat model that --placement "
+                        "semantic already assumes. 'gt' is a strictly stronger "
+                        "attacker and must be declared as such.")
+    g.add_argument("--cam_layer", type=int, default=-1,
+                   help="which feature map from the hooked module. -1 = "
+                        "deepest/coarsest, the standard Grad-CAM choice.")
+    g.add_argument("--cam_module", default="backbone",
+                   help="dotted path inside the mmseg segmentor to hook")
+
+    # ── placement ────────────────────────────────────────────────────────────
+    g.add_argument("--gen_placement", default="gradcam",
+                   choices=["center", "gradcam", "semantic", "fixed"],
+                   help="ABLATION A vs B. gradcam = argmax over MeanPool(M_i). "
+                        "This flag is READ ONLY by the conditional-generator "
+                        "scripts; --placement for the existing patch modes is "
+                        "untouched.")
+    g.add_argument("--gen_placement_class", type=int, default=0)
+    g.add_argument("--gen_placement_xy", type=float, nargs=2,
+                   default=[0.5, 0.5])
+
+    # ── LAP constraint ───────────────────────────────────────────────────────
+    g.add_argument("--gen_lap_alpha", type=float, default=0.0,
+                   help="ABLATION C vs D. L_rat weight. DEFAULT 0: L_rat and "
+                        "L_tv are SUMS (1e2-1e4) while the attack losses are "
+                        "per-pixel MEANS (1e-2 to 20). Read the step-1 "
+                        "magnitude report before setting this.")
+    g.add_argument("--gen_lap_beta", type=float, default=0.0)
+    g.add_argument("--gen_lap_gamma", type=float, default=0.0)
+    return p
+
+
+def build_generator_config(a):
+    from patchreach.patch.conditional_generator import GeneratorConfig
+    return GeneratorConfig(
+        size=a.patch_size, base_ch=a.gen_base_ch, depth=a.gen_depth,
+        cond=a.gen_cond, residual=a.gen_residual,
+        residual_scale=a.gen_residual_scale,
+        noise_dim=a.gen_noise_dim).validate()
+
+
 def setup_model(a):
     """(model, n_channels, n_active, spec). Prints the identity checks."""
     if not getattr(a, "cityscapes_root", None):
