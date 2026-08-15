@@ -1,0 +1,149 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 1120" width="1000" height="1120"
+     font-family="Georgia, 'Times New Roman', serif" role="img"
+     aria-label="Pipeline of the image-conditioned adversarial patch generator: the target image yields a reference crop and, through the frozen segmentation model, a detached sensitivity map; both condition the generator, whose patch is composited into the image, passed through the frozen model again, and scored by the attack and LAP losses, with gradient returning only to theta.">
+  <style>
+    .box   { stroke-width: 1.4; }
+    .lbl   { font-size: 17px; fill: #17141C; }
+    .sub   { font-size: 11.5px; fill: #6D6479; font-family: Helvetica, Arial, sans-serif; }
+    .ann   { font-size: 11px;  fill: #6D6479; font-family: Helvetica, Arial, sans-serif; }
+    .annk  { font-size: 11px;  fill: #B32639; font-family: Helvetica, Arial, sans-serif; font-weight: 700; }
+    .lead  { stroke: #6D6479; stroke-width: 1.6; fill: none; }
+    .cut   { stroke: #B32639; stroke-width: 1.6; fill: none; stroke-dasharray: 6 4; }
+    .grad  { stroke: #B32639; stroke-width: 2.2; fill: none; }
+  </style>
+
+  <rect width="1000" height="1120" fill="#FFFFFF"/>
+
+  <defs>
+    <marker id="a"  markerWidth="9" markerHeight="9" refX="7.6" refY="3.2" orient="auto">
+      <path d="M0,0 L7.6,3.2 L0,6.4 z" fill="#6D6479"/></marker>
+    <marker id="ac" markerWidth="9" markerHeight="9" refX="7.6" refY="3.2" orient="auto">
+      <path d="M0,0 L7.6,3.2 L0,6.4 z" fill="#B32639"/></marker>
+    <marker id="ag" markerWidth="10" markerHeight="10" refX="8.2" refY="3.6" orient="auto">
+      <path d="M0,0 L8.2,3.6 L0,7.2 z" fill="#B32639"/></marker>
+  </defs>
+
+  <!-- ── target image ─────────────────────────────────────────────────── -->
+  <rect class="box" x="425" y="48" width="190" height="52" rx="5" fill="#F4F2F7" stroke="#D9D3E2"/>
+  <text class="lbl" x="520" y="72" text-anchor="middle">target image</text>
+  <text class="lbl" x="520" y="92" text-anchor="middle" font-style="italic">x&#7522;</text>
+
+  <!-- split bar -->
+  <path class="lead" d="M520,100 L520,126 M330,126 L710,126"/>
+  <path class="lead" d="M330,126 L330,146" marker-end="url(#a)"/>
+  <path class="lead" d="M710,126 L710,146" marker-end="url(#a)"/>
+  <!-- scene-context branch straight down to the generator -->
+  <path class="lead" d="M520,126 L520,434"/>
+  <text class="ann" x="508" y="284" text-anchor="end">scene context</text>
+  <text class="ann" x="508" y="299" text-anchor="end">whole image, resized to S&#215;S</text>
+
+  <!-- ── left: reference crop ─────────────────────────────────────────── -->
+  <rect class="box" x="210" y="152" width="240" height="58" rx="5" fill="#EEE6F4" stroke="#6E4A8C"/>
+  <text class="lbl" x="330" y="176" text-anchor="middle">reference crop</text>
+  <text class="lbl" x="330" y="197" text-anchor="middle" font-style="italic">r&#7522;</text>
+  <text class="ann" x="330" y="228" text-anchor="middle">fixed-size crop &#183; resized &#183; never optimised</text>
+
+  <!-- ── right: frozen model, CAM, M_i ────────────────────────────────── -->
+  <rect class="box" x="580" y="152" width="260" height="58" rx="5" fill="#F4F2F7"
+        stroke="#8A8296" stroke-dasharray="5 3.5"/>
+  <text class="lbl" x="710" y="176" text-anchor="middle">segmentation model</text>
+  <text class="sub" x="710" y="196" text-anchor="middle">frozen &#8212; parameters never updated</text>
+
+  <path class="lead" d="M710,210 L710,244" marker-end="url(#a)"/>
+
+  <rect class="box" x="565" y="250" width="290" height="62" rx="5" fill="#E4EBF4" stroke="#3F6798"/>
+  <text class="lbl" x="710" y="274" text-anchor="middle">sensitivity / Grad-CAM</text>
+  <text class="lbl" x="710" y="297" text-anchor="middle" font-size="14" font-style="italic">S<tspan font-size="10" dy="3">seg</tspan><tspan dy="-3"> = &#8722;L</tspan><tspan font-size="10" dy="3">attack</tspan></text>
+
+  <path class="cut" d="M710,312 L710,346" marker-end="url(#ac)"/>
+  <text class="annk" x="722" y="334">detach</text>
+
+  <rect class="box" x="630" y="352" width="160" height="52" rx="5" fill="#E4EBF4" stroke="#3F6798"/>
+  <text class="lbl" x="710" y="383" text-anchor="middle" font-style="italic">M&#7522;</text>
+  <text class="ann" x="710" y="422" text-anchor="middle">normalised per sample &#183; upsampled to H&#215;W</text>
+
+  <!-- merge bar into the generator -->
+  <path class="lead" d="M330,210 L330,434"/>
+  <path class="lead" d="M710,404 L710,434"/>
+  <path class="lead" d="M330,434 L710,434"/>
+  <path class="lead" d="M520,434 L520,462" marker-end="url(#a)"/>
+
+  <!-- ── the generator ────────────────────────────────────────────────── -->
+  <rect class="box" x="305" y="468" width="430" height="80" rx="6" fill="#EEE6F4"
+        stroke="#6E4A8C" stroke-width="2.4"/>
+  <text class="lbl" x="520" y="497" text-anchor="middle" font-size="19" font-weight="bold"
+        fill="#6E4A8C">CONDITIONAL GENERATOR</text>
+  <text class="lbl" x="520" y="521" text-anchor="middle" font-size="17" font-style="italic">
+    G&#952;( x&#7522; , r&#7522; , M&#7522; )</text>
+  <text class="sub" x="520" y="539" text-anchor="middle">&#952; shared across the dataset &#8212; the only trainable component</text>
+
+  <path class="lead" d="M520,548 L520,586" marker-end="url(#a)"/>
+
+  <!-- ── the patch ────────────────────────────────────────────────────── -->
+  <rect class="box" x="420" y="592" width="200" height="52" rx="5" fill="#EEE6F4" stroke="#6E4A8C"/>
+  <text class="lbl" x="520" y="616" text-anchor="middle">patch</text>
+  <text class="lbl" x="520" y="636" text-anchor="middle" font-style="italic">p&#7522;</text>
+
+  <path class="lead" d="M520,644 L520,678" marker-end="url(#a)"/>
+
+  <!-- placement branch, M_i -> composite -->
+  <path class="lead" d="M790,378 L920,378 L920,712 L656,712" marker-end="url(#a)"/>
+  <text class="ann" x="912" y="500" text-anchor="end">placement (t&#7522;, &#8467;&#7522;)</text>
+  <text class="ann" x="912" y="516" text-anchor="end">= argmax MeanPool(M&#7522;)</text>
+
+  <!-- ── composite ────────────────────────────────────────────────────── -->
+  <rect class="box" x="390" y="684" width="260" height="56" rx="5" fill="#F4F2F7" stroke="#D9D3E2"/>
+  <text class="lbl" x="520" y="718" text-anchor="middle" font-size="18">
+    x&#7522; &#8853; p&#7522;</text>
+
+  <path class="lead" d="M520,740 L520,772" marker-end="url(#a)"/>
+
+  <rect class="box" x="390" y="778" width="260" height="58" rx="5" fill="#F4F2F7"
+        stroke="#8A8296" stroke-dasharray="5 3.5"/>
+  <text class="lbl" x="520" y="802" text-anchor="middle">segmentation model</text>
+  <text class="sub" x="520" y="822" text-anchor="middle">frozen &#8212; transmits gradient, never receives it</text>
+
+  <!-- ── losses ───────────────────────────────────────────────────────── -->
+  <path class="lead" d="M520,836 L520,856 L400,856 L400,872" marker-end="url(#a)"/>
+  <!-- LAP is scored on (p_i, r_i), NOT on the model output -->
+  <path class="lead" d="M620,618 L745,618 L745,872" marker-end="url(#a)"/>
+
+  <rect class="box" x="275" y="878" width="250" height="58" rx="5" fill="#F8E6E9" stroke="#B32639"/>
+  <text class="lbl" x="400" y="901" text-anchor="middle">attack loss</text>
+  <text class="lbl" x="400" y="922" text-anchor="middle" font-size="14" font-style="italic">
+    L<tspan font-size="10" dy="3">attack</tspan><tspan dy="-3">( f(x</tspan><tspan font-size="10" dy="-5">adv</tspan><tspan dy="5">), y )</tspan></text>
+
+  <rect class="box" x="620" y="878" width="250" height="58" rx="5" fill="#EEE6F4" stroke="#6E4A8C"/>
+  <text class="lbl" x="745" y="901" text-anchor="middle">LAP realism</text>
+  <text class="lbl" x="745" y="922" text-anchor="middle" font-size="14" font-style="italic">
+    L<tspan font-size="10" dy="3">LAP</tspan><tspan dy="-3">( p&#7522; , r&#7522; )</tspan></text>
+
+  <path class="lead" d="M400,936 L400,956 M745,936 L745,956 M400,956 L745,956"/>
+  <path class="lead" d="M520,956 L520,970" marker-end="url(#a)"/>
+
+  <rect class="box" x="305" y="976" width="430" height="60" rx="6" fill="#F8E6E9"
+        stroke="#B32639" stroke-width="2.2"/>
+  <text class="lbl" x="520" y="1000" text-anchor="middle" font-size="17">generator loss</text>
+  <text class="lbl" x="520" y="1022" text-anchor="middle" font-size="16" font-style="italic">
+    L = L<tspan font-size="11" dy="3">attack</tspan><tspan dy="-3"> + &#955; L</tspan><tspan font-size="11" dy="3">LAP</tspan></text>
+
+  <!-- ── gradient return, to theta only ───────────────────────────────── -->
+  <path class="grad" d="M305,1006 L40,1006 L40,508 L299,508" marker-end="url(#ag)"/>
+  <rect x="14" y="726" width="52" height="72" rx="4" fill="#FFFFFF"/>
+  <text class="lbl" x="40" y="762" text-anchor="middle" font-size="15" fill="#B32639"
+        transform="rotate(-90 40 762)">&#8706;L / &#8706;&#952;</text>
+
+  <!-- ── legend ───────────────────────────────────────────────────────── -->
+  <path d="M60,1078 L1000,1078" stroke="#E7E2EE" stroke-width="1"/>
+  <g transform="translate(60,1098)">
+    <rect x="0" y="-9" width="22" height="13" rx="2" fill="#F4F2F7" stroke="#8A8296"
+          stroke-dasharray="4 3" stroke-width="1.2"/>
+    <text class="ann" x="30" y="1">frozen &#8212; no parameter updates</text>
+
+    <path d="M280,-3 L320,-3" stroke="#B32639" stroke-width="1.6" stroke-dasharray="6 4"/>
+    <text class="ann" x="328" y="1">detached &#8212; conditioning only, no gradient</text>
+
+    <path d="M640,-3 L680,-3" stroke="#B32639" stroke-width="2.2"/>
+    <text class="ann" x="688" y="1">gradient path &#8212; reaches &#952; only</text>
+  </g>
+</svg>

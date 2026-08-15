@@ -39,6 +39,7 @@ from typing import Optional, Tuple
 import torch
 import torch.nn.functional as F
 
+from . import csf as csf_mod
 from . import lap as lap_mod
 from . import placement as placement_mod
 from . import shape as shape_mod
@@ -49,7 +50,7 @@ from . import shape as shape_mod
 # suite unchanged. Behaviourally it is identical to 'raw': sigmoid rendering,
 # no regularisers, no reference. Only the label differs, so diagnostics.txt
 # reports the run's real provenance instead of claiming patch_mode=raw.
-MODES = ("raw", "gan", "raw_ganinit", "lap", "conditional")
+MODES = ("raw", "gan", "raw_ganinit", "lap", "conditional", "csf")
 
 
 @dataclass
@@ -88,6 +89,14 @@ class PatchConfig:
     latent_clip: float = 2.0
     logit_clip: float = 6.0        # pixel modes; 0 disables
 
+    # ── perceptual constraint (csf.py), mode='csf' only ──────────────────────
+    csf_threshold: float = 0.25
+    csf_model: str = "barten"
+    csf_beta: float = 3.0
+    csf_min_cycles: float = 2.0
+    csf_pixel_size_cm: float = 0.0114
+    csf_viewing_distance_cm: float = 50.0
+
     init_from: Optional[str] = None       # checkpoint to seed from (LAP stage 2)
 
     def validate(self):
@@ -125,6 +134,19 @@ class Patch:
         self.placement: Optional[Tuple[int, int]] = None
         self.init_reference = init_reference
         self._load_reference()
+        # init_reference overrides a file reference. It is how mode='csf' gets
+        # the IMAGE CONTENT it will sit on: the perceptual guarantee is about a
+        # residual, so the base has to be what the patch actually covers.
+        if init_reference is not None:
+            self.reference = init_reference.to(self.device).clamp(0, 1)
+        self._csf_values = self._csf_budget = None
+        if self.cfg.mode == "csf":
+            self._csf_values, self._csf_budget = csf_mod.patch_budget(
+                c_size := self.cfg.size,
+                csf_mod.ViewingGeometry(self.cfg.csf_pixel_size_cm,
+                                        self.cfg.csf_viewing_distance_cm),
+                self.cfg.csf_model, self.cfg.csf_threshold,
+                self.cfg.csf_min_cycles, device=self.device)
         self.param = self._init_param()
 
     # ── construction ─────────────────────────────────────────────────────────
@@ -166,6 +188,14 @@ class Patch:
         if c.mode == "lap":
             return lap_mod.logit_seed(self.reference).clone().requires_grad_(True)
 
+        if c.mode == "csf":
+            # NOT zeros. csf_residual normalises to exactly tau, so a zero raw
+            # tensor is 0/0 with an undefined gradient. The reparameterisation
+            # is scale-invariant, so only the SHAPE of this init matters and
+            # its magnitude is irrelevant.
+            return torch.randn(3, c.size, c.size,
+                               device=self.device).requires_grad_(True)
+
         # raw: zeros -> sigmoid -> uniform 0.5 grey
         return torch.zeros(3, c.size, c.size,
                            device=self.device).requires_grad_(True)
@@ -188,6 +218,20 @@ class Patch:
         c = self.cfg
         if c.mode == "gan":
             return ((self.G(self.param.unsqueeze(0)) + 1.0) * 0.5).squeeze(0)
+        if c.mode == "csf":
+            # ADDITIVE in linear pixel space, deliberately not through the
+            # sigmoid: the spectral budget describes a residual on the base,
+            # and sigmoid(logit(r)+d) != r+d would distort exactly the spectrum
+            # the budget was computed for.
+            base = (self.reference if self.reference is not None
+                    else torch.full((3, c.size, c.size), 0.5,
+                                    device=self.device))
+            d = csf_mod.csf_residual(self.param.unsqueeze(0), self._csf_budget,
+                                     self._csf_values, c.csf_threshold,
+                                     c.csf_beta)
+            d = csf_mod.fit_to_range(d, base.unsqueeze(0))
+            return (base + d[0]).clamp(0.0, 1.0)
+
         p = torch.sigmoid(self.param)
         if c.mode == "lap" and c.lap_freeze_edges and self.edges is not None:
             # Pin the reference's strong edges so the outline survives — the
@@ -258,6 +302,28 @@ class Patch:
         footprint = (mask[0, 0] > 0.5).unsqueeze(0).expand(B, -1, -1)
         return patched, footprint
 
+    def set_reference_from_image(self, imgs: torch.Tensor, mean_t, std_t):
+        """
+        Take the base from the image region the patch will cover.
+
+        Must be called AFTER resolve_placement(). This is what makes mode='csf'
+        an invisible-residual attack rather than a visible textured square: the
+        patch starts as an exact copy of what it replaces, and only the
+        CSF-bounded residual is added on top.
+        """
+        B, _, H, W = imgs.shape
+        p = int(H * self.cfg.scale)
+        top, left = (self.placement if self.placement is not None
+                     else ((H - p) // 2, (W - p) // 2))
+        top = max(0, min(int(top), H - p))
+        left = max(0, min(int(left), W - p))
+        img01 = (imgs[:1] * std_t + mean_t).clamp(0, 1)
+        crop = img01[:, :, top:top + p, left:left + p]
+        self.reference = F.interpolate(crop, size=(self.cfg.size, self.cfg.size),
+                                       mode="bilinear", align_corners=False
+                                       )[0].detach()
+        return self.reference
+
     # ── optimisation helpers ─────────────────────────────────────────────────
 
     def project(self):
@@ -283,6 +349,8 @@ class Patch:
             if self.cfg.mode == "gan":
                 self.param.data.clamp_(-self.cfg.latent_clip,
                                        self.cfg.latent_clip)
+            elif self.cfg.mode == "csf":
+                pass          # scale-invariant reparameterisation; nothing to clip
             elif self.cfg.logit_clip > 0:
                 self.param.data.clamp_(-self.cfg.logit_clip,
                                        self.cfg.logit_clip)
@@ -359,6 +427,15 @@ class Patch:
         """Per-step logging. gan tracks the latent; pixel modes track spread."""
         if self.cfg.mode == "gan":
             return {"latent_absmax": self.param.abs().max().item()}
+        if self.cfg.mode == "csf":
+            rendered = self.render()
+            base = (self.reference if self.reference is not None
+                    else torch.full_like(rendered, 0.5))
+            return {"visibility": float(csf_mod.realised_visibility(
+                        rendered.unsqueeze(0), base.unsqueeze(0),
+                        self._csf_values, self.cfg.csf_beta)),
+                    "resid_rms": float((rendered - base).pow(2).mean().sqrt()),
+                    "resid_absmax": float((rendered - base).abs().max())}
         px = torch.sigmoid(self.param)
         lim = self.cfg.logit_clip if self.cfg.logit_clip > 0 else 12.0
         return {"pixel_std": px.std().item(),

@@ -81,6 +81,13 @@ def main():
     with torch.no_grad():
         clean_logits = upsample_to(model(img), label.shape[-2:])
     patch.resolve_placement(a.img_h, a.img_w, clean_logits.argmax(1)[0])
+    if a.from_image:
+        # Base the patch on the region it will cover. Only meaningful AFTER
+        # resolve_placement, and only changes behaviour for modes that treat
+        # the reference as a base (csf); every pre-existing mode ignores it.
+        patch.set_reference_from_image(img, mean_t, std_t)
+        print(f"[patch] base      : image region at {patch.placement} "
+              f"(--from_image)")
     patch.describe(a.img_h, a.img_w)
 
     _, fp0 = patch.apply(img)
