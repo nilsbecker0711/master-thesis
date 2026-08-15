@@ -146,8 +146,32 @@ def add_generator_args(p):
                         "clip: p=clamp(r+tanh(D),0,1). none: p=sigmoid(D), "
                         "ignoring r as a base.")
     g.add_argument("--gen_residual_scale", type=float, default=1.0)
+    g.add_argument("--gen_noise_dim", type=int, default=0,
+                   help="z_i channels. 0 = deterministic generation (default). "
+                        "Evaluation always uses the prior mean (zeros) so the "
+                        "reported test-time patch is reproducible.")
 
+    # ── perceptual constraint (--gen_residual csf) ───────────────────────────
     add_csf_args(p)
+
+    # ── sensitivity map ──────────────────────────────────────────────────────
+    g.add_argument("--cam_objective", default="attack",
+                   choices=["attack", "ce", "cospgd", "ipatch_cospgd"],
+                   help="ABLATION F. Scalar S_seg differentiated for the CAM. "
+                        "'attack' reuses --loss_fn so the map and the attack "
+                        "share one objective. S_seg = -L, because every loss "
+                        "in adversarial.py is MINIMISED to attack while "
+                        "Grad-CAM needs a score to increase.")
+    g.add_argument("--cam_target", default="pred", choices=["pred", "gt"],
+                   help="labels for S_seg. 'pred' uses the model's own argmax, "
+                        "keeping the LABEL-FREE threat model that --placement "
+                        "semantic already assumes. 'gt' is a strictly stronger "
+                        "attacker and must be declared as such.")
+    g.add_argument("--cam_layer", type=int, default=-1,
+                   help="which feature map from the hooked module. -1 = "
+                        "deepest/coarsest, the standard Grad-CAM choice.")
+    g.add_argument("--cam_module", default="backbone",
+                   help="dotted path inside the mmseg segmentor to hook")
 
     # ── placement ────────────────────────────────────────────────────────────
     g.add_argument("--gen_placement", default="gradcam",
