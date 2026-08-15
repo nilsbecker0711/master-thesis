@@ -25,7 +25,8 @@ import torch.nn.functional as F
 
 @torch.no_grad()
 def find_max_response_placement(score_map: torch.Tensor, p: int,
-                                centre_if_constant: bool = False
+                                centre_if_constant: bool = False,
+                                margin: int = 0
                                 ) -> Tuple[int, int]:
     r"""
     Top-left of the p x p window with the highest MEAN response.
@@ -51,6 +52,23 @@ def find_max_response_placement(score_map: torch.Tensor, p: int,
                 zeroed every channel) produces a constant map, and there the
                 map carries no localisation information at all, so falling back
                 to the documented default position is the honest choice.
+
+    margin  : keep the window at least `margin` px from every image border.
+
+                WHY THIS EXISTS. Without it the argmax can land flush against
+                an edge — a measured run put the window at top = H - p exactly,
+                because the sensitivity map's hottest ridge is the near-field
+                road/sidewalk boundary along the bottom of a dashcam frame. A
+                patch on the border has roughly HALF its effective receptive
+                field outside the image, so it can only influence inward. That
+                is a large, silent loss of geometric leverage, and it is
+                invisible in the loss: the attack simply underperforms.
+
+                DEFAULT 0, which reproduces the unmargined behaviour exactly,
+                so existing semantic-placement runs are unaffected. The margin
+                is clamped down if the image is too small to honour it, and a
+                margin that would leave no legal window degrades to 0 rather
+                than raising.
     """
     H, W = score_map.shape
     if p >= H or p >= W:
@@ -58,11 +76,19 @@ def find_max_response_placement(score_map: torch.Tensor, p: int,
     if centre_if_constant and float(score_map.max() - score_map.min()) <= 0.0:
         return (H - p) // 2, (W - p) // 2
 
+    # Largest margin that still leaves at least one legal window on each axis.
+    m = max(0, min(int(margin), (H - p) // 2, (W - p) // 2))
+
     score = F.avg_pool2d(score_map.float().view(1, 1, H, W),
-                         kernel_size=p, stride=1)
-    flat = int(score.view(-1).argmax().item())
+                         kernel_size=p, stride=1)          # [1,1,H-p+1,W-p+1]
+    if m:
+        score = score[:, :, m:score.shape[-2] - m, m:score.shape[-1] - m]
+
+    # reshape, not view: the margin slice above leaves `score` non-contiguous
+    # and .view() raises on it.
+    flat = int(score.reshape(-1).argmax().item())
     top, left = divmod(flat, score.shape[-1])
-    return int(top), int(left)
+    return int(top) + m, int(left) + m
 
 
 @torch.no_grad()

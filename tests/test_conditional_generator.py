@@ -244,6 +244,110 @@ def test_semantic_placement_is_unchanged_by_the_refactor():
     assert find_semantic_placement(everywhere, cls=0, p=12) == (0, 0)
 
 
+def test_margin_keeps_the_window_off_the_border():
+    """
+    The measured failure: the sensitivity map's hottest ridge is the near-field
+    road boundary along the BOTTOM of a dashcam frame, so the argmax pinned the
+    window at top = H - p exactly. A patch on the border has roughly half its
+    receptive field outside the image.
+    """
+    H, W, p = 40, 80, 12
+    score = torch.zeros(H, W)
+    score[H - p:, :p] = 1.0                       # hottest at the bottom-left
+
+    assert find_max_response_placement(score, p) == (H - p, 0)   # flush
+    top, left = find_max_response_placement(score, p, margin=6)
+    assert top == H - p - 6 and left == 6
+    assert 6 <= top <= H - p - 6 and 6 <= left <= W - p - 6
+
+
+def test_margin_zero_is_the_unmargined_argmax():
+    """Default must reproduce existing behaviour bit for bit."""
+    torch.manual_seed(0)
+    score = torch.rand(40, 80)
+    assert (find_max_response_placement(score, 12)
+            == find_max_response_placement(score, 12, margin=0))
+
+
+def test_oversized_margin_degrades_rather_than_raising():
+    """A margin larger than the image can accommodate must not crash."""
+    score = torch.rand(40, 80)
+    top, left = find_max_response_placement(score, 12, margin=500)
+    assert 0 <= top <= 40 - 12 and 0 <= left <= 80 - 12
+
+
+def test_batch_placement_passes_the_margin_through():
+    cam = torch.zeros(1, 1, 40, 80)
+    cam[0, 0, 28:, :12] = 1.0
+    assert cg.resolve_batch_placement("gradcam", 40, 80, 12, cam=cam) == [(28, 0)]
+    assert cg.resolve_batch_placement("gradcam", 40, 80, 12, cam=cam,
+                                      margin=6) == [(22, 6)]
+
+
+def test_window_reference_is_the_content_the_patch_replaces():
+    """
+    r_i sampled at the placement, not the centre. This removes the perspective
+    mismatch: a centre crop of a dashcam frame is mid-distance content, while
+    gradcam placement lands in the near field.
+    """
+    H, W, p = 64, 128, 16
+    img = torch.zeros(1, 3, H, W)
+    img[:, :, 40:56, 90:106] = 1.0                # mark ONLY the target window
+
+    r = cg.window_reference(img, [(40, 90)], p, 32)
+    assert torch.allclose(r, torch.ones_like(r), atol=1e-5)
+    assert not r.requires_grad
+
+    # the centre crop of the same image sees none of it
+    assert float(cg.center_crop_reference(img, p, 32).max()) == 0.0
+
+
+def test_window_reference_makes_baseline_a_a_literal_noop():
+    """
+    THE POINT OF THE OPTION. With reference='window', p_i = r_i reproduces
+    exactly the pixels it covers, so the patched image equals the original and
+    baseline A degrades nothing BY CONSTRUCTION. Every point of degradation is
+    then attributable to the generator.
+
+    Driven at size == p, which is the real configuration (128 == 128 at the
+    default geometry). When they differ the crop makes a bilinear round trip
+    p -> S -> p, so the reconstruction is close but not exact.
+
+    The image is built by NORMALISING a valid [0,1] tensor rather than using
+    randn directly: denormalise_batch clamps to [0,1], so a synthetic tensor
+    with out-of-gamut pixels would not survive the round trip. Real dataloader
+    output is in gamut, so this is the faithful case, not a convenient one.
+    """
+    model = _cam_model()
+    labels = torch.randint(0, 19, (2, 64, 128))
+    imgs = (torch.rand(2, 3, 64, 128) - MEAN) / STD
+
+    cam = segmentation_cam.SegmentationCAM(model, adversarial.build("ce"),
+                                           target="pred")
+    attack = cg.ConditionalAttack(model, cam, None, MEAN, STD, scale=0.25,
+                                  size=16, placement="gradcam",
+                                  method="reference", reference="window")
+    out = attack(imgs, labels)
+    assert out["patch_side"] == 16                    # p == size, no resampling
+    assert torch.allclose(out["patched"], imgs, atol=1e-5)
+    cam.close()
+
+    # and the centre-crop variant does NOT have that property
+    cam2 = segmentation_cam.SegmentationCAM(model, adversarial.build("ce"),
+                                            target="pred")
+    centre = cg.ConditionalAttack(model, cam2, None, MEAN, STD, scale=0.25,
+                                  size=16, placement="gradcam",
+                                  method="reference", reference="center")
+    assert not torch.allclose(centre(imgs, labels)["patched"], imgs, atol=1e-2)
+    cam2.close()
+
+
+def test_reference_mode_is_validated():
+    with pytest.raises(ValueError, match="reference must be one of"):
+        cg.ConditionalAttack(None, None, None, MEAN, STD, scale=0.25, size=32,
+                             reference="centre")     # British spelling typo
+
+
 def test_batch_placement_is_per_image():
     cam = torch.zeros(2, 1, 40, 80)
     cam[0, 0, 25:37, 60:72] = 1.0

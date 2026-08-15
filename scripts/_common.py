@@ -159,6 +159,24 @@ def add_generator_args(p):
     g.add_argument("--gen_placement_class", type=int, default=0)
     g.add_argument("--gen_placement_xy", type=float, nargs=2,
                    default=[0.5, 0.5])
+    g.add_argument("--gen_placement_margin", type=int, default=0,
+                   help="keep the gradcam window this many px from every image "
+                        "border. DEFAULT 0 reproduces the unmargined argmax. "
+                        "The sensitivity map's hottest ridge is the near-field "
+                        "road boundary along the bottom of a dashcam frame, so "
+                        "the argmax tends to pin the patch flush against the "
+                        "edge, where ~half its receptive field lies outside "
+                        "the image. Try p/2 (64 at the default geometry).")
+
+    # ── reference source ─────────────────────────────────────────────────────
+    g.add_argument("--gen_reference", default="center",
+                   choices=["center", "window"],
+                   help="where r_i is sampled. 'center' is the centre crop. "
+                        "'window' samples the content the patch REPLACES, "
+                        "removing the perspective mismatch between a "
+                        "mid-distance reference and a near-field destination. "
+                        "With 'window' baseline A becomes a literal no-op, so "
+                        "every point of degradation is the generator's.")
 
     # ── LAP constraint ───────────────────────────────────────────────────────
     g.add_argument("--gen_lap_alpha", type=float, default=0.0,

@@ -96,6 +96,14 @@ def build_parser():
                         "'generator without Grad-CAM placement' ablation and "
                         "it needs no retraining.")
     p.add_argument("--gen_placement_class", type=int, default=None)
+    p.add_argument("--gen_placement_margin", type=int, default=None,
+                   help="override the trained border margin for the gradcam "
+                        "argmax; another no-retrain placement ablation.")
+    p.add_argument("--gen_reference", default=None,
+                   choices=["center", "window"],
+                   help="override where r_i is sampled. Changing this at "
+                        "evaluation time measures how the trained generator "
+                        "behaves on a reference distribution it did not see.")
     p.add_argument("--cam_objective", default=None)
     p.add_argument("--cam_target", default=None, choices=["pred", "gt"])
     p.add_argument("--cam_layer", type=int, default=None)
@@ -143,6 +151,10 @@ def main():
     placement_class = (a.gen_placement_class
                        if a.gen_placement_class is not None
                        else tcfg.get("gen_placement_class", 0))
+    placement_margin = (a.gen_placement_margin
+                        if a.gen_placement_margin is not None
+                        else tcfg.get("gen_placement_margin", 0))
+    reference_mode = a.gen_reference or tcfg.get("gen_reference", "center")
     loss_fn = a.loss_fn or tcfg.get("loss_fn", "cospgd")
     target_class = (a.target_class if a.target_class is not None
                     else tcfg.get("target_class", 8))
@@ -175,7 +187,15 @@ def main():
     attack = cg.ConditionalAttack(
         model, cam, generator, mean_t, std_t, scale, size,
         placement=placement, placement_class=placement_class,
-        method=a.method)
+        method=a.method, reference=reference_mode,
+        placement_margin=placement_margin)
+
+    trained_reference = tcfg.get("gen_reference")
+    if trained_reference and reference_mode != trained_reference:
+        print(f"[abl ] reference OVERRIDDEN: trained with "
+              f"{trained_reference!r}, evaluating with {reference_mode!r}. The "
+              f"generator is seeing a reference distribution it was not "
+              f"trained on — report this as a transfer measurement.")
 
     ds = CityscapesSeg(a.cityscapes_root, a.split, a.img_h, a.img_w)
     idxs = image_indices(a.images, len(ds))
@@ -184,6 +204,7 @@ def main():
 
     stem = Path(a.checkpoint).parent.parent.name if a.checkpoint else "baselineA"
     tag = "_".join(x for x in [stem, a.method, f"pl-{placement}",
+                               f"ref-{reference_mode}",
                                f"{a.img_h}x{a.img_w}", a.tag] if x)
     out_dir = increment_path(Path(a.out_root) / tag)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -296,6 +317,8 @@ def main():
             "test_time_optimisation": False,
             "config": vars(a),
             "resolved": {"scale": scale, "size": size, "placement": placement,
+                         "placement_margin": placement_margin,
+                         "reference": reference_mode,
                          "loss_fn": loss_fn, "target_class": tgt,
                          "cam_objective": cam_loss_name,
                          "cam_target": cam_target, "cam_layer": cam_layer},
