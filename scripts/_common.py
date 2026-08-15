@@ -40,7 +40,12 @@ def add_model_args(p):
 
 def add_patch_args(p):
     p.add_argument("--patch_mode", default="raw",
-                   choices=["raw", "gan", "raw_ganinit", "lap"])
+                   choices=["raw", "gan", "raw_ganinit", "lap", "csf"],
+                   help="csf: base + a residual whose spectrum is bounded by "
+                        "the human contrast sensitivity function. Pair with "
+                        "--from_image in overfit.py so the base is the region "
+                        "the patch covers; otherwise the base is grey and the "
+                        "patch is a visible square with an invisible texture.")
     p.add_argument("--patch_size", type=int, default=128)
     p.add_argument("--patch_scale", type=float, default=0.25)
     p.add_argument("--logit_clip", type=float, default=6.0,
@@ -85,6 +90,22 @@ def add_patch_args(p):
                         "with score_reference.py --sweep_edge; aim for "
                         "free/sil of 0.5-0.7.")
     p.add_argument("--init_from", default=None)
+    add_csf_args(p)
+    return p
+
+
+def add_csf_args(p):
+    """Shared by add_patch_args and add_generator_args — one definition."""
+    if any(a.option_strings and "--csf_threshold" in a.option_strings
+           for a in p._actions):
+        return p
+    g = p.add_argument_group("perceptual constraint (csf)")
+    g.add_argument("--csf_threshold", type=float, default=0.25)
+    g.add_argument("--csf_model", default="barten", choices=["barten", "sso"])
+    g.add_argument("--csf_beta", type=float, default=3.0)
+    g.add_argument("--csf_min_cycles", type=float, default=2.0)
+    g.add_argument("--csf_pixel_size_cm", type=float, default=0.0114)
+    g.add_argument("--csf_viewing_distance_cm", type=float, default=50.0)
     return p
 
 
@@ -119,35 +140,14 @@ def add_generator_args(p):
                         "residual base stays r_i in every setting, so this "
                         "isolates conditioning from parameterisation.")
     g.add_argument("--gen_residual", default="logit",
-                   choices=["logit", "clip", "none"],
+                   choices=["logit", "clip", "none", "csf"],
                    help="logit: p=sigmoid(logit_seed(r)+D) — matches spec.py's "
                         "sigmoid parameterisation, no dead gradients at 0/1. "
                         "clip: p=clamp(r+tanh(D),0,1). none: p=sigmoid(D), "
                         "ignoring r as a base.")
     g.add_argument("--gen_residual_scale", type=float, default=1.0)
-    g.add_argument("--gen_noise_dim", type=int, default=0,
-                   help="z_i channels. 0 = deterministic generation (default). "
-                        "Evaluation always uses the prior mean (zeros) so the "
-                        "reported test-time patch is reproducible.")
 
-    # ── sensitivity map ──────────────────────────────────────────────────────
-    g.add_argument("--cam_objective", default="attack",
-                   choices=["attack", "ce", "cospgd", "ipatch_cospgd"],
-                   help="ABLATION F. Scalar S_seg differentiated for the CAM. "
-                        "'attack' reuses --loss_fn so the map and the attack "
-                        "share one objective. S_seg = -L, because every loss "
-                        "in adversarial.py is MINIMISED to attack while "
-                        "Grad-CAM needs a score to increase.")
-    g.add_argument("--cam_target", default="pred", choices=["pred", "gt"],
-                   help="labels for S_seg. 'pred' uses the model's own argmax, "
-                        "keeping the LABEL-FREE threat model that --placement "
-                        "semantic already assumes. 'gt' is a strictly stronger "
-                        "attacker and must be declared as such.")
-    g.add_argument("--cam_layer", type=int, default=-1,
-                   help="which feature map from the hooked module. -1 = "
-                        "deepest/coarsest, the standard Grad-CAM choice.")
-    g.add_argument("--cam_module", default="backbone",
-                   help="dotted path inside the mmseg segmentor to hook")
+    add_csf_args(p)
 
     # ── placement ────────────────────────────────────────────────────────────
     g.add_argument("--gen_placement", default="gradcam",
@@ -195,7 +195,11 @@ def build_generator_config(a):
         size=a.patch_size, base_ch=a.gen_base_ch, depth=a.gen_depth,
         cond=a.gen_cond, residual=a.gen_residual,
         residual_scale=a.gen_residual_scale,
-        noise_dim=a.gen_noise_dim).validate()
+        noise_dim=a.gen_noise_dim,
+        csf_threshold=a.csf_threshold, csf_model=a.csf_model,
+        csf_beta=a.csf_beta, csf_min_cycles=a.csf_min_cycles,
+        csf_pixel_size_cm=a.csf_pixel_size_cm,
+        csf_viewing_distance_cm=a.csf_viewing_distance_cm).validate()
 
 
 def setup_model(a):
@@ -223,7 +227,8 @@ def image_indices(arg, n_val):
     return [int(x) for x in str(arg).replace(",", " ").split()]
 
 
-def build_patch(a, device, mean_t, std_t, generator=None):
+def build_patch(a, device, mean_t, std_t, generator=None,
+                init_reference=None):
     from patchreach.patch.spec import PatchConfig, Patch
     cfg = PatchConfig(
         mode=a.patch_mode, size=a.patch_size, scale=a.patch_scale,
@@ -233,5 +238,10 @@ def build_patch(a, device, mean_t, std_t, generator=None):
         reference_fit=a.reference_fit, logit_clip=a.logit_clip, shape_bg=a.shape_bg, shape_thresh=a.shape_thresh,
         lap_alpha=a.lap_alpha, lap_beta=a.lap_beta, lap_gamma=a.lap_gamma,
         lap_edge_thresh=a.lap_edge_thresh,
-        lap_freeze_edges=a.lap_freeze_edges, init_from=a.init_from)
-    return Patch(cfg, device, mean_t, std_t, generator=generator)
+        lap_freeze_edges=a.lap_freeze_edges, init_from=a.init_from,
+        csf_threshold=a.csf_threshold, csf_model=a.csf_model,
+        csf_beta=a.csf_beta, csf_min_cycles=a.csf_min_cycles,
+        csf_pixel_size_cm=a.csf_pixel_size_cm,
+        csf_viewing_distance_cm=a.csf_viewing_distance_cm)
+    return Patch(cfg, device, mean_t, std_t, generator=generator,
+                 init_reference=init_reference)

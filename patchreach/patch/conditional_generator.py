@@ -66,11 +66,12 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from ..data.cityscapes import upsample_to
+from . import csf as csf_mod
 from . import lap as lap_mod
 from . import placement as placement_mod
 
 COND_MODES = ("image", "image+ref", "image+ref+cam")
-RESIDUAL_MODES = ("logit", "clip", "none")
+RESIDUAL_MODES = ("logit", "clip", "none", "csf")
 PLACEMENT_MODES = ("center", "gradcam", "semantic", "fixed")
 REFERENCE_MODES = ("center", "window")
 
@@ -97,6 +98,20 @@ class GeneratorConfig:
     residual_scale: float = 1.0
     noise_dim: int = 0               # 0 = deterministic
 
+    # ── perceptual (residual='csf') ──────────────────────────────────────────
+    # Only read when residual == 'csf'. Kept on the ARCHITECTURE config because
+    # the CSF and budget maps are buffers sized by `size`, so a checkpoint
+    # cannot be rebuilt without them.
+    # tau = 1.0 is NOT the operating point. Measured at 128px: tau 0.25 gives
+    # |delta| rms ~0.025 (about 6/255); above tau 0.5 the range fit starts
+    # binding and tau stops controlling anything. Usable range is ~0.05-0.5.
+    csf_threshold: float = 0.25      # tau, in nominal JND — THE knob
+    csf_min_cycles: float = 2.0      # lowest frequency allowed, cycles/patch
+    csf_model: str = "barten"        # barten | sso
+    csf_beta: float = 3.0            # Minkowski summation exponent
+    csf_pixel_size_cm: float = 0.0114
+    csf_viewing_distance_cm: float = 50.0
+
     def validate(self) -> "GeneratorConfig":
         if self.cond not in COND_MODES:
             raise ValueError(f"cond must be one of {COND_MODES}, got {self.cond!r}")
@@ -108,6 +123,11 @@ class GeneratorConfig:
                 f"size={self.size} must be divisible by 2**depth="
                 f"{2 ** self.depth}; the U-Net skips need matching resolutions")
         return self
+
+    @property
+    def geometry(self) -> "csf_mod.ViewingGeometry":
+        return csf_mod.ViewingGeometry(self.csf_pixel_size_cm,
+                                       self.csf_viewing_distance_cm)
 
     @property
     def in_channels(self) -> int:
@@ -125,6 +145,11 @@ class GeneratorConfig:
         log(f"[gen ] noise     : "
             + ("off — deterministic" if self.noise_dim == 0
                else f"{self.noise_dim} channels"))
+        if self.residual == "csf":
+            log(f"[gen ] perceptual: {self.csf_model} CSF, tau = "
+                f"{self.csf_threshold:g} JND, Minkowski beta = {self.csf_beta:g}, "
+                f"min {self.csf_min_cycles:g} cycles/patch")
+            self.geometry.describe(log)
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -189,11 +214,27 @@ class ConditionalPatchGenerator(nn.Module):
              for i in reversed(range(cfg.depth))])
 
         self.head = nn.Conv2d(chans[0], 3, 3, padding=1)
-        # ZERO-INIT: Delta == 0 at step 0, so p_i == r_i exactly and the
-        # untrained generator IS baseline A. Any drift from the reference is
-        # then attributable to training, not to initialisation noise.
-        nn.init.zeros_(self.head.weight)
-        nn.init.zeros_(self.head.bias)
+        if cfg.residual == "csf":
+            # NOT zero-init here, and the baseline-A identity does NOT hold for
+            # this mode. csf_residual normalises to EXACTLY tau, so a zero raw
+            # tensor is a 0/0 and its gradient is undefined. The natural init
+            # is instead "random noise at the full visibility budget", which is
+            # the maximally-camouflaged starting point and is what the mode is
+            # about. The reparameterisation is scale-invariant, so the init
+            # magnitude does not matter — only its shape.
+            nn.init.normal_(self.head.weight, std=0.05)
+            nn.init.zeros_(self.head.bias)
+            cmap, budget = csf_mod.patch_budget(
+                cfg.size, cfg.geometry, cfg.csf_model, cfg.csf_threshold,
+                cfg.csf_min_cycles)
+            self.register_buffer("csf_values", cmap)
+            self.register_buffer("csf_budget", budget)
+        else:
+            # ZERO-INIT: Delta == 0 at step 0, so p_i == r_i exactly and the
+            # untrained generator IS baseline A. Any drift from the reference is
+            # then attributable to training, not to initialisation noise.
+            nn.init.zeros_(self.head.weight)
+            nn.init.zeros_(self.head.bias)
 
     # ── conditioning ─────────────────────────────────────────────────────────
 
@@ -259,6 +300,19 @@ class ConditionalPatchGenerator(nn.Module):
             raise ValueError(f"residual={mode!r} needs `reference` as its base")
         if mode == "clip":
             return (reference + torch.tanh(delta)).clamp(0.0, 1.0)
+        if mode == "csf":
+            # ADDITIVE AND CLIPPED, deliberately breaking the repository's
+            # sigmoid convention. The spectral guarantee is a statement about a
+            # residual in LINEAR pixel space; sigmoid(logit(r)+d) != r+d, so
+            # composing through a sigmoid would distort exactly the spectrum
+            # the budget was computed for and the invisibility claim would no
+            # longer hold. The clamp can violate the budget where r is already
+            # near 0 or 1 — that is measured and reported rather than assumed
+            # away (see realised_visibility()).
+            d = csf_mod.csf_residual(delta, self.csf_budget, self.csf_values,
+                                     self.cfg.csf_threshold, self.cfg.csf_beta)
+            d = csf_mod.fit_to_range(d, reference)
+            return (reference + d).clamp(0.0, 1.0)
         return torch.sigmoid(lap_mod.logit_seed(reference) + delta)
 
     def n_parameters(self) -> int:
