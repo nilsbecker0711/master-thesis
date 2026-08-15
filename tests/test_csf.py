@@ -288,3 +288,48 @@ def test_existing_patch_modes_are_untouched():
         p = Patch(cfg, torch.device("cpu"), MEAN, STD)
         assert torch.allclose(p.render(), torch.full((3, 16, 16), 0.5), atol=1e-6)
         assert p._csf_values is None
+
+
+def test_shape_mask_excludes_padding_from_the_range_fit():
+    """
+    THE BUG THIS PINS. load_reference_rgba pads a cutout with TRANSPARENT
+    BLACK, so 45% of refs/cover_cut.png is RGB 0 and 95% of the region outside
+    the silhouette is. Those pixels have zero headroom for a negative residual
+    and are never pasted — but unmasked they drove fit_to_range's quantile to
+    0.0000, scaled the residual to EXACTLY ZERO, and turned a five-epoch run
+    into a patch that was the unmodified reference image.
+    """
+    import os
+    if not os.path.exists("refs/cover_cut.png"):
+        pytest.skip("reference image not present")
+
+    shaped = Patch(PatchConfig(mode="csf", size=128, scale=0.25,
+                               reference="refs/cover_cut.png", shape="alpha",
+                               csf_threshold=0.25),
+                   torch.device("cpu"), MEAN, STD)
+    st = shaped.stats()
+    assert st["visibility"] == pytest.approx(0.25, rel=0.1)
+    assert st["resid_rms"] > 1e-3
+
+    # and the padding really is the culprit: unmasked, the fit collapses
+    d = torch.randn(1, 3, 128, 128) * 0.01
+    ref = shaped.reference.unsqueeze(0)
+    unmasked = C.fit_to_range(d, ref)
+    masked = C.fit_to_range(d, ref, mask=shaped.shape_mask)
+    assert float(unmasked.abs().max()) == pytest.approx(0.0, abs=1e-9)
+    assert float(masked.abs().max()) > 1e-4
+
+
+def test_tau_ladder_is_monotone_where_it_controls():
+    """tau must move the needle in its usable range, or it is not a knob."""
+    import os
+    if not os.path.exists("refs/cover_cut.png"):
+        pytest.skip("reference image not present")
+    seen = []
+    for tau in (0.05, 0.1, 0.25):
+        p = Patch(PatchConfig(mode="csf", size=128, scale=0.25,
+                              reference="refs/cover_cut.png", shape="alpha",
+                              csf_threshold=tau), torch.device("cpu"), MEAN, STD)
+        seen.append(p.stats()["visibility"])
+        assert seen[-1] == pytest.approx(tau, rel=0.1)
+    assert seen == sorted(seen)

@@ -228,8 +228,9 @@ class Patch:
                                     device=self.device))
             d = csf_mod.csf_residual(self.param.unsqueeze(0), self._csf_budget,
                                      self._csf_values, c.csf_threshold,
-                                     c.csf_beta)
-            d = csf_mod.fit_to_range(d, base.unsqueeze(0))
+                                     c.csf_beta, mask=self.shape_mask)
+            d = csf_mod.fit_to_range(d, base.unsqueeze(0),
+                                     mask=self.shape_mask)
             return (base + d[0]).clamp(0.0, 1.0)
 
         p = torch.sigmoid(self.param)
@@ -431,11 +432,15 @@ class Patch:
             rendered = self.render()
             base = (self.reference if self.reference is not None
                     else torch.full_like(rendered, 0.5))
+            d = rendered - base
+            act = self.shape_mask if self.shape_mask is not None else None
+            dd = d[:, act] if act is not None else d
             return {"visibility": float(csf_mod.realised_visibility(
                         rendered.unsqueeze(0), base.unsqueeze(0),
-                        self._csf_values, self.cfg.csf_beta)),
-                    "resid_rms": float((rendered - base).pow(2).mean().sqrt()),
-                    "resid_absmax": float((rendered - base).abs().max())}
+                        self._csf_values, self.cfg.csf_beta,
+                        mask=self.shape_mask)),
+                    "resid_rms": float(dd.pow(2).mean().sqrt()),
+                    "resid_absmax": float(dd.abs().max())}
         px = torch.sigmoid(self.param)
         lim = self.cfg.logit_clip if self.cfg.logit_clip > 0 else 12.0
         return {"pixel_std": px.std().item(),
@@ -487,6 +492,31 @@ class Patch:
             ctop, cleft = (H - p) // 2, (W - p) // 2
             d = ((top - ctop) ** 2 + (left - cleft) ** 2) ** 0.5
             log(f"[patch] top-left  : ({top}, {left})  {d:.0f}px from centre")
+        if c.mode == "csf":
+            st = self.stats()
+            log(f"[patch] CSF       : {c.csf_model} tau={c.csf_threshold:g} "
+                f"requested -> {st['visibility']:.4f} realised   "
+                f"(residual rms {st['resid_rms']:.5f}, "
+                f"max {st['resid_absmax']:.4f})")
+            frac = st["visibility"] / max(c.csf_threshold, 1e-12)
+            if frac < 0.5:
+                # The failure this exists to prevent: a five-epoch run whose
+                # residual had been scaled to EXACTLY ZERO, so the patch was
+                # the unmodified reference image and nothing was learned. It
+                # was invisible in the logs because only the final metrics
+                # were read. Say it once, loudly, before training starts.
+                log(f"[patch] WARNING   : the residual was shrunk to "
+                    f"{100*frac:.1f}% of the requested budget — "
+                    f"fit_to_range found no headroom.")
+                log("          The base has saturated pixels where the "
+                    "residual cannot fit without clipping.")
+                log("          A cutout PNG under --shape square keeps its "
+                    "TRANSPARENT PADDING as pure black,")
+                log("          which has zero headroom and drives this to 0. "
+                    "Use --shape alpha, or a")
+                log("          reference without large saturated regions, or "
+                    "lower --csf_threshold.")
+
         if c.mode == "lap":
             log(f"[patch] LAP       : alpha={c.lap_alpha:g} beta={c.lap_beta:g} "
                 f"gamma={c.lap_gamma:g}  "

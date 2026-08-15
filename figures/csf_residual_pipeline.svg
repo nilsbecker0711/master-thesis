@@ -1,0 +1,86 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 1130" width="960" height="1130"
+     font-family="Georgia, 'Times New Roman', serif" role="img"
+     aria-label="The CSF-constrained residual pipeline: an unconstrained tensor becomes a half-spectrum, is shaped by the inverse-CSF envelope with the low band zeroed, inverse-transformed, rescaled to a fixed perceptual visibility, shrunk to fit the valid range, and added to the content the patch covers.">
+  <style>
+    .sym { font-size: 19px; fill: #17141C; font-style: italic; }
+    .cap { font-size: 10.5px; fill: #6D6479; font-family: Helvetica, Arial, sans-serif; }
+    .op  { font-size: 13px; font-family: Helvetica, Arial, sans-serif; }
+    .ah  { font-size: 11px; font-family: Helvetica, Arial, sans-serif; font-weight: 700; letter-spacing: 1.1px; }
+    .ab  { font-size: 12.5px; fill: #6D6479; font-family: Helvetica, Arial, sans-serif; }
+    .band{ font-size: 10.5px; font-family: Helvetica, Arial, sans-serif; font-weight: 700; letter-spacing: 1.6px; }
+    .lead{ stroke: #6D6479; stroke-width: 1.6; fill: none; }
+    .axl { font-size: 10px; fill: #8C8499; font-family: Helvetica, Arial, sans-serif; }
+  </style>
+  <rect width="960" height="1130" fill="#FFFFFF"/>
+  <defs>
+    <marker id="a" markerWidth="9" markerHeight="9" refX="7.6" refY="3.2" orient="auto">
+      <path d="M0,0 L7.6,3.2 L0,6.4 z" fill="#6D6479"/></marker>
+  </defs>
+
+  <rect x="24" y="52"  width="912" height="430" rx="6" fill="#E4EBF4" opacity=".38"/>
+  <rect x="24" y="496" width="912" height="150" rx="6" fill="#F8E6E9" opacity=".45"/>
+  <rect x="24" y="660" width="912" height="270" rx="6" fill="#EEE6F4" opacity=".45"/>
+  <text class="band" x="44" y="74"  fill="#3F6798">1 &#183; SHAPE &#8212; PUT THE ENERGY WHERE THE EYE IS BLIND</text>
+  <text class="band" x="44" y="518" fill="#B32639">2 &#183; SCALE &#8212; FIX HOW VISIBLE IT MAY BE</text>
+  <text class="band" x="44" y="682" fill="#6E4A8C">3 &#183; COMPOSE &#8212; ONTO THE CONTENT IT COVERS</text>
+  <rect x="195" y="88" width="210" height="56" rx="5" fill="#F4F2F7" stroke="#D9D3E2" stroke-width="1.4"/>
+  <text class="sym" x="300" y="114" text-anchor="middle">raw</text>
+  <text class="cap" x="300" y="131" text-anchor="middle">unconstrained [3,S,S] &#183; the optimised parameter</text>
+  <path class="lead" d="M300,144 L300,188" marker-end="url(#a)"/>
+  <rect x="148" y="157" width="304" height="26" rx="13" fill="#FFFFFF" stroke="#D9D3E2" stroke-width="1"/>
+  <text class="op" x="300" y="174" text-anchor="middle" fill="#17141C">rfft2</text>
+  <rect x="195" y="196" width="210" height="56" rx="5" fill="#E4EBF4" stroke="#3F6798" stroke-width="1.4"/>
+  <text class="sym" x="300" y="222" text-anchor="middle">Z</text>
+  <text class="cap" x="300" y="239" text-anchor="middle">half-spectrum, complex</text>
+  <path class="lead" d="M300,252 L300,322" marker-end="url(#a)"/>
+  <rect x="148" y="278" width="304" height="26" rx="13" fill="#FFFFFF" stroke="#D9D3E2" stroke-width="1"/>
+  <text class="op" x="300" y="295" text-anchor="middle" fill="#3F6798">&#215;  B(f) / &#8730;(1 + |Z|&#178;)</text>
+  <rect x="195" y="330" width="210" height="56" rx="5" fill="#E4EBF4" stroke="#3F6798" stroke-width="1.4"/>
+  <text class="sym" x="300" y="356" text-anchor="middle">Z<tspan dx="-13" dy="-9" font-size="15" font-style="normal">&#94;</tspan></text>
+  <text class="cap" x="300" y="373" text-anchor="middle">every bin bounded by B(f), phase untouched</text>
+  <path class="lead" d="M300,386 L300,418" marker-end="url(#a)"/>
+  <rect x="148" y="393" width="304" height="26" rx="13" fill="#FFFFFF" stroke="#D9D3E2" stroke-width="1"/>
+  <text class="op" x="300" y="410" text-anchor="middle" fill="#17141C">irfft2</text>
+  <rect x="195" y="426" width="210" height="56" rx="5" fill="#F4F2F7" stroke="#D9D3E2" stroke-width="1.4"/>
+  <text class="sym" x="300" y="452" text-anchor="middle">&#948;&#8320;</text>
+  <text class="cap" x="300" y="469" text-anchor="middle">CSF-shaped residual, arbitrary scale</text>
+  <path class="lead" d="M300,482 L300,570" marker-end="url(#a)"/>
+  <rect x="148" y="540" width="304" height="26" rx="13" fill="#FFFFFF" stroke="#D9D3E2" stroke-width="1"/>
+  <text class="op" x="300" y="557" text-anchor="middle" fill="#B32639">&#215;  &#964; / V(&#948;&#8320;)</text>
+  <rect x="195" y="578" width="210" height="56" rx="5" fill="#F8E6E9" stroke="#B32639" stroke-width="1.4"/>
+  <text class="sym" x="300" y="604" text-anchor="middle">&#948;&#8321;</text>
+  <text class="cap" x="300" y="621" text-anchor="middle">Minkowski visibility exactly &#964;</text>
+  <path class="lead" d="M300,634 L300,734" marker-end="url(#a)"/>
+  <rect x="148" y="701" width="304" height="26" rx="13" fill="#FFFFFF" stroke="#D9D3E2" stroke-width="1"/>
+  <text class="op" x="300" y="718" text-anchor="middle" fill="#6E4A8C">&#215;  fit_to_range(&#948;&#8321;, r)</text>
+  <rect x="195" y="742" width="210" height="56" rx="5" fill="#F4F2F7" stroke="#D9D3E2" stroke-width="1.4"/>
+  <text class="sym" x="300" y="768" text-anchor="middle">&#948;</text>
+  <text class="cap" x="300" y="785" text-anchor="middle">shrunk so r + &#948; stays in [0,1]</text>
+  <path class="lead" d="M300,798 L300,836" marker-end="url(#a)"/>
+  <rect x="148" y="808" width="304" height="26" rx="13" fill="#FFFFFF" stroke="#D9D3E2" stroke-width="1"/>
+  <text class="op" x="300" y="825" text-anchor="middle" fill="#6E4A8C">+ r,  then clamp to [0,1]</text>
+  <rect x="195" y="844" width="210" height="62" rx="5" fill="#EEE6F4" stroke="#6E4A8C" stroke-width="2.2"/>
+  <text class="sym" x="300" y="873" text-anchor="middle">p</text>
+  <text class="cap" x="300" y="890" text-anchor="middle">the patch &#183; r is the covered content</text>
+  <text class="ah" x="470" y="206" fill="#3F6798">WHY A REPARAMETERISATION, NOT A PROJECTION</text>
+  <text class="ab" x="470" y="224"><tspan x="470" dy="0">A projection zeroes the gradient of every component</tspan><tspan x="470" dy="15">sitting on its bound &#8212; exactly where an adversarial</tspan><tspan x="470" dy="15">component wants to live. This squash is smooth</tspan><tspan x="470" dy="15">everywhere and never reaches the bound.</tspan></text>
+  <text class="ah" x="470" y="340" fill="#3F6798">B(f) = &#964; / (4 &#183; CSF(f))</text>
+  <text class="ab" x="470" y="358"><tspan x="470" dy="0">The 4 converts an rfft magnitude to Michelson contrast</tspan><tspan x="470" dy="15">at an assumed mean of 0.5. Below 2 cycles per patch the</tspan><tspan x="470" dy="15">budget is ZEROED: there 1/CSF diverges and the residual</tspan><tspan x="470" dy="15">would become a brightness offset &#8212; a visible rectangle.</tspan></text>
+  <text class="ah" x="470" y="524" fill="#B32639">SHAPE AND SCALE MUST STAY SEPARATE</text>
+  <text class="ab" x="470" y="542"><tspan x="470" dy="0">The envelope bounds each bin but says nothing about their</tspan><tspan x="470" dy="15">sum; the rescale alone would put energy wherever the attack</tspan><tspan x="470" dy="15">likes. Normalising to exactly &#964; is smooth, and the</tspan><tspan x="470" dy="15">constraint is active at every step in any case.</tspan></text>
+  <text class="ah" x="470" y="688" fill="#6E4A8C">A UNIFORM RESCALE, NOT A CLAMP</text>
+  <text class="ab" x="470" y="706"><tspan x="470" dy="0">Clamping is a hard nonlinearity and generates broadband</tspan><tspan x="470" dy="15">harmonics right where the CSF peaks &#8212; measured 1.0 JND</tspan><tspan x="470" dy="15">rising to 5.0 with only 8% of pixels clipped. Scaling every</tspan><tspan x="470" dy="15">coefficient equally leaves the spectrum&#8217;s shape untouched.</tspan></text>
+  <text class="ah" x="470" y="816" fill="#6E4A8C">r IS THE CONTENT THE PATCH REPLACES</text>
+  <text class="ab" x="470" y="834"><tspan x="470" dy="0">--from_image for Patch modes, --gen_reference window for the</tspan><tspan x="470" dy="15">generator. As &#964; &#8594; 0 the patch becomes exactly what it covers,</tspan><tspan x="470" dy="15">so baseline A is a no-op by construction.</tspan></text>
+  <text class="band" x="44" y="962" fill="#3F6798">THE BUDGET B(f), MEASURED</text>
+  <rect x="560" y="966" width="350" height="118" fill="#FFFFFF" stroke="#D9D3E2"/>
+  <rect x="560" y="966" width="10.9" height="118" fill="#F8E6E9" opacity=".7"/>
+  <polyline points="565.5,1084.0 576.4,1081.5 587.3,1081.6 598.3,1081.3 609.2,1080.9 620.2,1080.5 631.1,1079.9 642.0,1079.3 653.0,1078.6 663.9,1077.8 674.8,1076.9 685.8,1076.0 696.7,1074.9 707.7,1073.7 718.6,1072.3 729.5,1070.7 740.5,1068.9 751.4,1066.9 762.3,1064.7 773.3,1062.0 784.2,1059.0 795.2,1055.5 806.1,1051.5 817.0,1046.9 828.0,1041.6 838.9,1035.2 849.8,1027.8 860.8,1019.1 871.7,1009.0 882.7,997.2 893.6,983.0 904.5,966.0" fill="none" stroke="#3F6798" stroke-width="2"/>
+  <text class="axl" x="560" y="1098">0</text>
+  <text class="axl" x="735" y="1098" text-anchor="middle">cycles / pixel</text>
+  <text class="axl" x="910" y="1098" text-anchor="end">Nyquist 0.5</text>
+  <text class="axl" x="554" y="975" text-anchor="end">max</text>
+  <text class="axl" x="554" y="1084" text-anchor="end">0</text>
+  <text class="axl" x="577" y="1076" fill="#B32639">low band zeroed</text>
+  <text class="ab" x="44" y="986"><tspan x="44" dy="0">The allowance rises ~50&#215; from the CSF peak to</tspan><tspan x="44" dy="15">Nyquist. That ramp IS the hiding place, and it is</tspan><tspan x="44" dy="15">the premise the attack stands on: the network reads</tspan><tspan x="44" dy="15">the whole band at full weight, the eye does not.</tspan><tspan x="44" dy="15"></tspan><tspan x="44" dy="15">S = 128, &#964; = 0.25, Barten CSF, 0.0114 cm pixel at</tspan><tspan x="44" dy="15">50 cm &#8212; every value is conditional on that geometry.</tspan></text>
+</svg>

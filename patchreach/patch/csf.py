@@ -419,6 +419,7 @@ def visibility_index(delta: torch.Tensor, csf: torch.Tensor,
 
 def csf_residual(raw: torch.Tensor, budget: torch.Tensor, csf: torch.Tensor,
                  threshold: float = 1.0, beta: float = MINKOWSKI_BETA,
+                 mask: Optional[torch.Tensor] = None,
                  eps: float = 1e-12) -> torch.Tensor:
     r"""
     The full reparameterisation: unconstrained tensor -> residual of exactly
@@ -445,12 +446,25 @@ def csf_residual(raw: torch.Tensor, budget: torch.Tensor, csf: torch.Tensor,
     average one image's headroom into another's.
     """
     delta = bounded_residual(raw, budget)
-    v = visibility_index(delta, csf, reduce="minkowski", beta=beta)
+    # For a SHAPED patch only `delta * mask` is ever pasted, so that is what
+    # the observer sees and what tau must describe. Normalising over the full
+    # square would spend the budget on padding that is thrown away.
+    v = visibility_index(_masked(delta, mask), csf, reduce="minkowski", beta=beta)
     return delta * (threshold / v.clamp(min=eps)).view(-1, 1, 1, 1)
 
 
+def _masked(delta: torch.Tensor, mask: Optional[torch.Tensor]) -> torch.Tensor:
+    """delta restricted to the pasted region; unchanged when there is no mask."""
+    if mask is None:
+        return delta
+    while mask.dim() < delta.dim():
+        mask = mask.unsqueeze(0)
+    return delta * mask.to(delta.dtype)
+
+
 def fit_to_range(delta: torch.Tensor, reference: torch.Tensor,
-                 quantile: float = 0.001, eps: float = 1e-8) -> torch.Tensor:
+                 quantile: float = 0.001, mask: Optional[torch.Tensor] = None,
+                 eps: float = 1e-8) -> torch.Tensor:
     r"""
     Shrink `delta` so that `reference + delta` mostly stays inside [0,1],
     WITHOUT clipping.
@@ -477,26 +491,47 @@ def fit_to_range(delta: torch.Tensor, reference: torch.Tensor,
     trades a tiny, measurable violation for a usable attack — and
     realised_visibility() reports what actually happened rather than what was
     requested.
+
+    `mask` RESTRICTS THE FIT TO PIXELS THAT ARE ACTUALLY PASTED, and omitting
+    it caused a silent total failure. A shaped patch (--shape alpha) loads its
+    cutout padded with TRANSPARENT BLACK, so for refs/cover_cut.png 45% of the
+    square is RGB 0 and 95% of the region outside the silhouette is. Those
+    pixels have zero headroom for a negative residual, they are never pasted,
+    and they are irrelevant to the attack — yet unmasked they drove the
+    quantile to 0.0000, scaled the residual to EXACTLY ZERO, and turned a
+    five-epoch run into a patch that was the unmodified reference image. The
+    same quantile computed inside the silhouette was 1.26, i.e. the residual
+    would have fitted at full scale with room to spare.
+
+    Excluded pixels are given an unreachable ratio rather than being dropped,
+    so the tensor shape stays static and the quantile stays batched.
     """
     allowed = torch.where(delta > 0, 1.0 - reference, reference).clamp(min=0.0)
     ratio = allowed / delta.abs().clamp(min=eps)
+    if mask is not None:
+        while mask.dim() < ratio.dim():
+            mask = mask.unsqueeze(0)
+        ratio = torch.where(mask.expand_as(ratio), ratio,
+                            torch.full_like(ratio, 1e6))
     B = delta.shape[0]
-    flat = ratio.reshape(B, -1)
-    q = torch.quantile(flat.float(), quantile, dim=1).clamp(0.0, 1.0)
+    q = torch.quantile(ratio.reshape(B, -1).float(), quantile, dim=1
+                       ).clamp(0.0, 1.0)
     return delta * q.view(-1, 1, 1, 1)
 
 
 def realised_visibility(patch: torch.Tensor, reference: torch.Tensor,
                         csf: torch.Tensor, beta: float = MINKOWSKI_BETA,
-                        contrast_scale: float = CONTRAST_SCALE) -> torch.Tensor:
+                        contrast_scale: float = CONTRAST_SCALE,
+                        mask: Optional[torch.Tensor] = None) -> torch.Tensor:
     """
     Visibility of the residual that SURVIVED compositing, not the one that was
     requested. This is the number to report: tau is an intent, this is an
     outcome, and the gap between them is the honest measure of how well the
     constraint held.
     """
-    return visibility_index(patch - reference, csf, reduce="minkowski",
-                            beta=beta, contrast_scale=contrast_scale)
+    return visibility_index(_masked(patch - reference, mask), csf,
+                            reduce="minkowski", beta=beta,
+                            contrast_scale=contrast_scale)
 
 
 # ═════════════════════════════════════════════════════════════════════════════
