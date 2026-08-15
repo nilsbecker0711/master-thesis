@@ -72,6 +72,7 @@ from . import placement as placement_mod
 COND_MODES = ("image", "image+ref", "image+ref+cam")
 RESIDUAL_MODES = ("logit", "clip", "none")
 PLACEMENT_MODES = ("center", "gradcam", "semantic", "fixed")
+REFERENCE_MODES = ("center", "window")
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -290,21 +291,56 @@ def center_crop_reference(imgs01: torch.Tensor, p: int, size: int
         r_i = Resize( CenterCrop(x_i) )
 
     Fixed-size spatial centre crop of side p, resized to the generator's output
-    resolution, kept in [0,1] RGB. NOT optimised and NOT searched for — §4 of
-    the specification is explicit that the first implementation must not
-    dynamically locate an object. Detached, so no gradient can reach the image.
+    resolution, kept in [0,1] RGB. NOT optimised and NOT searched for — the
+    first implementation must not dynamically locate an object. Detached, so no
+    gradient can reach the image.
 
     Note the crop is taken at the image CENTRE while the patch may be PLACED
-    elsewhere (gradcam placement). The reference is therefore a visual anchor,
-    not a prediction of what the patch will cover. That is a deliberate
-    property of this first implementation and it is what cam_local exists to
-    partially compensate for.
+    elsewhere (gradcam placement). See window_reference() for the variant that
+    removes that mismatch.
     """
     _, _, H, W = imgs01.shape
     top, left = (H - p) // 2, (W - p) // 2
     crop = imgs01[:, :, top:top + p, left:left + p]
     return F.interpolate(crop, size=(size, size), mode="bilinear",
                          align_corners=False).clamp(0.0, 1.0).detach()
+
+
+def window_reference(imgs01: torch.Tensor, placements: Sequence[Tuple[int, int]],
+                     p: int, size: int) -> torch.Tensor:
+    r"""
+        r_i = Resize( Crop_{t_i, l_i}(x_i) )   — the content the patch REPLACES
+
+    Same fixed rule as center_crop_reference, applied at the placement window
+    instead of the image centre. This is NOT the dynamic object search the
+    specification rules out: nothing is searched for, and the location comes
+    from the placement policy that was going to be used anyway.
+
+    WHY IT MATTERS. A centre crop of a 512x1024 dashcam frame depicts
+    MID-DISTANCE content — building fronts, signs, the far end of the street.
+    Grad-CAM placement puts the patch in the NEAR field, where the same objects
+    would appear several times larger. A measured run sampled the reference at
+    (256, 512) and pasted it at (448, 159): ~400 px away and at a different
+    depth entirely. The result cannot look plausible however well the generator
+    behaves, because the reference violates the scene's perspective.
+
+    That handicaps the central hypothesis: LAP pulls the patch toward a
+    reference that is geometrically incompatible with its destination, so
+    "perceptually coherent" is unreachable by construction rather than by
+    failure of the method. Sampling at the window makes coherence attainable —
+    at step 0 the patch is EXACTLY the content it covers, i.e. invisible.
+
+    COST, and it is real: the attack now starts from a perfect reconstruction
+    of the scene, so baseline A becomes a literal no-op (drop_remote = 0 by
+    construction, not merely small). Every point of degradation is then
+    attributable to the generator. That is a cleaner experiment but a different
+    one, which is why `center` remains the default.
+    """
+    outs = [F.interpolate(imgs01[i:i + 1, :, t:t + p, l:l + p],
+                          size=(size, size), mode="bilinear",
+                          align_corners=False)
+            for i, (t, l) in enumerate(placements)]
+    return torch.cat(outs, dim=0).clamp(0.0, 1.0).detach()
 
 
 def crop_windows(maps: torch.Tensor, placements: Sequence[Tuple[int, int]],
@@ -335,7 +371,8 @@ def resolve_batch_placement(policy: str, H: int, W: int, p: int,
                             cam: Optional[torch.Tensor] = None,
                             clean_pred: Optional[torch.Tensor] = None,
                             cls: int = 0,
-                            xy: Tuple[float, float] = (0.5, 0.5)
+                            xy: Tuple[float, float] = (0.5, 0.5),
+                            margin: int = 0
                             ) -> List[Tuple[int, int]]:
     r"""
     One (top, left) PER IMAGE.
@@ -357,8 +394,11 @@ def resolve_batch_placement(policy: str, H: int, W: int, p: int,
     if policy == "gradcam":
         if cam is None:
             raise ValueError("placement='gradcam' needs the sensitivity map")
+        # `margin` keeps the window off the image border, where roughly half a
+        # patch's receptive field falls outside the image. Only the gradcam
+        # path applies it — the existing policies are untouched.
         return [placement_mod.find_max_response_placement(
-            cam[i, 0], p, centre_if_constant=True)
+            cam[i, 0], p, centre_if_constant=True, margin=margin)
             for i in range(cam.shape[0])]
 
     if policy == "semantic":
@@ -451,7 +491,8 @@ class ConditionalAttack:
                  scale: float, size: int, placement: str = "gradcam",
                  placement_class: int = 0,
                  placement_xy: Tuple[float, float] = (0.5, 0.5),
-                 method: str = "generator"):
+                 method: str = "generator", reference: str = "center",
+                 placement_margin: int = 0):
         self.model = model
         self.cam = cam
         self.generator = generator
@@ -460,10 +501,15 @@ class ConditionalAttack:
         self.placement = placement
         self.placement_class = placement_class
         self.placement_xy = placement_xy
+        self.placement_margin = placement_margin
         if method not in ("generator", "reference"):
             raise ValueError(f"method must be 'generator' or 'reference', "
                              f"got {method!r}")
+        if reference not in REFERENCE_MODES:
+            raise ValueError(f"reference must be one of {REFERENCE_MODES}, "
+                             f"got {reference!r}")
         self.method = method
+        self.reference = reference
 
     def __call__(self, imgs: torch.Tensor, labels: torch.Tensor,
                  deterministic_noise: bool = False) -> dict:
@@ -475,12 +521,10 @@ class ConditionalAttack:
         #      no gradient may run back through the frozen segmentation model
         #      into the generator by this route.
         cam, clean_logits = self.cam(imgs, labels)
-
-        # 3. reference: centre crop in [0,1], never optimised
         imgs01 = denormalise_batch(imgs, self.mean_t, self.std_t).detach()
-        refs = center_crop_reference(imgs01, p, self.size)
 
-        # 5. placement (before generation: cam_local is cropped at the window)
+        # 3. placement FIRST. reference='window' samples r_i at the placement,
+        #    so the ordering is load-bearing; reference='center' does not care.
         # upsample BEFORE argmax — the head emits below input resolution and
         # placement is measured in image pixels. Same order as everywhere else
         # in the repo (upsample_to(...).argmax(1)).
@@ -488,7 +532,13 @@ class ConditionalAttack:
                       if self.placement == "semantic" else None)
         places = resolve_batch_placement(
             self.placement, H, W, p, cam=cam, clean_pred=clean_pred,
-            cls=self.placement_class, xy=self.placement_xy)
+            cls=self.placement_class, xy=self.placement_xy,
+            margin=self.placement_margin)
+
+        # 4. reference in [0,1], never optimised
+        refs = (window_reference(imgs01, places, p, self.size)
+                if self.reference == "window"
+                else center_crop_reference(imgs01, p, self.size))
 
         # 4. generate
         if self.method == "reference":

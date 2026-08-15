@@ -155,6 +155,10 @@ def run_id(a) -> str:
         bits.append(f"cls{a.target_class}")
     if a.gen_lap_alpha or a.gen_lap_beta or a.gen_lap_gamma:
         bits.append(f"lap-a{a.gen_lap_alpha:g}")
+    if a.gen_reference != "center":
+        bits.append(f"ref-{a.gen_reference}")
+    if a.gen_placement_margin:
+        bits.append(f"m{a.gen_placement_margin}")
     if a.cam_objective != "attack":
         bits.append(f"cam-{a.cam_objective}")
     if a.cam_target != "pred":
@@ -422,14 +426,20 @@ def main():
           f"(NOT per-image — the patch is a function, not a tensor)")
     print(f"[gen ] geometry   : {gcfg.size}px generated -> {p_side}px rendered "
           f"(scale {a.patch_scale})")
-    print(f"[gen ] placement  : {a.gen_placement}")
+    print(f"[gen ] placement  : {a.gen_placement}"
+          + (f"  (margin {a.gen_placement_margin}px)"
+             if a.gen_placement_margin and a.gen_placement == "gradcam" else ""))
+    print(f"[gen ] reference  : {a.gen_reference}"
+          + ("  — r_i is the content the patch replaces; baseline A is a no-op"
+             if a.gen_reference == "window" else "  — centre crop"))
     for q in model.parameters():
         assert not q.requires_grad, "the segmentation model must stay frozen"
 
     attack = cg.ConditionalAttack(
         model, cam, generator, mean_t, std_t, a.patch_scale, gcfg.size,
         placement=a.gen_placement, placement_class=a.gen_placement_class,
-        placement_xy=tuple(a.gen_placement_xy), method="generator")
+        placement_xy=tuple(a.gen_placement_xy), method="generator",
+        reference=a.gen_reference, placement_margin=a.gen_placement_margin)
 
     lpips_metric = None if a.no_lpips else cg.build_lpips(device, a.lpips_net)
 
@@ -451,7 +461,9 @@ def main():
         ref_attack = cg.ConditionalAttack(
             model, cam, None, mean_t, std_t, a.patch_scale, gcfg.size,
             placement=a.gen_placement, placement_class=a.gen_placement_class,
-            placement_xy=tuple(a.gen_placement_xy), method="reference")
+            placement_xy=tuple(a.gen_placement_xy), method="reference",
+            reference=a.gen_reference,
+            placement_margin=a.gen_placement_margin)
         baseline_a = evaluate(ref_attack, val_loader, device, a.num_classes,
                               adv_loss, a.exclude_footprint, tgt, lpips_metric)
         summarise("baselineA", baseline_a, tgt)
