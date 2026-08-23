@@ -26,7 +26,8 @@ from _common import (add_model_args, setup_model, image_indices, FIXED10)
 from patchreach.data.cityscapes import (CityscapesSeg, class_name,
                                         norm_tensors, upsample_to)
 from patchreach.diagnostics import report
-from patchreach.metrics.miou import SegMetric, single_image_miou, attack_rates
+from patchreach.metrics.miou import (SegMetric, compare,
+                                     single_image_miou, attack_rates)
 from patchreach.metrics.curves import untargeted_reach, collapse_point
 from patchreach.patch.spec import Patch
 from patchreach.utils import get_device, seed_everything, increment_path
@@ -133,8 +134,10 @@ def main():
                        loss_fn, a.num_classes, tgt, mean_t, std_t)
 
     agg = {k: v.compute() for k, v in m.items()}
+    agg.update(compare(m["clean_all"], m["adv_all"], prefix="all_"))
+    agg.update(compare(m["clean_rem"], m["adv_rem"], prefix="rem_"))
     ciou, aiou = m["clean_rem"].per_class(), m["adv_rem"].per_class()
-    agg["drop_remote_dataset"] = agg["clean_rem"] - agg["adv_rem"]
+    agg["drop_remote_dataset"] = agg["rem_drop"]
     drops = torch.tensor([r["drop_remote"] for r in per_image])
     flips = torch.tensor([r["any_flip_rate"] for r in per_image])
 

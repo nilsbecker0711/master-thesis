@@ -64,7 +64,7 @@ from _common import (add_model_args, add_generator_args, build_generator_config,
 from patchreach.data.cityscapes import CityscapesSeg, norm_tensors, upsample_to
 from patchreach.diagnostics import conditional as cviz, report
 from patchreach.losses import adversarial
-from patchreach.metrics.miou import SegMetric
+from patchreach.metrics.miou import SegMetric, compare
 from patchreach.patch import conditional_generator as cg
 from patchreach.patch import segmentation_cam
 from patchreach.patch.lap import asi, agi, ade, magnitude_report
@@ -239,9 +239,24 @@ def evaluate(attack: cg.ConditionalAttack, loader, device, K: int,
         placements += [list(x) for x in out["placements"]]
         lpips_vals += cg.lpips_distances(lpips_metric, p_batch, r_batch)
 
-    res = {k: m.compute() for k, m in ms.items()}
-    res["drop_all"] = res["clean_all"] - res["adv_all"]
-    res["drop_remote"] = res["clean_rem"] - res["adv_rem"]
+    # BOTH class sets. 'gt' counts a class iff it has ground truth, so clean
+    # and adv share one denominator; 'union' is the historical behaviour, where
+    # a rare class leaving the mean once moved drop_remote by -3.6 points and
+    # made an inert attack look as though it IMPROVED the model.
+    res = {}
+    for scope, ck, ak in (("all", "clean_all", "adv_all"),
+                          ("remote", "clean_rem", "adv_rem")):
+        d = compare(ms[ck], ms[ak])
+        tag = "all" if scope == "all" else "rem"
+        res[f"clean_{tag}"] = d["clean"]
+        res[f"adv_{tag}"] = d["adv"]
+        res[f"clean_{tag}_union"] = d["clean_union"]
+        res[f"adv_{tag}_union"] = d["adv_union"]
+        res[f"drop_{scope}"] = d["drop"]
+        res[f"drop_{scope}_union"] = d["drop_union"]
+        res[f"n_classes_{scope}"] = d["n_classes_gt"]
+        res[f"n_classes_{scope}_union_clean"] = d["n_classes_clean_union"]
+        res[f"n_classes_{scope}_union_adv"] = d["n_classes_adv_union"]
     res["any_flip_rate"] = 100.0 * flips / max(n_flip, 1)
     res["attack_loss"] = sum(losses) / max(len(losses), 1)
     if target_class is not None:
@@ -261,6 +276,15 @@ def evaluate(attack: cg.ConditionalAttack, loader, device, K: int,
 def summarise(tag: str, ev: dict, target_class=None, log=print):
     extra = (f"  hit={ev['target_hit_rate']:.1f}%" if target_class is not None
              else f"  flip={ev['any_flip_rate']:.1f}%")
+    if ev.get("n_classes_remote_union_clean") != ev.get("n_classes_remote_union_adv"):
+        # A class entered or left the union denominator, so the 'union' numbers
+        # for clean and adv are means over DIFFERENT class sets and their
+        # difference is not a measurement. The 'gt' numbers are unaffected.
+        log(f"  [!] class set moved: union counts "
+            f"{ev['n_classes_remote_union_clean']} clean vs "
+            f"{ev['n_classes_remote_union_adv']} adv — "
+            f"drop_remote_union={ev['drop_remote_union']:+.2f} is an artefact, "
+            f"drop_remote={ev['drop_remote']:+.2f} is the number")
     lp = ev.get("lpips") or []
     lp_s = (f"  LPIPS={sum(lp)/len(lp):.4f}" if lp else "")
     log(f"  [{tag:<9s}] remote {ev['adv_rem']:6.2f} "

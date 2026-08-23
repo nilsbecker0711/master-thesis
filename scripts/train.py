@@ -35,7 +35,7 @@ from _common import add_model_args, add_patch_args, setup_model, build_patch
 from patchreach.data.cityscapes import CityscapesSeg, norm_tensors, upsample_to
 from patchreach.diagnostics import report
 from patchreach.losses import adversarial, reach as reach_mod
-from patchreach.metrics.miou import SegMetric
+from patchreach.metrics.miou import SegMetric, compare
 from patchreach.patch.lap import magnitude_report, rationality_report
 from patchreach.utils import (get_device, seed_everything, increment_path,
                               channel_probe)
@@ -147,9 +147,22 @@ def evaluate(model, loader, patch, device, K, target_class=None):
             n_hit += int(nt.sum())
             hits += int((nt & (pa == target_class)).sum())
 
-    out = {k: m.compute() for k, m in ms.items()}
-    out["drop_all"] = out["clean_all"] - out["adv_all"]
-    out["drop_remote"] = out["clean_rem"] - out["adv_rem"]
+    # See metrics/miou.py: 'gt' fixes the counted class set from the labels so
+    # clean and adv share a denominator. 'union' is kept for continuity with
+    # runs recorded before the distinction existed.
+    out = {}
+    for scope, ck, ak, tag in (("all", "clean_all", "adv_all", "all"),
+                               ("remote", "clean_rem", "adv_rem", "rem")):
+        d = compare(ms[ck], ms[ak])
+        out[f"clean_{tag}"] = d["clean"]
+        out[f"adv_{tag}"] = d["adv"]
+        out[f"clean_{tag}_union"] = d["clean_union"]
+        out[f"adv_{tag}_union"] = d["adv_union"]
+        out[f"drop_{scope}"] = d["drop"]
+        out[f"drop_{scope}_union"] = d["drop_union"]
+        out[f"n_classes_{scope}"] = d["n_classes_gt"]
+        out[f"n_classes_{scope}_union_clean"] = d["n_classes_clean_union"]
+        out[f"n_classes_{scope}_union_adv"] = d["n_classes_adv_union"]
     out["any_flip_rate"] = 100.0 * flips / max(n_flip, 1)
     if target_class is not None:
         out["target_hit_rate"] = 100.0 * hits / max(n_hit, 1)
