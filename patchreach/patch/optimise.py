@@ -230,6 +230,15 @@ def attack_image(model, img, label, patch, *,
                              target_class if loss_fn == "ipatch_cospgd"
                              else None)
 
+    # The END-OF-RUN patch statistics, promoted into the record.
+    # For csf that is realised visibility — tau is an INTENT, this is the
+    # OUTCOME, and only the outcome is reportable. It previously lived solely
+    # in `history`, which the population scripts strip before writing
+    # summary.json, so a population run could not report the one number the
+    # whole CSF family's claim rests on. For raw it carries frac_at_clip,
+    # which is the early warning for saturation collapse across a population.
+    final_stats = {f"final_{k}": v for k, v in patch.stats().items()}
+
     degraded = best_drop > (clean_rem - final_rem) + 1.0
     if degraded and verbose:
         log(f"\n  WARNING: best drop was {best_drop:+.2f} but the FINAL "
@@ -273,7 +282,7 @@ def attack_image(model, img, label, patch, *,
             "n_classes_adv_union": cmp_rem["n_classes_adv_union"],
             "class_set_moved": bool(cmp_rem["n_classes_clean_union"]
                                     != cmp_rem["n_classes_adv_union"]),
-            **rates, "history": history}
+            **final_stats, **rates, "history": history}
 
 
 def _save_png(patch, path):
