@@ -67,7 +67,15 @@ def add_patch_args(p):
     p.add_argument("--shape_thresh", type=float, default=0.15,
                    help="chroma keying distance threshold")
     p.add_argument("--placement", default="center",
-                   choices=["center", "fixed", "semantic"])
+                   choices=["center", "fixed", "semantic", "gradcam"],
+                   help="where the patch goes. 'gradcam' is the argmax over "
+                        "MeanPool(M_i) — the per-image sensitivity hotspot, "
+                        "the SAME policy --gen_placement gradcam uses on the "
+                        "conditional generator. It is only coherent for "
+                        "PER-IMAGE attacks (overfit.py, overfit_population.py): "
+                        "a universal patch is shared across images while the "
+                        "map is not, so train.py would be placing one tensor "
+                        "by a different image's sensitivity every batch.")
     p.add_argument("--placement_class", type=int, default=0,
                    help="trainId for --placement semantic. 0=road is "
                         "omnipresent in Cityscapes; 1=sidewalk is absent from "
@@ -75,6 +83,16 @@ def add_patch_args(p):
     p.add_argument("--placement_xy", type=float, nargs=2, default=[0.5, 0.5],
                    help="normalised (y, x) CENTRE for --placement fixed. "
                         "(0.75, 0.5) is the road surface straight ahead.")
+    p.add_argument("--placement_margin", type=int, default=0,
+                   help="keep a --placement gradcam window this many px from "
+                        "every image border. DEFAULT 0 reproduces the "
+                        "unmargined argmax and leaves center/fixed/semantic "
+                        "untouched. The sensitivity map's hottest ridge is the "
+                        "near-field road boundary along the bottom of a "
+                        "dashcam frame, so the argmax tends to pin the patch "
+                        "flush against the edge, where ~half its receptive "
+                        "field lies outside the image and can never be "
+                        "influenced. Try p/2 (64 at the default geometry).")
     p.add_argument("--reference", default=None)
     p.add_argument("--lap_alpha", type=float, default=0.0)
     p.add_argument("--lap_beta", type=float, default=0.0)
@@ -90,7 +108,46 @@ def add_patch_args(p):
                         "with score_reference.py --sweep_edge; aim for "
                         "free/sil of 0.5-0.7.")
     p.add_argument("--init_from", default=None)
+    add_cam_args(p)
     add_csf_args(p)
+    return p
+
+
+def add_cam_args(p):
+    r"""
+    Sensitivity-map arguments — shared by add_patch_args and
+    add_generator_args, one definition.
+
+    These used to live only on the generator, because gradcam placement lived
+    only on the generator. --placement gradcam brings the same policy to the
+    per-image patch modes, and it needs the same map, built the same way. A
+    second copy of these flags is exactly the drift that put three bugs into
+    train.py/overfit.py before add_patch_args existed.
+
+    Guarded like add_csf_args so a parser that ever takes BOTH groups does not
+    raise on the duplicate option strings.
+    """
+    if any(a.option_strings and "--cam_objective" in a.option_strings
+           for a in p._actions):
+        return p
+    g = p.add_argument_group("sensitivity map (Grad-CAM)")
+    g.add_argument("--cam_objective", default="attack",
+                   choices=["attack", "ce", "cospgd", "ipatch_cospgd"],
+                   help="ABLATION F. Scalar S_seg differentiated for the CAM. "
+                        "'attack' reuses --loss_fn so the map and the attack "
+                        "share one objective. S_seg = -L, because every loss "
+                        "in adversarial.py is MINIMISED to attack while "
+                        "Grad-CAM needs a score to increase.")
+    g.add_argument("--cam_target", default="pred", choices=["pred", "gt"],
+                   help="labels for S_seg. 'pred' uses the model's own argmax, "
+                        "keeping the LABEL-FREE threat model that --placement "
+                        "semantic already assumes. 'gt' is a strictly stronger "
+                        "attacker and must be declared as such.")
+    g.add_argument("--cam_layer", type=int, default=-1,
+                   help="which feature map from the hooked module. -1 = "
+                        "deepest/coarsest, the standard Grad-CAM choice.")
+    g.add_argument("--cam_module", default="backbone",
+                   help="dotted path inside the mmseg segmentor to hook")
     return p
 
 
@@ -155,23 +212,7 @@ def add_generator_args(p):
     add_csf_args(p)
 
     # ── sensitivity map ──────────────────────────────────────────────────────
-    g.add_argument("--cam_objective", default="attack",
-                   choices=["attack", "ce", "cospgd", "ipatch_cospgd"],
-                   help="ABLATION F. Scalar S_seg differentiated for the CAM. "
-                        "'attack' reuses --loss_fn so the map and the attack "
-                        "share one objective. S_seg = -L, because every loss "
-                        "in adversarial.py is MINIMISED to attack while "
-                        "Grad-CAM needs a score to increase.")
-    g.add_argument("--cam_target", default="pred", choices=["pred", "gt"],
-                   help="labels for S_seg. 'pred' uses the model's own argmax, "
-                        "keeping the LABEL-FREE threat model that --placement "
-                        "semantic already assumes. 'gt' is a strictly stronger "
-                        "attacker and must be declared as such.")
-    g.add_argument("--cam_layer", type=int, default=-1,
-                   help="which feature map from the hooked module. -1 = "
-                        "deepest/coarsest, the standard Grad-CAM choice.")
-    g.add_argument("--cam_module", default="backbone",
-                   help="dotted path inside the mmseg segmentor to hook")
+    add_cam_args(p)
 
     # ── placement ────────────────────────────────────────────────────────────
     g.add_argument("--gen_placement", default="gradcam",
@@ -259,6 +300,7 @@ def build_patch(a, device, mean_t, std_t, generator=None,
         shape=a.shape, placement=a.placement,
         placement_class=a.placement_class, reference=a.reference,
         placement_xy=tuple(a.placement_xy),
+        placement_margin=getattr(a, "placement_margin", 0),
         reference_fit=a.reference_fit, logit_clip=a.logit_clip, shape_bg=a.shape_bg, shape_thresh=a.shape_thresh,
         lap_alpha=a.lap_alpha, lap_beta=a.lap_beta, lap_gamma=a.lap_gamma,
         lap_edge_thresh=a.lap_edge_thresh,

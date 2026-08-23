@@ -118,13 +118,33 @@ def find_semantic_placement(clean_pred: torch.Tensor, cls: int, p: int
 def resolve(policy: str, H: int, W: int, p: int,
             clean_pred: Optional[torch.Tensor] = None,
             cls: int = 0,
-            xy: Tuple[float, float] = (0.5, 0.5)) -> Tuple[int, int]:
-    """
+            xy: Tuple[float, float] = (0.5, 0.5),
+            score_map: Optional[torch.Tensor] = None,
+            margin: int = 0) -> Tuple[int, int]:
+    r"""
     Top-left corner under the configured policy.
 
     center   : image centre — the default and the strongest baseline.
     fixed    : `xy` as a normalised CENTRE, clipped to fit.
     semantic : largest region of `cls` in clean_pred; centre if unavailable.
+    gradcam  : argmax over MeanPool(score_map) — the sensitivity hotspot.
+
+    GRADCAM IS PER-IMAGE BY CONSTRUCTION and is only coherent for a per-image
+    attack. A universal patch is one tensor shared across the dataset while the
+    sensitivity map is not shared, so "place the shared patch at this image's
+    hotspot" is not a well-defined policy for train.py. overfit.py and
+    overfit_population.py optimise a fresh patch per image, so patch and
+    placement are per-image together and the policy is consistent.
+
+    Semantics are IDENTICAL to conditional_generator.resolve_batch_placement's
+    gradcam branch — same helper, same centre_if_constant, same margin — so the
+    per-image ablation and the generator's ablation A-vs-B measure the same
+    thing. That equality is pinned by a test; it is the whole reason gradcam
+    delegates here rather than reimplementing the argmax.
+
+    MISSING MAP RAISES rather than falling back to centre. Silent fallback to
+    centre is the exact bug class spec.py's ordering note exists to prevent —
+    it produces a plausible number for a placement policy that never ran.
     """
     if policy == "center" or (policy == "semantic" and clean_pred is None):
         return (H - p) // 2, (W - p) // 2
@@ -137,5 +157,16 @@ def resolve(policy: str, H: int, W: int, p: int,
 
     if policy == "semantic":
         return find_semantic_placement(clean_pred, cls, p)
+
+    if policy == "gradcam":
+        if score_map is None:
+            raise ValueError(
+                "placement='gradcam' needs the sensitivity map. Pass "
+                "score_map= to resolve(), or a `cam` to optimise.prepare(). "
+                "Falling back to centre here would report a gradcam run that "
+                "was actually centred.")
+        return find_max_response_placement(score_map, p,
+                                           centre_if_constant=True,
+                                           margin=margin)
 
     raise ValueError(f"unknown placement policy {policy!r}")
