@@ -311,13 +311,49 @@ def test_shape_mask_excludes_padding_from_the_range_fit():
     assert st["visibility"] == pytest.approx(0.25, rel=0.1)
     assert st["resid_rms"] > 1e-3
 
-    # and the padding really is the culprit: unmasked, the fit collapses
+    # The mask still matters, but no longer HERE: the transparent padding is
+    # itself saturated (exactly 0.0), so the min_headroom exclusion added for
+    # the full-region case now catches it too and the unmasked fit survives.
+    # The two fixes overlap on this reference; neither is redundant, because
+    # padding need not be saturated in general.
     d = torch.randn(1, 3, 128, 128) * 0.01
     ref = shaped.reference.unsqueeze(0)
-    unmasked = C.fit_to_range(d, ref)
-    masked = C.fit_to_range(d, ref, mask=shaped.shape_mask)
-    assert float(unmasked.abs().max()) == pytest.approx(0.0, abs=1e-9)
-    assert float(masked.abs().max()) > 1e-4
+    assert float(C.fit_to_range(d, ref).abs().max()) > 1e-4
+    assert float(C.fit_to_range(d, ref, mask=shaped.shape_mask
+                                ).abs().max()) > 1e-4
+
+    # Where the mask is still load-bearing is the VISIBILITY normalisation:
+    # tau describes the perturbation that is composited, so spending budget on
+    # padding that is discarded would under-shoot the real cost.
+    csf, budget = C.patch_budget(128, threshold=0.25)
+    raw = torch.randn(1, 3, 128, 128)
+    m = C.csf_residual(raw, budget, csf, 0.25, mask=shaped.shape_mask)
+    u = C.csf_residual(raw, budget, csf, 0.25)
+    assert float(C.visibility_index(C._masked(m, shaped.shape_mask), csf))         == pytest.approx(0.25, rel=1e-3)
+    assert not torch.allclose(m, u)
+
+
+def test_saturated_pixels_do_not_veto_the_whole_residual():
+    """
+    A pixel already at 0 or 1 has zero headroom in one direction, so its
+    headroom ratio is 0 and it drags any quantile down with it. Over a full
+    512x1024 frame a 0.1% quantile tolerates 524 such pixels and a Cityscapes
+    sky blow-out alone exceeds that: a full-image spectral probe scaled EVERY
+    band to exactly zero and reported "range-limited" for all six.
+
+    Excluding them is also physically right — clamping a pixel that is already
+    at 1.0 returns 1.0, so it was never going to move and must not veto the
+    scale of every pixel that could.
+    """
+    torch.manual_seed(0)
+    img = torch.rand(1, 3, 256, 512) * 0.5 + 0.2
+    img[:, :, :40, :] = 1.0                      # blown sky
+    img[:, :, -30:, :] = 0.0                     # black hood
+    d = torch.randn(1, 3, 256, 512) * 0.01
+
+    fitted = C.fit_to_range(d, img)
+    assert float(fitted.pow(2).mean().sqrt()) > 1e-3
+    assert float(fitted.abs().max() / d.abs().max()) > 0.5
 
 
 def test_tau_ladder_is_monotone_where_it_controls():

@@ -443,10 +443,20 @@ class Patch:
             d = rendered - base
             act = self.shape_mask if self.shape_mask is not None else None
             dd = d[:, act] if act is not None else d
+            # BOTH conventions. tau is enforced under the mu=0.5 assumption,
+            # but Cityscapes windows measure mu ~ 0.25, so the locally-measured
+            # visibility is roughly TWICE the nominal one. Reporting only the
+            # first would hide a systematic 2x under-statement.
+            vis_local = float(csf_mod.visibility_index(
+                csf_mod._masked(d.unsqueeze(0), self.shape_mask),
+                self._csf_values, beta=self.cfg.csf_beta,
+                contrast_scale=csf_mod.local_contrast_scale(
+                    base.unsqueeze(0), self.shape_mask)))
             return {"visibility": float(csf_mod.realised_visibility(
                         rendered.unsqueeze(0), base.unsqueeze(0),
                         self._csf_values, self.cfg.csf_beta,
                         mask=self.shape_mask)),
+                    "visibility_local": vis_local,
                     "resid_rms": float(dd.pow(2).mean().sqrt()),
                     "resid_absmax": float(dd.abs().max())}
         px = torch.sigmoid(self.param)

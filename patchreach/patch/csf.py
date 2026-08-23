@@ -266,6 +266,43 @@ def csf_map(H: int, W: int,
 # constant, but never report tau=1 as literally "one JND" without this caveat.
 CONTRAST_SCALE = 4.0
 
+# MU_FLOOR guards 2/mu against a near-black window, where the ratio diverges.
+MU_FLOOR = 0.02
+
+
+def local_contrast_scale(base: torch.Tensor,
+                         mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+    r"""
+    2 / mu, per sample and per channel, with mu measured on `base`.
+
+    The alternative to CONTRAST_SCALE's mu = 0.5 assumption, and MEASURABLY
+    the more accurate one on this data. Cityscapes frames are dark: the local
+    mean inside a patch window was measured at 0.19-0.34 across five scenes,
+    not 0.5. Michelson contrast is A/mu, so assuming 0.5 where the truth is
+    0.25 UNDER-STATES contrast by 2x, and every patch generated under that
+    assumption is about twice as visible as its tau claims.
+
+    Confirmed by the spectral probe: at the same nominal tau = 1, the fixed
+    convention admitted rms 0.0264 where the local one admitted 0.0122 --
+    a factor of 2.16.
+
+    Per CHANNEL rather than per luminance, because visibility_index() takes the
+    rfft of each colour channel separately; a single luminance mean would apply
+    one channel's contrast to another's spectrum.
+    """
+    if base.dim() == 3:
+        base = base.unsqueeze(0)
+    if mask is None:
+        mu = base.mean(dim=(2, 3), keepdim=True)
+    else:
+        m = mask.to(base.dtype)
+        while m.dim() < base.dim():
+            m = m.unsqueeze(0)
+        m = m.expand_as(base)
+        mu = ((base * m).sum(dim=(2, 3), keepdim=True)
+              / m.sum(dim=(2, 3), keepdim=True).clamp(min=1.0))
+    return 2.0 / mu.clamp(min=MU_FLOOR)
+
 
 def amplitude_budget(csf: torch.Tensor, threshold: float = 1.0,
                      max_amplitude: float = 1.0,
@@ -464,6 +501,7 @@ def _masked(delta: torch.Tensor, mask: Optional[torch.Tensor]) -> torch.Tensor:
 
 def fit_to_range(delta: torch.Tensor, reference: torch.Tensor,
                  quantile: float = 0.001, mask: Optional[torch.Tensor] = None,
+                 min_headroom: float = 1e-3,
                  eps: float = 1e-8) -> torch.Tensor:
     r"""
     Shrink `delta` so that `reference + delta` mostly stays inside [0,1],
@@ -508,6 +546,21 @@ def fit_to_range(delta: torch.Tensor, reference: torch.Tensor,
     """
     allowed = torch.where(delta > 0, 1.0 - reference, reference).clamp(min=0.0)
     ratio = allowed / delta.abs().clamp(min=eps)
+
+    # SATURATED PIXELS ARE EXCLUDED, not merely down-weighted. A pixel already
+    # at 0 or 1 has exactly zero headroom in one direction, so its ratio is 0
+    # and it drags any quantile to 0 with it. Over a 128x128 patch a 0.1%
+    # quantile tolerates ~49 such pixels; over a full 512x1024 frame it
+    # tolerates 524, and a Cityscapes sky blow-out alone exceeds that. The
+    # measured consequence: a full-image probe scaled EVERY band to exactly
+    # zero and reported "range-limited" for all six, producing no measurement.
+    #
+    # Excluding them is also the physically correct choice. Where the base is
+    # already 1.0 and the residual pushes up, clamping returns 1.0 — the pixel
+    # was never going to move, so it should not be allowed to veto the scale of
+    # every pixel that could.
+    saturated = allowed <= min_headroom
+    ratio = torch.where(saturated, torch.full_like(ratio, 1e6), ratio)
     if mask is not None:
         while mask.dim() < ratio.dim():
             mask = mask.unsqueeze(0)
@@ -569,7 +622,8 @@ def rapsd(x: torch.Tensor, n_bins: int = 64
 
 
 def report(H: int, W: int, geometry: ViewingGeometry = ViewingGeometry(),
-           model: str = "barten", threshold: float = 1.0, log=print):
+           model: str = "barten", threshold: float = 1.0,
+           min_cycles: float = 2.0, log=print):
     """
     Print where the budget actually is, before anyone trusts it.
 
@@ -577,8 +631,13 @@ def report(H: int, W: int, geometry: ViewingGeometry = ViewingGeometry(),
     frequency is not orders of magnitude larger than at the CSF peak, there is
     no gap to hide in and the premise fails at step zero.
     """
-    csf = csf_map(H, W, geometry, model)
-    budget = amplitude_budget(csf, threshold)
+    # patch_budget, NOT amplitude_budget. The naive budget has no low-frequency
+    # cutoff, so 1/CSF diverges at DC and the lowest band is printed with the
+    # LARGEST allowance of any frequency -- the exact inversion documented as a
+    # failure mode above. A probe run printed 0.0770 for 0.00-0.02 cyc/px
+    # against 0.0026 at Nyquist, i.e. the table said the opposite of what the
+    # attack actually does.
+    csf, budget = patch_budget(H, geometry, model, threshold, min_cycles)
     f_cpp = radial_frequency_cpp(H, W)
     geometry.describe(log)
     log(f"[csf ] model     : {model}  threshold tau = {threshold:g} JND")
