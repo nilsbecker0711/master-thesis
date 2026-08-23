@@ -375,6 +375,7 @@ def frequency_sensitivity(model, imgs: torch.Tensor, patch, mean_t, std_t,
 
 
 def summarise(per_image: Sequence[Sequence[Dict]], target: float,
+              normalise: str = "visibility",
               min_signal: float = 0.5, log=print) -> Dict:
     r"""
     Aggregate per-image band sweeps and answer the image-boundness question.
@@ -498,7 +499,11 @@ def summarise(per_image: Sequence[Sequence[Dict]], target: float,
             "peak_agreement": agreement,
             "image_bound": not stable,
             "band_stability": "stable" if stable else "scene_dependent",
-            "verdict": "gap" if gap else "no_gap",
+            "verdict": ("efficiency" if normalise == "rms"
+                        else ("gap" if gap else "no_gap")),
+            "normalise": normalise,
+            "efficiency_ratio": (float(realised[lo_band])
+                                 / max(float(realised[hi_band]), 1e-9)),
             "max_flip_remote": float(mean.max()),
             "min_signal": min_signal}
 

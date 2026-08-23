@@ -124,8 +124,12 @@ def main():
     print(f"\n{'=' * 72}")
     print(" WHAT THE EYE ALLOWS — amplitude budget by band")
     print(f"{'=' * 72}")
+    # The table must describe THIS run. a.csf_threshold is the attack modes'
+    # default and is unrelated to --target, so printing it made all four rungs
+    # of a tau ladder show an identical header reading "tau = 0.25".
+    header_tau = target if a.normalise == "visibility" else a.csf_threshold
     csf_report = csf_mod.report(a.patch_size, a.patch_size, geometry,
-                                a.csf_model, a.csf_threshold)
+                                a.csf_model, header_tau, a.csf_min_cycles)
 
     print(f"\n{'=' * 72}")
     print(f" WHAT THE NETWORK READS — {a.arch} ({spec.bracket} attention)")
@@ -148,7 +152,7 @@ def main():
             contrast_mean=a.contrast_mean, csf_model=a.csf_model,
             geometry=geometry, beta=a.csf_beta))
 
-    summary = spectral.summarise(per_image, target, a.min_signal)
+    summary = spectral.summarise(per_image, target, a.normalise, a.min_signal)
 
     out_dir = (Path(a.out_dir)
                / f"{a.arch}_{a.img_h}x{a.img_w}_{a.region}_{a.normalise}")
