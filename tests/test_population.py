@@ -176,6 +176,44 @@ def test_pooled_classes_argument_selects_which_number_is_headline():
         pytest.approx(pop.pooled("gt")["drop_remote_union"])
 
 
+def test_record_carries_end_of_run_patch_stats():
+    r"""
+    These previously lived only in `history`, which the population scripts strip
+    before writing summary.json — so a population run could not report realised
+    visibility, the one number the CSF family's claim rests on, nor
+    frac_at_clip, the early warning for saturation collapse. analysis/pick_lr.py
+    reads them to select a learning rate at equal perceptual cost, so losing
+    them silently breaks that selection rather than erroring.
+    """
+    model, img, label, patch = _setup()
+    clean = optimise.prepare(model, img, patch, 64, 64)
+    rec = optimise.attack_image(model, img, label, patch, steps=4, log_every=2,
+                                num_classes=4, clean_logits=clean,
+                                verbose=False)
+    # raw mode reports spread and saturation
+    assert "final_frac_at_clip" in rec
+    assert "final_pixel_std" in rec
+    assert all(k.startswith("final_") for k in rec if k.startswith("final_"))
+
+
+def test_csf_record_carries_realised_visibility():
+    """tau is an INTENT; realised visibility is the OUTCOME, and only the
+    outcome is reportable."""
+    img = (torch.rand(1, 3, 64, 64) - MEAN) / STD
+    label = torch.randint(0, 4, (1, 64, 64))
+    torch.manual_seed(0)
+    model = _TinySeg(4)
+    patch = Patch(PatchConfig(mode="csf", size=16, scale=0.25),
+                  torch.device("cpu"), MEAN, STD)
+    clean = optimise.prepare(model, img, patch, 64, 64, from_image=True,
+                             mean_t=MEAN, std_t=STD)
+    rec = optimise.attack_image(model, img, label, patch, steps=4, log_every=2,
+                                num_classes=4, clean_logits=clean,
+                                verbose=False)
+    assert rec["final_visibility"] > 0
+    assert "final_resid_rms" in rec
+
+
 def test_attack_image_records_both_class_sets():
     model, img, label, patch = _setup()
     clean = optimise.prepare(model, img, patch, 64, 64)
