@@ -1,0 +1,594 @@
+% =====================================================================
+%  STANDALONE. The bibliography is embedded below via filecontents, so
+%  this single file is the whole document -- no external .bib needed.
+%
+%      pdflatex csf_patch_procedure
+%      bibtex   csf_patch_procedure
+%      pdflatex csf_patch_procedure
+%      pdflatex csf_patch_procedure
+%
+%  or simply:  latexmk -pdf csf_patch_procedure
+%
+%  Describes exactly:
+%      python scripts/overfit.py --patch_mode csf --from_image \
+%             --loss_fn cospgd --csf_threshold <tau> --steps <K>
+%
+%  PROVENANCE IS MARKED THROUGHOUT. Elements carrying a citation come
+%  from the literature; those marked [novel] have no external source and
+%  must be defended in the text rather than cited. Sec. 11 tabulates it.
+% =====================================================================
+\documentclass[11pt,a4paper]{article}
+
+\begin{filecontents*}{csf_patch_procedure.bib}
+@inproceedings{barten2003,
+  author    = {Barten, Peter G. J.},
+  title     = {Formula for the contrast sensitivity of the human eye},
+  booktitle = {Image Quality and System Performance, Proc. SPIE},
+  volume    = {5294},
+  pages     = {231--238},
+  year      = {2003},
+  doi       = {10.1117/12.537476}
+}
+@article{galinska2026csflow,
+  author  = {Galinska, Malgorzata and Pogodzinski, Bart and Lenssen, Jan Eric},
+  title   = {{CSFlow}: Aligning Flow Matching with Human Contrast Sensitivity},
+  journal = {arXiv preprint arXiv:2606.08833},
+  year    = {2026}
+}
+@article{watson2005sso,
+  author  = {Watson, Andrew B. and Ahumada, Albert J.},
+  title   = {A standard model for foveal detection of spatial contrast},
+  journal = {Journal of Vision},
+  volume  = {5}, number = {9}, pages = {717--740}, year = {2005},
+  doi     = {10.1167/5.9.6}
+}
+@article{quick1974,
+  author  = {Quick, R. F.},
+  title   = {A vector-magnitude model of contrast detection},
+  journal = {Kybernetik},
+  volume  = {16}, number = {2}, pages = {65--67}, year = {1974},
+  doi     = {10.1007/BF00271628}
+}
+@article{robson1981,
+  author  = {Robson, J. G. and Graham, Norma},
+  title   = {Probability summation and regional variation in contrast
+             sensitivity across the visual field},
+  journal = {Vision Research},
+  volume  = {21}, number = {3}, pages = {409--418}, year = {1981},
+  doi     = {10.1016/0042-6989(81)90169-3}
+}
+@article{watson1979,
+  author  = {Watson, Andrew B.},
+  title   = {Probability summation over time},
+  journal = {Vision Research},
+  volume  = {19}, number = {5}, pages = {515--522}, year = {1979},
+  doi     = {10.1016/0042-6989(79)90136-6}
+}
+@book{michelson1927,
+  author = {Michelson, Albert A.}, title = {Studies in Optics},
+  publisher = {University of Chicago Press}, year = {1927}
+}
+@article{brown2017patch,
+  author  = {Brown, Tom B. and Man{\'e}, Dandelion and Roy, Aurko and
+             Abadi, Mart{\'\i}n and Gilmer, Justin},
+  title   = {Adversarial Patch},
+  journal = {arXiv preprint arXiv:1712.09665}, year = {2017}
+}
+@inproceedings{tan2021lap,
+  author    = {Tan, Jia and Ji, Nan and Xie, Haidong and Xiang, Xueshuang},
+  title     = {Legitimate Adversarial Patches: Evading Human Eyes and
+               Detection Models in the Physical World},
+  booktitle = {Proceedings of the 29th ACM International Conference on Multimedia},
+  pages     = {5307--5315}, year = {2021}, doi = {10.1145/3474085.3475653}
+}
+@inproceedings{agnihotri2024cospgd,
+  author    = {Agnihotri, Shashank and Jung, Steffen and Keuper, Margret},
+  title     = {{CosPGD}: An Efficient White-Box Adversarial Attack for
+               Pixel-Wise Prediction Tasks},
+  booktitle = {International Conference on Machine Learning (ICML)}, year = {2024}
+}
+@article{mirsky2023ipatch,
+  author  = {Mirsky, Yisroel}, title = {{IPatch}: A Remote Adversarial Patch},
+  journal = {Cybersecurity}, volume = {6}, number = {1}, year = {2023},
+  doi     = {10.1186/s42400-023-00145-0}
+}
+@inproceedings{madry2018pgd,
+  author    = {Madry, Aleksander and Makelov, Aleksandar and Schmidt, Ludwig and
+               Tsipras, Dimitris and Vladu, Adrian},
+  title     = {Towards Deep Learning Models Resistant to Adversarial Attacks},
+  booktitle = {International Conference on Learning Representations (ICLR)},
+  year      = {2018}
+}
+@inproceedings{kingma2015adam,
+  author    = {Kingma, Diederik P. and Ba, Jimmy},
+  title     = {Adam: A Method for Stochastic Optimization},
+  booktitle = {International Conference on Learning Representations (ICLR)},
+  year      = {2015}
+}
+@inproceedings{cordts2016cityscapes,
+  author    = {Cordts, Marius and Omran, Mohamed and Ramos, Sebastian and
+               Rehfeld, Timo and Enzweiler, Markus and Benenson, Rodrigo and
+               Franke, Uwe and Roth, Stefan and Schiele, Bernt},
+  title     = {The Cityscapes Dataset for Semantic Urban Scene Understanding},
+  booktitle = {IEEE Conference on Computer Vision and Pattern Recognition (CVPR)},
+  year      = {2016}
+}
+@article{ruzanski2011rapsd,
+  author  = {Ruzanski, Evan and Chandrasekar, V.},
+  title   = {Scale Filtering for Improved Nowcasting Performance in a
+             High-Resolution X-Band Radar Network},
+  journal = {IEEE Transactions on Geoscience and Remote Sensing},
+  volume  = {49}, number = {6}, pages = {2296--2307}, year = {2011},
+  doi     = {10.1109/TGRS.2010.2103946}
+}
+@inproceedings{zhang2018lpips,
+  author    = {Zhang, Richard and Isola, Phillip and Efros, Alexei A. and
+               Shechtman, Eli and Wang, Oliver},
+  title     = {The Unreasonable Effectiveness of Deep Features as a
+               Perceptual Metric},
+  booktitle = {IEEE Conference on Computer Vision and Pattern Recognition (CVPR)},
+  year      = {2018}
+}
+@article{falck2025fourier,
+  author  = {Falck, Fabian and Pandeva, Teodora and Zahirnia, Kiarash and
+             Lawrence, Rachel and Turner, Richard and Meeds, Edward and
+             Zazo, Javier and Karmalkar, Sushrut},
+  title   = {A Fourier Space Perspective on Diffusion Models},
+  journal = {arXiv preprint arXiv:2505.11278}, year = {2025}
+}
+@misc{dieleman2024spectral,
+  author = {Dieleman, Sander}, title = {Diffusion is spectral autoregression},
+  year = {2024},
+  howpublished = {Blog post, sander.ai/2024/09/02/spectral-autoregression.html}
+}
+\end{filecontents*}
+
+% lmodern before fontenc: with T1 and no scalable font, microtype's font
+% expansion aborts with "auto expansion is only possible with scalable fonts"
+% and no PDF is produced.
+\usepackage{lmodern}
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage[a4paper,margin=2.6cm]{geometry}
+\usepackage{amsmath,amssymb}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage{microtype}
+\usepackage[round,authoryear]{natbib}
+\usepackage[hidelinks]{hyperref}
+
+\newcommand{\novel}{\hfill{\normalfont\small\textsc{[no external source]}}}
+\newcolumntype{L}[1]{>{\raggedright\arraybackslash}p{#1}}
+
+\title{A Contrast-Sensitivity-Constrained Adversarial Patch\\
+       for Semantic Segmentation}
+\author{Formal procedure and provenance}
+\date{}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+\noindent
+We define an adversarial patch whose deviation from the image content it
+covers is bounded in the frequency domain by a model of human contrast
+sensitivity. The construction rests on an asymmetry: a segmentation
+network weights the spectrum up to Nyquist uniformly, whereas the human
+visual system does not, so a perturbation may be admissible to one and
+not the other. Whether that gap is exploitable for a given architecture
+is an empirical question, not an assumption of the method. Every step
+below is stated formally and attributed; five elements have no external
+source and are marked as such throughout.
+\end{abstract}
+
+% =====================================================================
+\section{Notation}
+
+\begin{tabular}{@{}lL{9.4cm}@{}}
+\toprule
+$\mathbf{x}\in\mathbb{R}^{3\times H\times W}$ & input image, ImageNet-normalised \\
+$\mathbf{x}^{01}$ & the same image in $[0,1]$ RGB, $\mathrm{clip}(\mathbf{x}\odot\boldsymbol{\sigma}_n+\boldsymbol{\mu}_n,0,1)$ \\
+$\mathbf{y}$ & ground-truth trainIds in $\{0,\dots,C-1\}\cup\{255\}$; $255$ is void \\
+$f$ & frozen segmentation network, $f(\mathbf{x})\in\mathbb{R}^{C\times H'\times W'}$ \\
+$\mathcal{U}$ & bilinear upsampling to $H\times W$ \\
+$s,\;p=\lfloor Hs\rfloor,\;S$ & patch scale, rendered side in pixels, parameter resolution \\
+$\mathbf{z}\in\mathbb{R}^{3\times S\times S}$ & the optimised parameter \\
+$\mathcal{F},\mathcal{F}^{-1}$ & real 2-D DFT and inverse, forward-normalised \\
+$\mathcal{K}$ & half-spectrum bin index set \\
+$\mathcal{M}$ & set of pixels actually composited (silhouette; all of them if square) \\
+$\tau$ & perceptual budget, in nominal JND (Sec.~\ref{sec:tau}) \\
+\bottomrule
+\end{tabular}
+
+% =====================================================================
+\section{Observer model}
+
+Contrast sensitivity is defined over cycles per degree of visual angle,
+whereas an image spectrum is indexed in cycles per pixel. With physical
+pixel size $\rho$ and viewing distance $d$, one pixel subtends
+\begin{equation}
+  \theta_{\mathrm{pix}} \;=\; 2\arctan\!\left(\frac{\rho}{2d}\right)\cdot\frac{180}{\pi}
+  \quad\text{degrees},
+  \label{eq:cpd}
+\end{equation}
+so an image frequency $\nu$ in cycles per pixel corresponds to
+$u=\nu/\theta_{\mathrm{pix}}$ cycles per degree
+\citep[App.~D]{galinska2026csflow}. We adopt the Barten model
+\citep{barten2003},
+\begin{align}
+  \mathrm{CSF}(u) &= \frac{M_{\mathrm{opt}}(u)}{k}
+  \left[\frac{2}{T}\!\left(\frac{1}{X_0^{2}}+\frac{1}{X_{\max}^{2}}
+  +\frac{u^{2}}{N_{\max}^{2}}\right)
+  \!\left(\frac{1}{\eta\,\mathrm{p}\,E}
+  +\frac{\Phi_0}{1-\exp(-(u/u_0)^{2})}\right)\right]^{-1/2},
+  \label{eq:barten}\\[2pt]
+  M_{\mathrm{opt}}(u) &= \exp(-2\pi^{2}\varsigma^{2}u^{2}),
+  \label{eq:mopt}
+\end{align}
+with the parameterisation of \citet[App.~A]{galinska2026csflow}:
+$\varsigma=0.5/60$, $k=3$, $T=0.1$, $X_0=60$, $X_{\max}=12$,
+$N_{\max}=15$, $\eta=0.03$, $\mathrm{p}=1.2\times10^{6}$, $E=500$,
+$\Phi_0=3\times10^{-8}$, $u_0=7$. Note $\mathrm{CSF}(0)=0$: a uniform
+field carries no contrast. Where orientation dependence is wanted we
+substitute the Standard Spatial Observer with its oblique effect
+\citep{watson2005sso}, under which diagonal carriers are less visible
+than axis-aligned ones at equal radial frequency.
+
+\paragraph{Scope of the observer assumption.}
+Every visibility statement below is conditional on $(\rho,d)$ through
+Eq.~\eqref{eq:cpd}. This is not incidental:
+\citet[Sec.~6]{galinska2026csflow} identify the assumption of a typical
+screen and viewing distance as a \emph{conceptual limitation} of any
+CSF-derived weighting, requiring calibration if optimal values are
+wanted. We therefore treat $(\rho,d)$ as a reported experimental
+parameter and sweep it rather than fixing it once.
+
+\paragraph{Why a pixel-space formulation is required.}
+The correspondence between DFT bins and retinal spatial frequency holds
+only when the perturbation lives in pixel space.
+\citet[Sec.~5.1]{galinska2026csflow} adopt the same restriction for the
+same reason: in latent-space models the coordinates of the perturbed
+variable need not correspond to image spatial frequencies at all. The
+patch here is optimised directly in $[0,1]$ RGB, so Eq.~\eqref{eq:cpd}
+is well defined throughout.
+
+% =====================================================================
+\section{Per-frequency amplitude budget \novel}
+
+A grating of Michelson contrast $c$ at frequency $u$ is at detection
+threshold when $c\,\mathrm{CSF}(u)=1$ \citep{barten2003}. Inverting this
+into an \emph{amplitude allowance} on the DFT is what turns a perception
+model into an attack constraint. It does not appear in
+\citet{galinska2026csflow}, who use $\mathrm{CSF}$ as a \emph{weight}
+over generative timesteps; the function and its constants come from that
+work, the inversion does not.
+
+On the half-spectrum grid with radial frequency
+$\nu(\mathbf{k})=\sqrt{\nu_y^2+\nu_x^2}$ in cycles per pixel,
+\begin{equation}
+  B(\mathbf{k}) \;=\;
+  \min\!\left(\frac{\tau}{\kappa\,\mathrm{CSF}\big(\nu(\mathbf{k})/\theta_{\mathrm{pix}}\big)},
+  \;A_{\max}\right)\cdot\mathbb{1}\big[\nu(\mathbf{k})\ge\nu_{\min}\big].
+  \label{eq:budget}
+\end{equation}
+
+\paragraph{Contrast conversion $\kappa=4$.}
+A cosine of peak amplitude $A$ on mean luminance $\bar{L}$ has Michelson
+contrast $A/\bar{L}$ \citep{michelson1927}; under the forward-normalised
+DFT that component has magnitude $A/2$. Taking $\bar{L}=\tfrac12$ for a
+$[0,1]$ image gives $c=4\,|\mathcal{F}(\cdot)(\mathbf{k})|$. The mean is
+assumed rather than measured locally, which \emph{under}-estimates
+visibility on dark content; the discrepancy is absorbed into the
+calibration of $\tau$.
+
+\paragraph{Low-frequency cutoff $\nu_{\min}=m_c/S$.}
+Since $\mathrm{CSF}\to0$ at DC, Eq.~\eqref{eq:budget} would otherwise
+grant the near-DC bins the \emph{largest} allowance of any frequency.
+The Barten rolloff is measured for full-field gratings, where the eye
+adapts to a slow luminance ramp; inside a patch of side $S$ a component
+below $1/S$ cycles per pixel completes no cycle and is a brightness
+offset against the surround, which the patch border renders as a visible
+edge. We require $m_c=2$ cycles across the patch. Omitting this inverts
+the intended spectrum: measured radial power then concentrates in the
+lowest bin rather than the highest.
+
+% =====================================================================
+\section{Spectral reparameterisation \novel}
+
+Rather than projecting onto the feasible set, we reparameterise so the
+constraint holds by construction:
+\begin{equation}
+  Z=\mathcal{F}(\mathbf{z}),\qquad
+  \hat{Z}(\mathbf{k})=B(\mathbf{k})\,
+  \frac{Z(\mathbf{k})}{\sqrt{1+|Z(\mathbf{k})|^{2}}},\qquad
+  \boldsymbol{\delta}_0=\mathcal{F}^{-1}(\hat{Z}),
+  \label{eq:reparam}
+\end{equation}
+so $|\hat{Z}(\mathbf{k})|<B(\mathbf{k})$ for every $\mathbf{k}$ and any
+$\mathbf{z}$. The scaling acts on the complex coefficient, preserving
+phase exactly and avoiding differentiation of $\arg Z$ at the origin. A
+hard projection would zero the gradient of every component resting on
+its bound---precisely where an adversarial component settles---whereas
+Eq.~\eqref{eq:reparam} is smooth everywhere and attains the bound only
+in the limit.
+
+% =====================================================================
+\section{Visibility normalisation}
+
+Detection of a compound stimulus is not decided by its most visible
+component: the visual system pools evidence across spatial-frequency and
+orientation channels, standardly modelled as a Minkowski norm with
+exponent $\beta\approx3\text{--}4$
+\citep{quick1974,robson1981,watson1979}. With $\mathcal{M}$ the
+composited support,
+\begin{equation}
+  V_\beta(\boldsymbol{\delta})=
+  \left[\sum_{\mathbf{k}\in\mathcal{K}}
+  \Big(\kappa\,\big|\mathcal{F}(\boldsymbol{\delta}\odot\mathcal{M})(\mathbf{k})\big|\;
+  \mathrm{CSF}\big(\nu(\mathbf{k})/\theta_{\mathrm{pix}}\big)\Big)^{\beta}
+  \right]^{1/\beta},
+  \label{eq:visibility}
+\end{equation}
+and the residual is rescaled to exactly the requested budget,
+\begin{equation}
+  \boldsymbol{\delta}_1=\frac{\tau}{V_\beta(\boldsymbol{\delta}_0)}\,
+  \boldsymbol{\delta}_0 .
+  \label{eq:scale}
+\end{equation}
+Shape and scale are deliberately separate: Eq.~\eqref{eq:reparam} bounds
+each bin but says nothing about their sum, while Eq.~\eqref{eq:scale}
+alone would place energy wherever the attack prefers. Equality rather
+than inequality is used because the constraint is active at every step
+and equality is differentiable where $\min(\cdot)$ is not.
+
+Taking the maximum over $\mathbf{k}$ instead of the Minkowski sum
+(the $\beta\to\infty$ limit) is the more permissive criterion and should
+not be used: a residual scoring $0.235$ under it was measured reaching
+$\pm7.65$ in pixel space.
+
+% =====================================================================
+\section{Dynamic-range fit \novel}
+
+The composite must lie in $[0,1]$, but clipping is a hard nonlinearity
+and generates broadband harmonics at exactly the frequencies where
+$\mathrm{CSF}$ peaks, destroying the guarantee of
+Eqs.~\eqref{eq:budget}--\eqref{eq:scale}: a residual built to $1.0$
+nominal JND was measured at $5.0$ after clipping, with only $8\%$ of
+pixels affected. A \emph{uniform} rescale is the only operation leaving
+the spectral shape invariant, since it scales every Fourier coefficient
+equally and hence
+$V_\beta(c\boldsymbol{\delta})=c\,V_\beta(\boldsymbol{\delta})$. With
+per-pixel headroom
+\begin{equation}
+  a(u,v)=\begin{cases}
+    1-\mathbf{r}(u,v), & \delta_1(u,v)>0,\\
+    \mathbf{r}(u,v),   & \text{otherwise,}
+  \end{cases}
+  \qquad
+  c^{\star}=\mathrm{clip}\!\left(
+  Q_q\!\left\{\frac{a(u,v)}{|\delta_1(u,v)|}\;:\;(u,v)\in\mathcal{M}\right\},0,1\right),
+  \label{eq:fit}
+\end{equation}
+we set $\boldsymbol{\delta}=c^{\star}\boldsymbol{\delta}_1$, where $Q_q$
+is the $q$-quantile ($q=10^{-3}$). The quantile rather than the minimum
+admits a negligible fraction of clipped pixels, since a single saturated
+pixel would otherwise force $c^{\star}=0$. Restricting the quantile to
+$\mathcal{M}$ is essential: pixels outside the composited region cannot
+affect the result yet would otherwise determine its scale. With a cutout
+reference padded in transparent black, omitting that restriction drives
+$c^{\star}$ to zero and the attack becomes the unmodified reference.
+
+% =====================================================================
+\section{Reference and patch}
+
+The base is the image content the patch replaces, at the resolved
+placement $(t,\ell)$:
+\begin{equation}
+  \mathbf{r}=\mathrm{Resize}_{S\times S}
+  \Big(\mathbf{x}^{01}\big[\,t:t{+}p,\;\ell:\ell{+}p\,\big]\Big),
+  \qquad
+  \mathbf{p}=\mathrm{clip}\big(\mathbf{r}+\boldsymbol{\delta},0,1\big).
+  \label{eq:patch}
+\end{equation}
+$\mathbf{r}$ is treated as a constant, $\nabla_{\mathbf{r}}\equiv0$.
+Because $\mathbf{r}$ equals the covered content, replacement by
+$\mathbf{p}$ is identical to \emph{adding} $\boldsymbol{\delta}$, so
+$\tau\to0$ recovers the unperturbed image exactly and the no-attack
+baseline is a no-op by construction rather than merely a weak attack.
+
+% =====================================================================
+\section{Application}
+
+Following the localised-patch threat model of \citet{brown2017patch},
+with optional silhouette mask after \citet{tan2021lap},
+\begin{align}
+  \tilde{\mathbf{p}} &= \big(\mathrm{Resize}_{p\times p}(\mathbf{p})
+    -\boldsymbol{\mu}_n\big)\oslash\boldsymbol{\sigma}_n, \\
+  \mathbf{m} &= \mathrm{Pad}_{t,\ell}\big(\mathbb{1}_{p\times p}\odot\mathcal{M}\big), \\
+  \mathbf{x}^{\mathrm{adv}} &= \mathbf{x}\odot(1-\mathbf{m})
+    \;+\;\mathrm{Pad}_{t,\ell}(\tilde{\mathbf{p}})\odot\mathbf{m}.
+  \label{eq:apply}
+\end{align}
+
+% =====================================================================
+\section{Objective}
+
+The scored support excludes both void labels and the patch footprint,
+\begin{equation}
+  \Omega=\{(u,v):\mathbf{y}(u,v)\neq255\}\;\setminus\;\mathrm{supp}(\mathbf{m}),
+  \label{eq:support}
+\end{equation}
+the latter to prevent the degenerate solution in which the patch itself
+adopts the attacked appearance rather than influencing its surroundings
+\citep{mirsky2023ipatch}. We use CosPGD \citep{agnihotri2024cospgd},
+\begin{equation}
+  \mathcal{L}=-\frac{1}{|\Omega|}\sum_{(u,v)\in\Omega}
+  \Big[\cos\big(\mathrm{softmax}\,\mathcal{U}f(\mathbf{x}^{\mathrm{adv}})_{:,u,v},\,
+  \mathbf{e}_{\mathbf{y}(u,v)}\big)\Big]_{\mathrm{sg}}
+  \cdot\ \mathrm{CE}\big(\mathcal{U}f(\mathbf{x}^{\mathrm{adv}})_{:,u,v},\,
+  \mathbf{y}(u,v)\big).
+  \label{eq:cospgd}
+\end{equation}
+
+\paragraph{Declared deviations.}
+\citet{agnihotri2024cospgd} do not detach the cosine;
+$[\cdot]_{\mathrm{sg}}$ removes gradient flow through the weight. They
+further use sign-SGD with $\varepsilon$-projection, as a PGD variant
+\citep{madry2018pgd}; a patch is not an $\varepsilon$-ball
+perturbation, so Eq.~\eqref{eq:cospgd} is optimised with Adam
+\citep{kingma2015adam} on the raw gradient.
+
+% =====================================================================
+\section{Optimisation and evaluation}
+
+\begin{equation}
+  \mathbf{z}^{(0)}\sim\mathcal{N}(\mathbf{0},\mathbf{I}),\qquad
+  \mathbf{z}^{(j+1)}=\mathrm{Adam}\big(\mathbf{z}^{(j)},
+  \nabla_{\mathbf{z}}\mathcal{L}\big),\qquad j=0,\dots,K-1 .
+  \label{eq:opt}
+\end{equation}
+The initialisation is Gaussian rather than zero because
+Eq.~\eqref{eq:scale} is undefined at $\boldsymbol{\delta}_0=\mathbf{0}$;
+Eqs.~\eqref{eq:reparam}--\eqref{eq:scale} are scale-invariant in
+$\mathbf{z}$, so only the \emph{shape} of the initialisation matters.
+The network $f$ is frozen throughout and $\nabla_{\phi}f$ is never
+formed. The attack is reported as
+\begin{equation}
+  \Delta\mathrm{mIoU}_{\mathrm{remote}}
+  =\mathrm{mIoU}\big(\mathcal{U}f(\mathbf{x}),\mathbf{y};\Omega\big)
+  -\mathrm{mIoU}\big(\mathcal{U}f(\mathbf{x}^{\mathrm{adv}}),\mathbf{y};\Omega\big),
+  \label{eq:drop}
+\end{equation}
+the mean taken over classes \emph{present in} $\mathbf{y}|_\Omega$ so
+that both terms share a denominator \citep{cordts2016cityscapes}.
+Counting a class merely because it is predicted makes the two means run
+over different class sets, and a rare class entering or leaving the
+denominator shifts $\Delta\mathrm{mIoU}$ by roughly
+$\mathrm{mIoU}/(n-1)$ independently of any pixel-level change. Spectral
+placement of the learned residual is reported by radially averaged power
+spectral density \citep{ruzanski2011rapsd}, and perceptual similarity to
+$\mathbf{r}$ by LPIPS \citep{zhang2018lpips}, computed after training
+and never entering Eq.~\eqref{eq:cospgd}.
+
+% =====================================================================
+\section{The budget parameter $\tau$}
+\label{sec:tau}
+
+\paragraph{Definition.}
+$\tau$ is the permitted Minkowski visibility of the residual, in units
+of the Barten detection threshold under the assumed geometry: by
+Eq.~\eqref{eq:scale} the composited perturbation satisfies
+$V_\beta(\boldsymbol{\delta}_1)=\tau$ exactly, so $\tau=1$ nominally
+places it \emph{at} threshold and $\tau<1$ below. It plays the role
+$\alpha$ plays in \citet{tan2021lap}---the single knob trading attack
+strength against perceptibility---and the curve over $\tau$, not any
+single operating point, is the deliverable.
+
+\paragraph{$\tau$ acts once, not twice.}
+Although $\tau$ appears in both Eq.~\eqref{eq:budget} and
+Eq.~\eqref{eq:scale}, its occurrence in the budget is inert whenever
+$A_{\max}$ is inactive: $B$ is then proportional to $\tau$, hence so are
+$\boldsymbol{\delta}_0$ and $V_\beta(\boldsymbol{\delta}_0)$, and the
+ratio in Eq.~\eqref{eq:scale} cancels it. Measured at $S=128$ and the
+default geometry, varying $\tau$ in Eq.~\eqref{eq:budget} alone over
+$[0.05,1]$ leaves the residual bit-identical, and $A_{\max}=0.25$ binds
+on no bin until $\tau\gtrsim4$. Equation~\eqref{eq:budget} therefore
+sets the residual's \emph{shape}; Eq.~\eqref{eq:scale} sets its
+\emph{scale}.
+
+\paragraph{Operating range.}
+Below the knee of Eq.~\eqref{eq:fit} realised visibility tracks $\tau$
+exactly and the residual scales linearly:
+
+\begin{center}
+\begin{tabular}{@{}lcccc@{}}
+\toprule
+$\tau$ & 0.05 & 0.10 & 0.25 & 0.50 \\
+residual RMS & 0.0049 & 0.0098 & 0.0245 & 0.0490 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\noindent
+Above the knee the range fit binds, attained visibility saturates and
+$\tau$ ceases to control anything. The knee is reference-dependent,
+being set by the headroom of $\mathbf{r}$, and lay near $\tau\approx0.4$
+for the references used here. Values above it must not be reported as
+though achieved.
+
+\paragraph{Why $\tau$ is \emph{nominal}.}
+Three approximations stand between $\tau$ and a psychophysical JND, each
+biasing it: the mean luminance in $\kappa$ is assumed rather than
+measured; the Minkowski sum in Eq.~\eqref{eq:visibility} runs over DFT
+bins rather than perceptual channels; and Eq.~\eqref{eq:cpd} fixes a
+viewing geometry that \citet[Sec.~6]{galinska2026csflow} identify as
+needing calibration. $\tau$ should therefore be calibrated against
+rendered patches and reported as a relative axis. A claim of
+imperceptibility requires a study with human observers, which this
+procedure does not constitute.
+
+\paragraph{Not the interpolation parameter of \citet{galinska2026csflow}.}
+Their $\alpha$ in $w_{\mathrm{final}}=\alpha w_{\mathrm{CSFlow}}
++(1-\alpha)w_{\mathrm{base}}$ blends a perception-driven weighting with a
+baseline one over generative timesteps. It is not a perceptual budget
+and bounds nothing; the two share no role beyond both being scalars
+derived from the same CSF.
+
+\paragraph{Bounded by $\mathrm{CSF}$ does not imply statistically
+inconspicuous.}
+Natural image spectra follow an approximate power law, so energy placed
+near Nyquist is atypical of the data precisely where the eye is least
+sensitive \citep{falck2025fourier,dieleman2024spectral}. Invisibility to
+a human observer and indistinguishability from natural image statistics
+are distinct properties; only the former is constrained here, and the
+RAPSD of Sec.~10 is what makes the latter measurable.
+
+% =====================================================================
+\section{Provenance}
+
+\begin{center}
+\small
+\begin{tabular}{@{}lL{6.4cm}L{4.6cm}@{}}
+\toprule
+\textbf{Sec.} & \textbf{Element} & \textbf{Source} \\
+\midrule
+2  & cycles/pixel $\to$ cycles/degree      & \citet[App.~D]{galinska2026csflow} \\
+2  & Barten CSF; parameter values          & \citet{barten2003}; params \citet[App.~A]{galinska2026csflow} \\
+2  & Standard Spatial Observer, oblique effect & \citet{watson2005sso} \\
+2  & pixel-space requirement; geometry caveat  & \citet[Sec.~5.1, 6]{galinska2026csflow} \\
+3  & \emph{inversion of CSF into a budget} & \textbf{no external source} \\
+3  & Michelson contrast, $\kappa=4$        & \citet{michelson1927} \\
+3  & \emph{low-frequency cutoff for a patch} & \textbf{no external source} \\
+4  & \emph{smooth spectral reparameterisation} & \textbf{no external source} \\
+5  & Minkowski / probability summation     & \citet{quick1974}; \citet{robson1981}; \citet{watson1979} \\
+6  & \emph{uniform-rescale range fit}      & \textbf{no external source} \\
+7  & \emph{covered content as residual base} & \textbf{no external source} \\
+8  & localised patch application           & \citet{brown2017patch} \\
+8  & silhouette masking                    & \citet{tan2021lap} \\
+9  & footprint exclusion                   & \citet{mirsky2023ipatch} \\
+9  & CosPGD objective                      & \citet{agnihotri2024cospgd} \\
+9  & PGD lineage; declared deviation       & \citet{madry2018pgd} \\
+10 & Adam                                  & \citet{kingma2015adam} \\
+10 & mIoU protocol, Cityscapes             & \citet{cordts2016cityscapes} \\
+10 & RAPSD                                 & \citet{ruzanski2011rapsd} \\
+10 & LPIPS, evaluation only                & \citet{zhang2018lpips} \\
+11 & natural-image spectral statistics     & \citet{falck2025fourier}; \citet{dieleman2024spectral} \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\noindent
+Five elements carry no external source and are contributions of this
+work: the budget inversion (Eq.~\ref{eq:budget}), the patch-specific
+low-frequency cutoff, the smooth spectral reparameterisation
+(Eq.~\ref{eq:reparam}), the uniform-rescale range fit
+(Eq.~\ref{eq:fit}), and the use of the covered content as the residual
+base (Eq.~\ref{eq:patch}). From \citet{galinska2026csflow} we take a
+function, its constants, a unit conversion and two scoping caveats---not
+a method: their contribution is a weighting over flow-matching
+timesteps, which has no analogue here.
+
+\bibliographystyle{plainnat}
+\bibliography{csf_patch_procedure}
+
+\end{document}
