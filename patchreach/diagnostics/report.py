@@ -117,25 +117,55 @@ def save_panels(img, label, patched, clean_logits, adv_logits, footprint,
     dist = distance_map(H, W, *centroid(footprint), pc.device)
     remote = (label[0] != 255) & (~footprint[0])
     changed = (pc != pa) & remote
-    rgb = np.zeros((H, W, 3))
-    rgb[remote.cpu().numpy()] = [0.85, 0.85, 0.85]
-    rgb[footprint[0].cpu().numpy()] = [0.25, 0.25, 0.25]
+    # FOUR regions, and every one of them is named. The canvas starts black,
+    # so anything left black is neither remote nor footprint — i.e. GROUND
+    # TRUTH VOID (label 255: ego-vehicle hood, image borders, and every id
+    # remap() sends outside trainIds 0..18). Void is excluded from mIoU, from
+    # the flip rate and from the reach curves.
+    #
+    # The footprint was previously 0.25 grey, close enough to the black void
+    # that the two read as one region and the caption named only the footprint.
+    # 0.45 separates the three greys unambiguously: 0.00 void < 0.45 footprint
+    # < 0.85 unchanged.
+    VOID, FOOT, UNCHANGED = 0.0, 0.45, 0.85
+    rgb = np.full((H, W, 3), VOID)
+    rgb[remote.cpu().numpy()] = [UNCHANGED] * 3
+    rgb[footprint[0].cpu().numpy()] = [FOOT] * 3
     max_d = dist[remote].max().item() if remote.any() else 1.0
     ch = changed.cpu().numpy()
     if ch.any():
         nd = np.clip(dist.cpu().numpy()[ch] / max(max_d, 1), 0, 1)
+        # 1 - nd, so pixels NEAR the patch are bright: the attack's epicentre
+        # should glow. The colour bar below must be reversed to match, which is
+        # the whole reason this is spelled out.
         rgb[ch] = mcm.plasma(1.0 - nd)[:, :3]
     flip_pct = 100.0 * changed.sum().item() / max(int(remote.sum()), 1)
 
     fig, ax = plt.subplots(figsize=(12, 6))
     ax.imshow(rgb)
     ax.axis("off")
-    ax.set_title(f"(e) prediction changes — {flip_pct:.1f}% of remote pixels\n"
-                 "colour = distance from patch, grey = unchanged, "
-                 "dark = footprint", fontsize=9)
-    sm = plt.cm.ScalarMappable(cmap="plasma", norm=plt.Normalize(0, max_d))
+    ax.set_title(f"(e) prediction changes — {flip_pct:.1f}% of remote pixels",
+                 fontsize=11)
+
+    # plasma_r, NOT plasma. The image paints near = bright via plasma(1 - nd),
+    # so a bar built from plain plasma over Normalize(0, max_d) reads 0 px as
+    # dark purple and max as yellow — the exact reverse of the image. That
+    # mislabelled every change map the repository has produced.
+    sm = plt.cm.ScalarMappable(cmap="plasma_r", norm=plt.Normalize(0, max_d))
     sm.set_array([])
-    fig.colorbar(sm, ax=ax, fraction=0.025, label="distance (px)")
+    fig.colorbar(sm, ax=ax, fraction=0.025,
+                 label="distance from patch (px) — bright = near")
+
+    import matplotlib.patches as _mp
+    ax.legend(handles=[
+        _mp.Patch(facecolor=[UNCHANGED] * 3, edgecolor="#999999",
+                  label="unchanged (prediction identical)"),
+        _mp.Patch(facecolor=[FOOT] * 3, edgecolor="#999999",
+                  label="patch footprint (excluded from the metrics)"),
+        _mp.Patch(facecolor=[VOID] * 3, edgecolor="#999999",
+                  label="ground-truth void, label 255 (excluded)"),
+    ], loc="upper right", fontsize=8, framealpha=0.9, handlelength=1.4,
+        borderpad=0.5, labelspacing=0.35)
     _save(fig, out_dir / "e_change_map.png")
 
     # ── combined, shared legend strip underneath ─────────────────────────────
