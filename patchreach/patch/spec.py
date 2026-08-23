@@ -67,9 +67,11 @@ class PatchConfig:
     shape_thresh: float = 0.15
 
     # ── placement (placement.py) ─────────────────────────────────────────────
-    placement: str = "center"             # center | fixed | semantic
+    placement: str = "center"             # center | fixed | semantic | gradcam
     placement_class: int = 0              # 0=road: omnipresent in Cityscapes
     placement_xy: Tuple[float, float] = (0.5, 0.5)
+    # Border keep-out for gradcam only. 0 leaves every other policy untouched.
+    placement_margin: int = 0
 
     # ── reference image: shared by lap AND shape ─────────────────────────────
     # In the old code the silhouette was derived from --lap_reference, so a
@@ -243,18 +245,24 @@ class Patch:
     # ── placement ────────────────────────────────────────────────────────────
 
     def resolve_placement(self, H: int, W: int,
-                          clean_pred: Optional[torch.Tensor] = None):
+                          clean_pred: Optional[torch.Tensor] = None,
+                          score_map: Optional[torch.Tensor] = None):
         """
         Must be called before the first apply() when placement != 'center'.
 
-        Semantic placement reads the CLEAN PREDICTION, so the caller has to run
-        the clean forward pass first. Ordering:
+        Semantic placement reads the CLEAN PREDICTION and gradcam placement
+        reads the SENSITIVITY MAP, so the caller has to run the clean forward
+        pass (and the CAM) first. Ordering:
             clean forward -> resolve_placement -> apply
+
+        score_map : [H,W] float, required for placement='gradcam'. Missing, it
+        raises rather than centring silently — see placement.resolve().
         """
         p = int(H * self.cfg.scale)
         self.placement = placement_mod.resolve(
             self.cfg.placement, H, W, p, clean_pred,
-            self.cfg.placement_class, self.cfg.placement_xy)
+            self.cfg.placement_class, self.cfg.placement_xy,
+            score_map=score_map, margin=self.cfg.placement_margin)
         return self.placement
    
  
@@ -486,7 +494,9 @@ class Patch:
                 f"is {100*frac:.0f}% of the square baseline")
         log(f"[patch] placement : {c.placement}"
             + (f" on class {c.placement_class}" if c.placement == "semantic"
-               else ""))
+               else "")
+            + (f" (margin {c.placement_margin}px)"
+               if c.placement == "gradcam" and c.placement_margin else ""))
         if self.placement is not None:
             top, left = self.placement
             ctop, cleft = (H - p) // 2, (W - p) // 2
