@@ -21,8 +21,42 @@ import torch
 from ..data.cityscapes import upsample_to
 
 
+CLASS_SETS = ("gt", "union")
+
+
 class SegMetric:
-    """Confusion-matrix mIoU. iou_c = TP/(TP+FP+FN); NaN if the class is absent."""
+    r"""
+    Confusion-matrix mIoU. iou_c = TP/(TP+FP+FN).
+
+    WHICH CLASSES ENTER THE MEAN — this decides whether a clean/attacked
+    comparison is valid at all.
+
+      'gt'    (default) count a class iff it has GROUND TRUTH in the evaluated
+              pixels. The set then depends only on the labels, which are
+              identical for the clean and the attacked pass, so both means run
+              over the SAME denominator.
+
+      'union' count a class iff it has ground truth OR is predicted anywhere.
+              The historical behaviour, kept so earlier runs stay reproducible.
+
+    WHY 'union' BREAKS ATTACK EVALUATION. Under 'union' a class with no ground
+    truth that the model nevertheless predicts scores IoU = 0 and drags the
+    nanmean down. Suppress that spurious prediction and the class becomes NaN,
+    leaves the denominator, and the mean JUMPS — by roughly mean/(n-1), about
+    3.7 points at 18 classes. Clean and attacked are then averaged over
+    different class sets and the difference between them is not a measurement.
+
+    Observed: a 150-epoch run reported drop_remote = -3.63, i.e. the attack
+    apparently IMPROVED mIoU by 3.6 points, entirely because one rare class
+    (no GT in the 20 val images, a handful of predicted pixels) stopped being
+    counted. A toy case makes the sensitivity plain: 5 spurious pixels in
+    40,000 move mIoU by 33 points.
+
+    'gt' cannot do this: a class absent from the ground truth is not evaluated
+    in either pass, so nothing can move in or out. The cost is that spurious
+    predictions of a GT-absent class are no longer penalised — but they were
+    only ever penalised by an unstable all-or-nothing term.
+    """
 
     def __init__(self, K: int, ignore_index: int = 255, device="cpu"):
         self.K, self.ig = K, ignore_index
@@ -40,24 +74,59 @@ class SegMetric:
         self.cm.view(-1).scatter_add_(0, l * self.K + p, torch.ones_like(l))
 
     @torch.no_grad()
-    def per_class(self) -> torch.Tensor:
+    def per_class(self, classes: str = "gt") -> torch.Tensor:
+        if classes not in CLASS_SETS:
+            raise ValueError(f"classes must be one of {CLASS_SETS}, got {classes!r}")
         cm = self.cm.float()
         tp = cm.diagonal()
-        denom = cm.sum(0) + cm.sum(1) - tp
-        return torch.where(denom > 0, tp / denom,
+        gt = cm.sum(1)                       # ground-truth pixels per class
+        denom = cm.sum(0) + gt - tp          # GT + predicted - TP
+        # gt > 0 implies denom > 0, so the division is safe either way.
+        keep = (gt > 0) if classes == "gt" else (denom > 0)
+        return torch.where(keep, tp / denom.clamp(min=1.0),
                            torch.full_like(tp, float("nan"))) * 100.0
 
     @torch.no_grad()
-    def compute(self) -> float:
-        return self.per_class().nanmean().item()
+    def compute(self, classes: str = "gt") -> float:
+        return self.per_class(classes).nanmean().item()
+
+    @torch.no_grad()
+    def n_counted(self, classes: str = "gt") -> int:
+        return int((~torch.isnan(self.per_class(classes))).sum())
 
 
 @torch.no_grad()
 def single_image_miou(logits, labels, K: int,
-                      exclude: Optional[torch.Tensor] = None) -> float:
+                      exclude: Optional[torch.Tensor] = None,
+                      classes: str = "gt") -> float:
     m = SegMetric(K, device=logits.device)
     m.update(upsample_to(logits, labels.shape[-2:]).argmax(1), labels, exclude)
-    return m.compute()
+    return m.compute(classes)
+
+
+@torch.no_grad()
+def compare(clean: SegMetric, adv: SegMetric, prefix: str = "") -> dict:
+    r"""
+    Clean vs attacked under BOTH class sets, plus the class counts that make
+    any divergence between them legible.
+
+    Reporting both is deliberate. 'gt' is the number to trust; 'union' is kept
+    so runs recorded before this distinction existed remain comparable, and
+    because the GAP between them is itself a diagnostic — a large gap means a
+    rare class moved in or out of the denominator, which says something about
+    the attack that neither number says alone.
+    """
+    out = {}
+    for cs in CLASS_SETS:
+        suffix = "" if cs == "gt" else "_union"
+        c, a = clean.compute(cs), adv.compute(cs)
+        out[f"{prefix}clean{suffix}"] = c
+        out[f"{prefix}adv{suffix}"] = a
+        out[f"{prefix}drop{suffix}"] = c - a
+    out[f"{prefix}n_classes_gt"] = clean.n_counted("gt")
+    out[f"{prefix}n_classes_clean_union"] = clean.n_counted("union")
+    out[f"{prefix}n_classes_adv_union"] = adv.n_counted("union")
+    return out
 
 
 @torch.no_grad()
