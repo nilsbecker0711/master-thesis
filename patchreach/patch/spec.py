@@ -111,6 +111,15 @@ class PatchConfig:
     csf_lref: float = 0.0          # 0 = legacy mu=0.5; >0 = that Y as L_ref
     csf_composite: str = "clip"    # clip | fit
 
+    # nominal  : tau bounds the residual we INTEND to add (every run to date).
+    # realised : tau bounds the residual that SURVIVES compositing, which is
+    #            the one an observer sees. Measured gap between them at 1000
+    #            steps: 2.77x on the mu=0.5 convention, 7.44x on the local one.
+    #            Default stays 'nominal' so a tau from an earlier run keeps its
+    #            meaning -- the same convention d37975f used for the mu=0.5
+    #            correction -- but 'realised' is the honest one to quote.
+    csf_enforce: str = "nominal"   # nominal | realised
+
     init_from: Optional[str] = None       # checkpoint to seed from (LAP stage 2)
 
     def validate(self):
@@ -118,6 +127,10 @@ class PatchConfig:
             raise ValueError(f"mode must be one of {MODES}, got {self.mode!r}")
         if self.mode == "lap" and not self.reference and not self.init_from:
             raise ValueError("mode='lap' needs `reference` (or `init_from`)")
+        if self.mode in ("csf", "universal_csf"):
+            if self.csf_enforce not in ("nominal", "realised"):
+                raise ValueError("csf_enforce must be nominal|realised, got "
+                                 f"{self.csf_enforce!r}")
         if self.mode == "universal_csf":
             if self.csf_composite not in ("clip", "fit"):
                 raise ValueError("csf_composite must be clip|fit, got "
@@ -168,6 +181,7 @@ class Patch:
         self._csf_values = self._csf_budget = None
         self._frac_clipped = 0.0
         self._frac_at_bound = 0.0
+        self._realised_vis = self._realised_vis_max = 0.0
         if self.cfg.mode == "universal_csf":
             c = self.cfg
             geom = csf_mod.ViewingGeometry(c.csf_pixel_size_cm,
@@ -329,6 +343,14 @@ class Patch:
                                      c.csf_beta, mask=self.shape_mask)
             d = csf_mod.fit_to_range(d, base.unsqueeze(0),
                                      mask=self.shape_mask)
+            if c.csf_enforce == "realised":
+                # AFTER fit_to_range, not instead of it. fit_to_range keeps the
+                # composite inside [0,1] for all but a quantile of pixels; this
+                # bounds what the remaining clipping COSTS. Both are uniform
+                # rescales, so the spectrum's shape survives either way.
+                d = csf_mod.fit_to_visibility(
+                    d, base.unsqueeze(0), self._csf_values, c.csf_threshold,
+                    c.csf_beta, mask=self.shape_mask)
             return (base + d[0]).clamp(0.0, 1.0)
 
         p = torch.sigmoid(self.param)
@@ -462,11 +484,29 @@ class Patch:
             d = csf_mod.fit_to_range(delta.expand(B, -1, -1, -1), win)
         else:
             d = delta
+        if self.cfg.csf_enforce == "realised":
+            # shared_scale: one scale for the one shared residual. A per-sample
+            # scale would be the per-image adaptation this mode exists to avoid.
+            d = csf_mod.fit_to_visibility(
+                d, win, self._csf_values, self.cfg.csf_threshold,
+                self.cfg.csf_beta, contrast_scale=self._contrast_scale,
+                shared_scale=True)
         raw_win = win + d
         new_win = raw_win.clamp(0.0, 1.0)
         with torch.no_grad():
             self._frac_clipped = float(
                 ((raw_win < 0.0) | (raw_win > 1.0)).float().mean())
+            # WHAT THE OBSERVER GETS, per image, after the clamp. The
+            # `visibility` key below measures self.residual() -- the projected
+            # parameter, before it ever meets content -- so it is <= tau by
+            # construction and CANNOT report this violation. Reporting only
+            # that number would have made this mode look compliant precisely
+            # when it was not.
+            rv = csf_mod.visibility_index(
+                new_win - win, self._csf_values, beta=self.cfg.csf_beta,
+                contrast_scale=self._contrast_scale)
+            self._realised_vis = float(rv.mean())
+            self._realised_vis_max = float(rv.max())
 
         normed = (new_win - self._mean) / self._std
         pads = (left, W - p - left, top, H - p - top)
@@ -643,6 +683,11 @@ class Patch:
                     # non-zero means the tau guarantee is being violated in the
                     # permissive direction on real content
                     "frac_clipped": self._frac_clipped,
+                    # POST-composite, the number tau actually has to bound.
+                    # 0.0 until the first apply() -- it is a property of the
+                    # residual meeting content, not of the residual alone.
+                    "realised_visibility": self._realised_vis,
+                    "realised_visibility_max": self._realised_vis_max,
                     "resid_rms": float(d.pow(2).mean().sqrt()),
                     "resid_absmax": float(d.abs().max())}
 

@@ -696,6 +696,96 @@ def realised_visibility(patch: torch.Tensor, reference: torch.Tensor,
 #  Spectral analysis
 # ═════════════════════════════════════════════════════════════════════════════
 
+def fit_to_visibility(delta: torch.Tensor, base: torch.Tensor,
+                      csf: torch.Tensor, threshold: float = 1.0,
+                      beta: float = MINKOWSKI_BETA,
+                      contrast_scale=CONTRAST_SCALE,
+                      mask: Optional[torch.Tensor] = None,
+                      iters: int = 12,
+                      shared_scale: bool = False) -> torch.Tensor:
+    r"""
+    Scale `delta` so the residual that SURVIVES compositing satisfies tau.
+
+    THE PROBLEM THIS EXISTS FOR. Every budget above this line constrains the
+    residual we INTEND to add. The observer sees clamp(base + delta) - base,
+    which is a different signal, and the difference is not small. A clamp is a
+    hard nonlinearity: it does not scale the residual, it BENDS it, and a bent
+    peak is a corner, and a corner is broadband -- energy lands in exactly the
+    low and mid bands where the CSF is largest and the budget is tightest.
+
+    Measured on segformer/image 420, tau = 0.25, five seeds at 1000 steps:
+    realised visibility came out 2.77x tau on the mu=0.5 convention (worst seed
+    4.52x) and 7.44x on the locally-measured one (worst 12.34x). The constraint
+    held at initialisation -- "tau=0.25 requested -> 0.2508 realised" -- and
+    broke during optimisation, because the attack always pushes toward the
+    largest perturbation it is allowed and so drives more pixels into the
+    clamp. The signature is diagnostic: the WORST seed for visibility had the
+    LOWEST resid_rms and resid_absmax of the five, which is backwards for
+    "bigger is more visible" and exactly right for clipping, which removes
+    peaks while adding harmonics.
+
+    THE FIX is the one operation that cannot distort a spectrum: a single
+    scalar. Bisect on c in [0,1] and return c*delta, choosing the largest c
+    whose COMPOSITED residual measures within tau.
+
+    THE INVARIANT IS WHAT MAKES THIS SOUND. `lo` is only ever assigned a value
+    that has been MEASURED compliant, `hi` only ever one measured violating,
+    and `lo` is what is returned. The bound therefore holds regardless of
+    whether V(c) is monotone in c -- and it is NOT guaranteed to be, precisely
+    because clipping generates harmonics. A bisection that assumed monotonicity
+    would be unsound here; this one is not, because it never returns a value it
+    has not checked. c = 0 is compliant trivially (V(0) = 0), so `lo` always
+    starts valid and the search cannot fail.
+
+    THE SCALE IS DETACHED, so the gradient still flows through delta as if the
+    scale were a constant -- the same contract as gradient clipping. The
+    forward pass is exactly compliant; the backward is the gradient of the
+    scaled residual.
+
+    `shared_scale` is for universal_csf, where `base` is a BATCH of different
+    content. A per-sample c would be a per-image adaptation, which is the one
+    thing a universal patch must not have -- the same objection the
+    csf_composite='fit' docstring raises. The minimum over the batch is taken
+    instead, so one scale is applied to the one shared residual and every image
+    in the batch is compliant.
+
+    COST: `iters` rfft2 calls on the patch grid, no model forward. Negligible
+    beside one SegFormer pass. The attack does get weaker -- that is the point.
+    The overshoot was buying effectiveness, and it was being bought with
+    perceptual budget the run had already promised not to spend.
+    """
+    if delta.dim() == 3:
+        delta = delta.unsqueeze(0)
+    if base.dim() == 3:
+        base = base.unsqueeze(0)
+    B = base.shape[0]
+
+    def realised(c: torch.Tensor) -> torch.Tensor:
+        r = (base + c.view(-1, 1, 1, 1) * delta).clamp(0.0, 1.0) - base
+        return visibility_index(_masked(r, mask), csf, beta=beta,
+                                contrast_scale=contrast_scale)
+
+    with torch.no_grad():
+        one = torch.ones(B, device=delta.device, dtype=delta.dtype)
+        ok = realised(one) <= threshold
+        if bool(ok.all()):
+            return delta                       # already compliant, no cost
+        lo = torch.where(ok, one, torch.zeros_like(one))
+        hi = one.clone()
+        for _ in range(iters):
+            mid = 0.5 * (lo + hi)
+            good = realised(mid) <= threshold
+            lo = torch.where(good, mid, lo)
+            hi = torch.where(good, hi, mid)
+        c = lo
+
+    if shared_scale:
+        # ONE residual in, one residual out. Returning a per-sample stack here
+        # would make the shape lie about what the mode guarantees.
+        return delta * c.min()
+    return delta * c.view(-1, 1, 1, 1)
+
+
 def rapsd(x: torch.Tensor, n_bins: int = 64
           ) -> Tuple[torch.Tensor, torch.Tensor]:
     r"""
