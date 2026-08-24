@@ -57,6 +57,77 @@ def test_viewing_geometry_matches_appendix_d():
     assert 30 < g.nyquist_cpd < 45
 
 
+def test_from_screen_matches_hand_computed_panels():
+    """
+    The constructor exists because deriving pixel pitch by hand is where the
+    mistake happens: a 15.6" 1080p laptop has a 0.0180 cm pixel, 1.6x the
+    0.0114 cm the defaults assume, and a residual built for the default
+    geometry measures ~5x its requested visibility when viewed on it.
+    """
+    for diag, px, dist, pitch, ppi, theta in [
+            (15.6, 1920, 50, 0.01799, 141, 0.02061),
+            (31.5, 2560, 70, 0.02724,  93, 0.02230),
+            (27.0, 3840, 60, 0.01557, 163, 0.01486)]:
+        g = C.ViewingGeometry.from_screen(diag, px, dist)
+        assert g.pixel_size_cm == pytest.approx(pitch, abs=1e-5)
+        assert g.ppi == pytest.approx(ppi, abs=1.0)
+        assert g.degrees_per_pixel == pytest.approx(theta, abs=1e-5)
+        assert g.viewing_distance_cm == dist
+
+
+def test_from_screen_honours_a_non_16_9_aspect():
+    wide = C.ViewingGeometry.from_screen(34, 3440, 70, aspect=(21, 9))
+    tall = C.ViewingGeometry.from_screen(34, 3440, 70, aspect=(16, 9))
+    # the same diagonal spread over a wider panel gives a WIDER pixel
+    assert wide.pixel_size_cm > tall.pixel_size_cm
+
+
+def test_from_physical_is_the_driving_threat_model():
+    """
+    A 0.5 m patch at 20 m on a 128 px grid is 0.01119 deg/px -> Nyquist
+    44.7 cpd, a FINER geometry than the 0.0114/50 default (38.3 cpd). A real
+    road patch therefore has MORE room to hide than a desk monitor suggests,
+    which is the opposite of what inspecting PNGs on a laptop implies.
+    """
+    g = C.ViewingGeometry.from_physical(0.5, 20.0, 128)
+    assert g.degrees_per_pixel == pytest.approx(0.01119, abs=1e-5)
+    assert g.nyquist_cpd > C.ViewingGeometry().nyquist_cpd
+
+
+def test_only_the_ratio_of_pixel_size_to_distance_matters():
+    """degrees_per_pixel uses p/(2d) and nothing else, so the two fields are
+    one knob. from_physical relies on this to pick an arbitrary declared
+    distance."""
+    a = C.ViewingGeometry.from_physical(0.5, 20.0, 128, declare_distance_cm=100.0)
+    b = C.ViewingGeometry.from_physical(0.5, 20.0, 128, declare_distance_cm=37.0)
+    assert a.degrees_per_pixel == pytest.approx(b.degrees_per_pixel, rel=1e-9)
+    assert a.pixel_size_cm != pytest.approx(b.pixel_size_cm)
+
+
+def test_matched_distance_inverts_the_geometry():
+    """A screen viewed at matched_distance_cm(its PPI) must reproduce the
+    geometry exactly — that is the whole point of the eyeball check."""
+    ref = C.ViewingGeometry()
+    for diag, px in [(15.6, 1920), (31.5, 2560), (27.0, 3840)]:
+        probe = C.ViewingGeometry.from_screen(diag, px, 50)
+        d = ref.matched_distance_cm(probe.ppi)
+        assert C.ViewingGeometry.from_screen(diag, px, d).degrees_per_pixel             == pytest.approx(ref.degrees_per_pixel, rel=1e-6)
+    # d ~ 1/ppi, so halving the density doubles the distance
+    assert ref.matched_distance_cm(100) == pytest.approx(
+        2 * ref.matched_distance_cm(200), rel=1e-9)
+
+
+def test_existing_geometry_behaviour_is_untouched():
+    """The constructors are ADDITIONS. Positional construction, the field
+    defaults and the serialised form all have to be exactly what they were, or
+    every checkpoint and config.json recorded so far changes meaning."""
+    from dataclasses import asdict
+    g = C.ViewingGeometry(0.0114, 50.0)
+    assert asdict(g) == {"pixel_size_cm": 0.0114, "viewing_distance_cm": 50.0}
+    assert g.degrees_per_pixel == pytest.approx(0.013063, rel=1e-3)
+    assert C.ViewingGeometry() == g
+
+
 def test_distance_changes_the_budget_in_the_right_direction():
     """
     Further away, one pixel subtends a SMALLER visual angle, so a given image
