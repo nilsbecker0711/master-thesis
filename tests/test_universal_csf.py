@@ -68,7 +68,13 @@ def test_pooled_visibility_never_exceeds_tau(tau):
     """
     p = make(csf_threshold=tau)
     for scale in (1e-3, 1.0, 1e3):
+        # THE CONTRACT: the constraint is maintained by project(), which the
+        # training loop calls after every optimiser step. Writing param.data
+        # and reading residual() without projecting is the one ordering under
+        # which the bound legitimately does not hold -- so the test does what
+        # the loop does rather than asserting an invariant nothing maintains.
         p.param.data = torch.randn(3, S, S) * scale
+        p.project()
         v = float(C.visibility_index(p.residual(), p._csf_values,
                                      beta=p.cfg.csf_beta,
                                      contrast_scale=p._contrast_scale))
@@ -262,3 +268,45 @@ def test_lref_tightens_the_budget():
     legacy = make(csf_threshold=0.25)
     cal = make(csf_threshold=0.25, csf_lref=0.0971)   # train median at centre
     assert float(cal._csf_budget.max()) < float(legacy._csf_budget.max())
+
+
+def test_the_optimiser_can_actually_reallocate_the_spectrum():
+    """
+    THE BUG THIS PINS, and it shipped in the first version of this mode.
+
+    The projection used to live inside residual(), which makes the map radially
+    flat above the bound: dL/d|Z| is EXACTLY zero at a saturated bin, so its
+    magnitude can never come back down and saturation is an absorbing state.
+    Measured from the default init: frac_at_bound stuck at 0.989 across 200
+    Adam steps and the per-bin spend ratio moved by 2e-05. The optimiser could
+    only rotate phase, and spectral_allocation() -- the metric this mode exists
+    to produce -- was pinned at 1.000 by construction rather than by choice.
+
+    Projecting the PARAMETER after the step instead leaves the loss an
+    unflattened gradient, so bins can move down as well as up.
+    """
+    p = make(csf_threshold=0.25)
+    opt = torch.optim.Adam([p.param], lr=0.05, betas=(0.5, 0.999))
+    B = p._csf_budget
+    live = B > 0
+
+    def spend():
+        mag = torch.fft.rfft2(p.residual().detach(), norm="forward").abs()
+        return (mag / B.clamp(min=1e-12))[:, :, live]
+
+    before = spend().clone()
+    target = torch.randn(1, 3, S, S) * 0.01
+    for _ in range(50):
+        opt.zero_grad()
+        ((p.residual() - target) ** 2).mean().backward()
+        opt.step()
+        p.project()
+    after = spend()
+
+    # the allocation MOVED, and moved downward somewhere -- the direction the
+    # frozen version could never go
+    assert float((after - before).abs().max()) > 0.05
+    assert float(after.min()) < 0.95
+    assert p.stats()["frac_at_bound"] < 0.99
+    # and the bound still holds
+    assert float(after.max()) <= 1.0 + 1e-4

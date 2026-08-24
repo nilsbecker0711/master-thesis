@@ -200,6 +200,8 @@ class Patch:
                 self.cfg.csf_model, self.cfg.csf_threshold,
                 self.cfg.csf_min_cycles, device=self.device)
         self.param = self._init_param()
+        if self.cfg.mode == "universal_csf":
+            self._project_spectrum()
 
     # ── construction ─────────────────────────────────────────────────────────
 
@@ -241,12 +243,16 @@ class Patch:
             return lap_mod.logit_seed(self.reference).clone().requires_grad_(True)
 
         if c.mode == "universal_csf":
-            # Deliberately LARGE. The projection is invariant to scaling raw
-            # up, so a big init starts with essentially every bin at its bound
-            # and pooled visibility at exactly tau -- which is what makes a
-            # universal run at tau comparable to an overfit run at tau. A small
-            # init starts far below the budget and the run has to climb there
-            # first, wasting steps and under-reporting tau throughout.
+            # Large, so that the projection in __init__ lands it AT the budget
+            # on every live bin: pooled visibility starts at exactly tau, which
+            # is what makes a universal run at tau comparable to an overfit run
+            # at tau. Starting far below would under-report tau for as long as
+            # the run took to climb there.
+            #
+            # Unlike the forward-clamp version this is NOT a trap. project()
+            # clamps the parameter after each step while the loss still sees an
+            # unflattened gradient, so a bin that starts at its bound can move
+            # back down whenever the loss wants it lower.
             return (torch.randn(3, c.size, c.size, device=self.device) * 10.0
                     ).requires_grad_(True)
 
@@ -286,11 +292,18 @@ class Patch:
         if self.cfg.mode != "universal_csf":
             raise ValueError(f"residual() is universal_csf only, got "
                              f"{self.cfg.mode!r}")
-        d, at_bound = csf_mod.universal_residual(
-            self.param.unsqueeze(0), self._csf_budget, self._csf_values,
-            self.cfg.csf_threshold, self.cfg.csf_beta, self._contrast_scale)
-        self._frac_at_bound = float(at_bound)
-        return d
+        # THE PARAMETER IS THE RESIDUAL. No projection inside the graph -- see
+        # project(), which is where the constraint is applied.
+        #
+        # WHY NOT IN THE FORWARD, measured. Putting the clamp here makes the
+        # map radially flat above the bound, so dL/d|Z| is EXACTLY zero at any
+        # saturated bin and its magnitude can never come back down. Saturation
+        # is then an absorbing state: from the default init, frac_at_bound sat
+        # at 0.989 for 200 Adam steps and the per-bin spend ratio moved by
+        # 2e-05. The optimiser could only rotate phase, and the spectral
+        # allocation this mode exists to measure was frozen at 1.000 by
+        # construction rather than chosen.
+        return self.param.unsqueeze(0)
 
     def render(self) -> torch.Tensor:
         """param -> [3,S,S] in [0,1], differentiable."""
@@ -514,15 +527,38 @@ class Patch:
             elif self.cfg.mode == "csf":
                 pass          # scale-invariant reparameterisation; nothing to clip
             elif self.cfg.mode == "universal_csf":
-                # The projection happens inside residual(), on the SPECTRUM,
-                # every forward pass -- so the constraint is already applied to
-                # what the loss sees rather than repaired afterwards. Clipping
-                # the raw parameter here would do nothing: the projection is
-                # invariant to scaling it up.
-                pass
+                # PROJECTED GRADIENT DESCENT, and the projection is on the
+                # PARAMETER -- the tensor the optimiser owns -- not on a render
+                # derived from it. Adam takes an unconstrained step, then every
+                # DFT bin is clamped back to its budget with phase untouched.
+                #
+                # The gradient the loss sees is therefore the TRUE gradient of
+                # the residual, with no min() flattening it, so a bin sitting
+                # at its bound is pushed back each step but can still move DOWN
+                # when the loss wants it lower. That is the whole difference
+                # from clamping in the forward pass, and it is what keeps the
+                # spectral allocation a free variable instead of a constant.
+                self._project_spectrum()
             elif self.cfg.logit_clip > 0:
                 self.param.data.clamp_(-self.cfg.logit_clip,
                                        self.cfg.logit_clip)
+
+    @torch.no_grad()
+    def _project_spectrum(self, eps: float = 1e-12):
+        """
+        Clamp every rfft bin of `param` to its budget, leaving phase free.
+
+        Called after every optimiser step, and once at construction so the
+        FIRST forward pass is already inside the constraint set rather than one
+        step behind it.
+        """
+        spec = torch.fft.rfft2(self.param.data, norm="forward")
+        mag = spec.abs()
+        scale = (self._csf_budget / mag.clamp(min=eps)).clamp(max=1.0)
+        self._frac_at_bound = float(
+            ((scale < 1.0) & (self._csf_budget > 0)).float().mean())
+        self.param.data = torch.fft.irfft2(
+            spec * scale, s=self.param.shape[-2:], norm="forward")
 
     def active_mask(self) -> Optional[torch.Tensor]:
         r"""
