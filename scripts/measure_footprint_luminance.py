@@ -352,7 +352,13 @@ def main():
     for band, v in bands["median"].items():
         print(f"  {band:<14}{v['csf']:>10.2f}{v['budget']:>12.4e}")
 
-    out_dir = Path(a.out_dir) / f"{a.split}_{a.img_h}x{a.img_w}_{a.placement}_p{size}"
+    # csf_model BELONGS IN THIS PATH. Without it the barten and sso runs of the
+    # same split/placement collide, and the second silently overwrites the
+    # first -- which is exactly what happened on the first cluster sweep: the
+    # sso control clobbered the headline barten run and only the luminance
+    # half, which is model-independent, survived.
+    out_dir = (Path(a.out_dir)
+               / f"{a.split}_{a.img_h}x{a.img_w}_{a.placement}_p{size}_{a.csf_model}")
     out_dir.mkdir(parents=True, exist_ok=True)
     plot_histogram(y_lin, y_enc, lin_stats, out_dir / "footprint_luminance.png")
     with open(out_dir / "footprint_luminance.json", "w") as f:

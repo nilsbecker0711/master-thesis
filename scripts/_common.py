@@ -40,12 +40,17 @@ def add_model_args(p):
 
 def add_patch_args(p):
     p.add_argument("--patch_mode", default="raw",
-                   choices=["raw", "gan", "raw_ganinit", "lap", "csf"],
+                   choices=["raw", "gan", "raw_ganinit", "lap", "csf",
+                            "universal_csf"],
                    help="csf: base + a residual whose spectrum is bounded by "
                         "the human contrast sensitivity function. Pair with "
                         "--from_image in overfit.py so the base is the region "
                         "the patch covers; otherwise the base is grey and the "
-                        "patch is a visible square with an invisible texture.")
+                        "patch is a visible square with an invisible texture. "
+                        "universal_csf: ONE residual shared across the whole "
+                        "dataset, added onto whatever content it lands on — "
+                        "the non-adaptive control for csf. train.py only; it "
+                        "is meaningless on a single image, where it IS csf.")
     p.add_argument("--patch_size", type=int, default=128)
     p.add_argument("--patch_scale", type=float, default=0.25)
     p.add_argument("--logit_clip", type=float, default=6.0,
@@ -163,6 +168,24 @@ def add_csf_args(p):
     g.add_argument("--csf_min_cycles", type=float, default=2.0)
     g.add_argument("--csf_pixel_size_cm", type=float, default=0.0114)
     g.add_argument("--csf_viewing_distance_cm", type=float, default=50.0)
+    g.add_argument("--csf_display_peak_cd_m2", type=float, default=100.0,
+                   help="display peak white, for the luminance-aware path "
+                        "only. Sets the absolute luminance Barten's pupil "
+                        "formula needs; 100 is the sRGB reference white.")
+    g.add_argument("--csf_lref", type=float, default=0.0,
+                   help="reference LINEAR luminance Y for the CSF budget. "
+                        "DEFAULT 0 keeps the legacy mu=0.5 convention, so a "
+                        "tau here means what it means in every run recorded so "
+                        "far. >0 switches to the calibrated budget, which is "
+                        "~1.9x tighter at Nyquist — measured, not estimated. "
+                        "0.097 is the Cityscapes train median at centre.")
+    g.add_argument("--csf_composite", default="clip", choices=["clip", "fit"],
+                   help="universal_csf only. clip: x+delta clamped to [0,1], "
+                        "and frac_clipped reports where that bit. fit: "
+                        "fit_to_range rescales instead, preserving the "
+                        "spectrum but introducing a PER-IMAGE scale — which is "
+                        "an adaptation a universal patch should not have. "
+                        "clip is the honest default; fit is the control.")
     return p
 
 
@@ -308,6 +331,9 @@ def build_patch(a, device, mean_t, std_t, generator=None,
         csf_threshold=a.csf_threshold, csf_model=a.csf_model,
         csf_beta=a.csf_beta, csf_min_cycles=a.csf_min_cycles,
         csf_pixel_size_cm=a.csf_pixel_size_cm,
-        csf_viewing_distance_cm=a.csf_viewing_distance_cm)
+        csf_viewing_distance_cm=a.csf_viewing_distance_cm,
+        csf_display_peak_cd_m2=getattr(a, "csf_display_peak_cd_m2", 100.0),
+        csf_lref=getattr(a, "csf_lref", 0.0),
+        csf_composite=getattr(a, "csf_composite", "clip"))
     return Patch(cfg, device, mean_t, std_t, generator=generator,
                  init_reference=init_reference)

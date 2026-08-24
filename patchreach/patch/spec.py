@@ -50,7 +50,8 @@ from . import shape as shape_mod
 # suite unchanged. Behaviourally it is identical to 'raw': sigmoid rendering,
 # no regularisers, no reference. Only the label differs, so diagnostics.txt
 # reports the run's real provenance instead of claiming patch_mode=raw.
-MODES = ("raw", "gan", "raw_ganinit", "lap", "conditional", "csf")
+MODES = ("raw", "gan", "raw_ganinit", "lap", "conditional", "csf",
+         "universal_csf")
 
 
 @dataclass
@@ -99,6 +100,17 @@ class PatchConfig:
     csf_pixel_size_cm: float = 0.0114
     csf_viewing_distance_cm: float = 50.0
 
+    # ── universal_csf only ───────────────────────────────────────────────────
+    # ONE residual shared across the whole dataset, added onto whatever content
+    # it lands on. mode='csf' optimises a fresh residual per image and takes
+    # its base from that image; this is the non-adaptive control for it, and
+    # the ONLY difference is that delta is shared and the reference luminance
+    # is fixed. Everything else -- the 1/CSF envelope, the Minkowski pooling,
+    # tau -- is the same machinery.
+    csf_display_peak_cd_m2: float = 100.0
+    csf_lref: float = 0.0          # 0 = legacy mu=0.5; >0 = that Y as L_ref
+    csf_composite: str = "clip"    # clip | fit
+
     init_from: Optional[str] = None       # checkpoint to seed from (LAP stage 2)
 
     def validate(self):
@@ -106,6 +118,18 @@ class PatchConfig:
             raise ValueError(f"mode must be one of {MODES}, got {self.mode!r}")
         if self.mode == "lap" and not self.reference and not self.init_from:
             raise ValueError("mode='lap' needs `reference` (or `init_from`)")
+        if self.mode == "universal_csf":
+            if self.csf_composite not in ("clip", "fit"):
+                raise ValueError("csf_composite must be clip|fit, got "
+                                 f"{self.csf_composite!r}")
+            if self.shape != "square":
+                # The residual's spectrum is computed on the full square. A
+                # silhouette would make the pasted region a different signal
+                # from the one tau was measured on, and the bound would not
+                # describe what the observer sees.
+                raise ValueError("mode='universal_csf' supports --shape square "
+                                 "only; the spectral bound is defined on the "
+                                 "full footprint")
         if self.shape != "square" and not self.reference:
             raise ValueError(f"shape={self.shape!r} needs `reference` — the "
                              "silhouette is derived from it")
@@ -142,6 +166,32 @@ class Patch:
         if init_reference is not None:
             self.reference = init_reference.to(self.device).clamp(0, 1)
         self._csf_values = self._csf_budget = None
+        self._frac_clipped = 0.0
+        self._frac_at_bound = 0.0
+        if self.cfg.mode == "universal_csf":
+            c = self.cfg
+            geom = csf_mod.ViewingGeometry(c.csf_pixel_size_cm,
+                                           c.csf_viewing_distance_cm,
+                                           c.csf_display_peak_cd_m2)
+            self._geometry = geom
+            if c.csf_lref > 0:
+                self._csf_values, budget = csf_mod.patch_budget_at_luminance(
+                    c.size, c.csf_lref, geom, c.csf_model, 1.0,
+                    c.csf_min_cycles, units="srgb", device=self.device)
+                self._contrast_scale = csf_mod.calibrated_contrast_scale(
+                    c.csf_lref)
+            else:
+                self._csf_values, budget = csf_mod.patch_budget(
+                    c.size, geom, c.csf_model, 1.0, c.csf_min_cycles,
+                    device=self.device)
+                self._contrast_scale = csf_mod.CONTRAST_SCALE
+            # Normalise ONCE. The envelope depends only on the configuration,
+            # never on the parameter, so recomputing it per step would be pure
+            # cost -- and a per-step normalisation would silently make tau a
+            # function of the current iterate.
+            self._csf_budget = csf_mod.normalise_budget_to_tau(
+                budget, self._csf_values, c.csf_threshold, c.csf_beta,
+                self._contrast_scale)
         if self.cfg.mode == "csf":
             self._csf_values, self._csf_budget = csf_mod.patch_budget(
                 c_size := self.cfg.size,
@@ -150,6 +200,8 @@ class Patch:
                 self.cfg.csf_model, self.cfg.csf_threshold,
                 self.cfg.csf_min_cycles, device=self.device)
         self.param = self._init_param()
+        if self.cfg.mode == "universal_csf":
+            self._project_spectrum()
 
     # ── construction ─────────────────────────────────────────────────────────
 
@@ -190,6 +242,20 @@ class Patch:
         if c.mode == "lap":
             return lap_mod.logit_seed(self.reference).clone().requires_grad_(True)
 
+        if c.mode == "universal_csf":
+            # Large, so that the projection in __init__ lands it AT the budget
+            # on every live bin: pooled visibility starts at exactly tau, which
+            # is what makes a universal run at tau comparable to an overfit run
+            # at tau. Starting far below would under-report tau for as long as
+            # the run took to climb there.
+            #
+            # Unlike the forward-clamp version this is NOT a trap. project()
+            # clamps the parameter after each step while the loss still sees an
+            # unflattened gradient, so a bin that starts at its bound can move
+            # back down whenever the loss wants it lower.
+            return (torch.randn(3, c.size, c.size, device=self.device) * 10.0
+                    ).requires_grad_(True)
+
         if c.mode == "csf":
             # NOT zeros. csf_residual normalises to exactly tau, so a zero raw
             # tensor is 0/0 with an undefined gradient. The reparameterisation
@@ -215,9 +281,39 @@ class Patch:
 
     # ── rendering ────────────────────────────────────────────────────────────
 
+    def residual(self) -> torch.Tensor:
+        """
+        universal_csf: param -> the shared residual delta [1,3,S,S].
+
+        In sRGB CODE units, the space the composite happens in. Not a patch --
+        it is added to content rather than replacing it, so it is signed and
+        has no [0,1] range of its own.
+        """
+        if self.cfg.mode != "universal_csf":
+            raise ValueError(f"residual() is universal_csf only, got "
+                             f"{self.cfg.mode!r}")
+        # THE PARAMETER IS THE RESIDUAL. No projection inside the graph -- see
+        # project(), which is where the constraint is applied.
+        #
+        # WHY NOT IN THE FORWARD, measured. Putting the clamp here makes the
+        # map radially flat above the bound, so dL/d|Z| is EXACTLY zero at any
+        # saturated bin and its magnitude can never come back down. Saturation
+        # is then an absorbing state: from the default init, frac_at_bound sat
+        # at 0.989 for 200 Adam steps and the per-bin spend ratio moved by
+        # 2e-05. The optimiser could only rotate phase, and the spectral
+        # allocation this mode exists to measure was frozen at 1.000 by
+        # construction rather than chosen.
+        return self.param.unsqueeze(0)
+
     def render(self) -> torch.Tensor:
         """param -> [3,S,S] in [0,1], differentiable."""
         c = self.cfg
+        if c.mode == "universal_csf":
+            # FOR VIEWING ONLY -- the residual on mid grey, so a saved PNG
+            # shows its structure. apply() never calls this; it composites the
+            # residual onto real content. Saving `delta` raw would be a
+            # near-black image at any usable tau.
+            return (0.5 + self.residual()[0]).clamp(0.0, 1.0)
         if c.mode == "gan":
             return ((self.G(self.param.unsqueeze(0)) + 1.0) * 0.5).squeeze(0)
         if c.mode == "csf":
@@ -287,6 +383,9 @@ class Patch:
         B, _, H, W = imgs.shape
         p = int(H * self.cfg.scale)
 
+        if self.cfg.mode == "universal_csf":
+            return self._apply_residual(imgs, p)
+
         rendered = F.interpolate(self.render().unsqueeze(0), size=(p, p),
                                  mode="bilinear", align_corners=False)
         normed = (rendered - self._mean) / self._std
@@ -306,6 +405,73 @@ class Patch:
                 self.shape_mask.float().view(1, 1, *self.shape_mask.shape),
                 size=(p, p), mode="nearest")
         mask = F.pad(sm, pads)                                  # [1,1,H,W]
+
+        patched = imgs * (1.0 - mask) + full * mask
+        footprint = (mask[0, 0] > 0.5).unsqueeze(0).expand(B, -1, -1)
+        return patched, footprint
+
+    def _apply_residual(self, imgs: torch.Tensor, p: int):
+        r"""
+        x'_i = x_i, with the footprint replaced by clip(x_i[footprint] + delta).
+
+        THE ONE STRUCTURAL DIFFERENCE FROM EVERY OTHER MODE. apply() above
+        renders a single patch and expands it across the batch, so every image
+        receives identical pixels. Here every image receives the SAME RESIDUAL
+        on DIFFERENT CONTENT, which is the whole point: delta is universal, the
+        content it sits on is not.
+
+        The composite runs in [0,1] sRGB code space and is re-normalised
+        afterwards, because that is the space the spectral budget is defined
+        in. Doing it in normalised space would apply a per-channel scale to the
+        residual and quietly change its spectrum by a factor of std.
+
+        CLIPPING IS TRACKED, NOT ASSUMED AWAY. Where the underlying content is
+        near 0 or 1 the clamp truncates the residual, so the realised
+        perturbation is not the projected one and the tau guarantee is violated
+        in the permissive direction. `frac_clipped` is the fraction of
+        footprint pixels where that happened, and it is logged every step.
+        --csf_composite fit uses fit_to_range instead, which rescales rather
+        than truncates and therefore preserves the spectrum -- at the cost of a
+        per-image scale, which is a per-image adaptation a universal patch is
+        not supposed to have. clip is the default for that reason.
+
+        GRADIENT: clamp has zero gradient on the saturated side, so a heavily
+        clipped run also loses the gradient on those pixels. That is a real
+        cost of the honest composite and another reason to watch frac_clipped.
+        """
+        B, _, H, W = imgs.shape
+        top, left = (self.placement if self.placement is not None
+                     else ((H - p) // 2, (W - p) // 2))
+        top = max(0, min(int(top), H - p))
+        left = max(0, min(int(left), W - p))
+
+        delta = self.residual()
+        if delta.shape[-1] != p:
+            # Resampling a residual RESAMPLES ITS SPECTRUM, so the budget the
+            # bins were projected onto no longer describes the pasted signal.
+            # Refuse rather than silently invalidate tau.
+            raise ValueError(
+                f"universal_csf needs the parameter grid to equal the pasted "
+                f"footprint: size={self.cfg.size} but int(H*scale)={p}. "
+                f"Set --patch_size {p} (or --patch_scale {self.cfg.size/H:g}).")
+
+        img01 = (imgs * self._std + self._mean).clamp(0.0, 1.0)
+        win = img01[:, :, top:top + p, left:left + p]
+
+        if self.cfg.csf_composite == "fit":
+            d = csf_mod.fit_to_range(delta.expand(B, -1, -1, -1), win)
+        else:
+            d = delta
+        raw_win = win + d
+        new_win = raw_win.clamp(0.0, 1.0)
+        with torch.no_grad():
+            self._frac_clipped = float(
+                ((raw_win < 0.0) | (raw_win > 1.0)).float().mean())
+
+        normed = (new_win - self._mean) / self._std
+        pads = (left, W - p - left, top, H - p - top)
+        full = F.pad(normed, pads)
+        mask = F.pad(torch.ones(1, 1, p, p, device=imgs.device), pads)
 
         patched = imgs * (1.0 - mask) + full * mask
         footprint = (mask[0, 0] > 0.5).unsqueeze(0).expand(B, -1, -1)
@@ -360,9 +526,39 @@ class Patch:
                                        self.cfg.latent_clip)
             elif self.cfg.mode == "csf":
                 pass          # scale-invariant reparameterisation; nothing to clip
+            elif self.cfg.mode == "universal_csf":
+                # PROJECTED GRADIENT DESCENT, and the projection is on the
+                # PARAMETER -- the tensor the optimiser owns -- not on a render
+                # derived from it. Adam takes an unconstrained step, then every
+                # DFT bin is clamped back to its budget with phase untouched.
+                #
+                # The gradient the loss sees is therefore the TRUE gradient of
+                # the residual, with no min() flattening it, so a bin sitting
+                # at its bound is pushed back each step but can still move DOWN
+                # when the loss wants it lower. That is the whole difference
+                # from clamping in the forward pass, and it is what keeps the
+                # spectral allocation a free variable instead of a constant.
+                self._project_spectrum()
             elif self.cfg.logit_clip > 0:
                 self.param.data.clamp_(-self.cfg.logit_clip,
                                        self.cfg.logit_clip)
+
+    @torch.no_grad()
+    def _project_spectrum(self, eps: float = 1e-12):
+        """
+        Clamp every rfft bin of `param` to its budget, leaving phase free.
+
+        Called after every optimiser step, and once at construction so the
+        FIRST forward pass is already inside the constraint set rather than one
+        step behind it.
+        """
+        spec = torch.fft.rfft2(self.param.data, norm="forward")
+        mag = spec.abs()
+        scale = (self._csf_budget / mag.clamp(min=eps)).clamp(max=1.0)
+        self._frac_at_bound = float(
+            ((scale < 1.0) & (self._csf_budget > 0)).float().mean())
+        self.param.data = torch.fft.irfft2(
+            spec * scale, s=self.param.shape[-2:], norm="forward")
 
     def active_mask(self) -> Optional[torch.Tensor]:
         r"""
@@ -436,6 +632,20 @@ class Patch:
         """Per-step logging. gan tracks the latent; pixel modes track spread."""
         if self.cfg.mode == "gan":
             return {"latent_absmax": self.param.abs().max().item()}
+        if self.cfg.mode == "universal_csf":
+            d = self.residual()
+            return {"visibility": float(csf_mod.visibility_index(
+                        d, self._csf_values, beta=self.cfg.csf_beta,
+                        contrast_scale=self._contrast_scale)),
+                    # climbing toward 1 means every bin sits on its bound and
+                    # the run is only re-phasing, not reallocating
+                    "frac_at_bound": self._frac_at_bound,
+                    # non-zero means the tau guarantee is being violated in the
+                    # permissive direction on real content
+                    "frac_clipped": self._frac_clipped,
+                    "resid_rms": float(d.pow(2).mean().sqrt()),
+                    "resid_absmax": float(d.abs().max())}
+
         if self.cfg.mode == "csf":
             rendered = self.render()
             base = (self.reference if self.reference is not None

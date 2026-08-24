@@ -66,7 +66,28 @@ def build_parser():
 
     p.add_argument("--epochs", type=int, default=100)
     p.add_argument("--lr", type=float, default=0.005)
+    p.add_argument("--lr_schedule", default="plateau",
+                   choices=["plateau", "cosine", "none"],
+                   help="DEFAULT 'plateau' reproduces every run recorded so "
+                        "far, byte for byte. 'cosine' anneals lr to zero over "
+                        "the whole run, the schedule PR #15 gave overfit.py "
+                        "and overfit_population.py for the reason measured "
+                        "there: Adam's step is ~lr per coordinate whatever the "
+                        "gradient, so a non-annealed run is still taking "
+                        "full-size steps at the end and the reported number is "
+                        "wherever the walk happened to stop (a 9.6-point swing "
+                        "across four identical single-image invocations). "
+                        "train.py did NOT get the flag in that PR; it does "
+                        "now. Use cosine for universal_csf.")
     p.add_argument("--batch_size", type=int, default=4)
+    p.add_argument("--num_workers", type=int, default=4,
+                   help="DataLoader workers. DEFAULT 4 is what every run so "
+                        "far used, so it stays. Cityscapes decodes a 2048x1024 "
+                        "PNG per sample and then resizes it, which at 4 "
+                        "workers can cost more per batch than the segmentor "
+                        "step it feeds — on a node with --cpus-per-task=16 "
+                        "raise this to 8-16 and the epoch time may halve. "
+                        "Check before assuming the GPU is the bottleneck.")
     p.add_argument("--exclude_footprint", action="store_true", default=True)
     p.add_argument("--val_images", type=int, default=20)
     p.add_argument("--val_every", type=int, default=5)
@@ -107,6 +128,14 @@ def run_id(a) -> str:
         bits.append(f"cls{a.target_class}")
     if a.patch_mode == "lap":
         bits.append(f"a{a.lap_alpha:g}")
+    if a.patch_mode in ("csf", "universal_csf"):
+        bits.append(f"tau{a.csf_threshold:g}")
+        if getattr(a, "csf_lref", 0.0) > 0:
+            bits.append(f"lref{a.csf_lref:g}")
+        if getattr(a, "csf_composite", "clip") != "clip":
+            bits.append(a.csf_composite)
+    if getattr(a, "lr_schedule", "plateau") != "plateau":
+        bits.append(f"lr-{a.lr_schedule}")
     if a.shape != "square":
         bits.append(f"sh-{a.shape}")
     if a.placement != "center":
@@ -192,7 +221,7 @@ def main():
     train_ds = CityscapesSeg(args.cityscapes_root, "train", args.img_h, args.img_w)
     val_full = CityscapesSeg(args.cityscapes_root, "val", args.img_h, args.img_w)
     train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True,
-                              num_workers=4, pin_memory=True)
+                              num_workers=args.num_workers, pin_memory=True)
     val_loader = DataLoader(
         Subset(val_full, list(range(min(args.val_images, len(val_full))))),
         batch_size=1, shuffle=False, num_workers=2)
@@ -212,6 +241,25 @@ def main():
         G.eval().to(device)
         for p in G.parameters():
             p.requires_grad_(False)
+
+    if args.patch_mode == "universal_csf":
+        p_px = int(args.img_h * args.patch_scale)
+        if args.patch_size != p_px:
+            raise SystemExit(
+                f"universal_csf needs --patch_size to equal the pasted "
+                f"footprint int(img_h*patch_scale) = {p_px}, got "
+                f"{args.patch_size}. Resampling a residual resamples its "
+                f"SPECTRUM, so the budget its bins were projected onto would "
+                f"no longer describe the pasted signal and tau would be a "
+                f"number about a different tensor. "
+                f"fix: --patch_size {p_px}   (or --patch_scale "
+                f"{args.patch_size/args.img_h:g})")
+        if args.placement == "gradcam":
+            raise SystemExit(
+                "universal_csf does not support --placement gradcam: the CAM "
+                "is per image while the patch is one shared tensor, and "
+                "Patch.apply() composites a single (top,left) for the whole "
+                "batch. Use center or fixed.")
 
     patch = build_patch(args, device, mean_t, std_t, generator=G)
 
@@ -253,8 +301,22 @@ def main():
 
     opt = torch.optim.Adam([patch.param], lr=args.lr, betas=(0.5, 0.999),
                            amsgrad=True)
-    sched = torch.optim.lr_scheduler.ReduceLROnPlateau(opt, "min", patience=30,
-                                                       factor=0.5)
+    # T_max is TOTAL OPTIMISER STEPS, not epochs. Annealing per epoch would
+    # decay ~len(loader) times too slowly and leave the tail exactly as hot as
+    # the flat schedule this exists to replace.
+    total_steps = args.epochs * len(train_loader)
+    if args.lr_schedule == "plateau":
+        sched = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            opt, "min", patience=30, factor=0.5)
+    elif args.lr_schedule == "cosine":
+        sched = torch.optim.lr_scheduler.CosineAnnealingLR(
+            opt, T_max=total_steps)
+        print(f"[sched] cosine, lr {args.lr:g} -> 0 over {total_steps:,} steps "
+              f"({args.epochs} epochs x {len(train_loader):,} batches)")
+    else:
+        sched = None
+        print("[sched] none — flat lr. The run will not settle; see "
+              "--lr_schedule.")
 
     history, best, checked, t0 = [], -1e9, False, time.time()
     for epoch in range(1, args.epochs + 1):
@@ -293,10 +355,15 @@ def main():
 
             opt.step()
             patch.project()
+            # Cosine steps PER BATCH (its T_max is in optimiser steps);
+            # plateau steps per epoch, on the epoch mean, below.
+            if args.lr_schedule == "cosine":
+                sched.step()
             running += la.item()
 
         running /= len(train_loader)
-        sched.step(running)
+        if args.lr_schedule == "plateau":
+            sched.step(running)
         st = " ".join(f"{k}={v:.4f}" for k, v in patch.stats().items())
         print(f"[epoch {epoch:3d}] {args.loss_fn}={running:.5f}  {st}")
         save_image(patch.render().cpu(),
@@ -331,11 +398,31 @@ def main():
     patch.save(out_dir / "final.pt")
     save_image(patch.render().cpu(), out_dir / "final_patch.png")
 
+    # ── universal_csf: the metrics this mode exists to produce ───────────────
+    # Run on the BEST checkpoint, not the last one, so the reported visibility
+    # describes the patch the headline number came from.
+    universal_report = None
+    if patch.cfg.mode == "universal_csf":
+        from patchreach.diagnostics import universal as univ
+        best_ck = out_dir / "best.pt"
+        if best_ck.exists():
+            patch.param.data = torch.load(
+                best_ck, map_location=device)["param"].to(device)
+        universal_report = univ.realised_tau(patch, val_loader, device,
+                                             mean_t, std_t)
+        alloc = univ.spectral_allocation(patch)
+        universal_report["spectral_allocation"] = alloc
+        univ.log_report(universal_report, alloc)
+        univ.plot(universal_report, alloc, out_dir / "universal_csf.png",
+                  title=out_dir.name)
+
     results = {"run_id": out_dir.name, "config": vars(args),
                "patch_config": asdict(patch.cfg),
                "backbone_channels": n_ch, "backbone_active_channels": n_active,
                "final": final, "best_drop_remote": best,
                "wall_clock_s": time.time() - t0, "history": history}
+    if universal_report is not None:
+        results["universal_csf"] = universal_report
     if patch.cfg.mode == "lap":
         results["rationality"] = rationality_report(patch.render(),
                                                     patch.reference)

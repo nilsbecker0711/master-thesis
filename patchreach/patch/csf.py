@@ -968,3 +968,228 @@ def patch_budget_at_luminance(size: int, Y_ref: float,
         budget = torch.where(radial_frequency_cpp(size, size, device) >= f_min,
                              budget, torch.zeros_like(budget))
     return csf, budget
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+#  Universal mode: hard projection, and the calibrated visibility
+# ═════════════════════════════════════════════════════════════════════════════
+
+def projected_residual(raw: torch.Tensor, budget: torch.Tensor
+                       ) -> Tuple[torch.Tensor, torch.Tensor]:
+    r"""
+    Hard per-bin magnitude projection. Returns (delta, frac_at_bound).
+
+        Z     = rfft2(raw)
+        Zhat  = Z * min(1, B(f)/|Z|)        elementwise, PHASE UNTOUCHED
+        delta = irfft2(Zhat)
+
+    THE DIFFERENCE FROM bounded_residual(), and why both exist. That function
+    is a smooth reparameterisation, chosen so no component is ever stuck on its
+    bound with a dead gradient. This one is a true projection: a bin at the
+    bound has zero gradient through the min(), which is exactly the failure
+    mode spec.py's logit_clip note describes in pixel space.
+
+    It is used anyway for the universal mode because the bound then holds as an
+    INEQUALITY on the parameter itself rather than asymptotically, which is
+    what makes "project the parameter, not the render" checkable. The dead
+    gradient is real, so `frac_at_bound` is returned rather than discarded:
+    a run where that fraction climbs toward 1 has stopped optimising and is
+    only re-phasing, and the caller must be able to see it.
+
+    Only the MAGNITUDE is limited. Scaling the complex coefficient preserves
+    phase exactly and avoids differentiating arg(Z), undefined at the origin.
+    """
+    spec = torch.fft.rfft2(raw, norm="forward")
+    mag = spec.abs()
+    scale = (budget / mag.clamp(min=1e-12)).clamp(max=1.0)
+    at_bound = (scale < 1.0) & (budget > 0)
+    delta = torch.fft.irfft2(spec * scale, s=raw.shape[-2:], norm="forward")
+    return delta, at_bound.float().mean()
+
+
+def normalise_budget_to_tau(budget: torch.Tensor, csf: torch.Tensor,
+                            threshold: float = 1.0,
+                            beta: float = MINKOWSKI_BETA,
+                            contrast_scale: float = CONTRAST_SCALE,
+                            channels: int = 3,
+                            eps: float = 1e-12) -> torch.Tensor:
+    r"""
+    Rescale a 1/CSF envelope so that ALL-BINS-AT-BUDGET pools to exactly `tau`.
+
+        v_full = ( sum_f (contrast_scale * B(f) * CSF(f))^beta )^(1/beta)
+        B'     = B * tau / v_full
+
+    WHY THIS IS NECESSARY, and it was measured rather than reasoned. The
+    obvious construction — project each bin onto the raw 1/CSF budget, then
+    rescale the result so pooled visibility equals tau — DOES NOT WORK. The
+    projection clamps most bins down, so the pooled visibility afterwards is
+    far below tau, and the rescale that restores it multiplies every bin back
+    up: a smoke test put bins at 90x their own budget. Per-bin bound and pooled
+    equality are not simultaneously satisfiable on one envelope, and asserting
+    both would have silently reported a bound that was violated by two orders
+    of magnitude.
+
+    Normalising the ENVELOPE instead makes the per-bin bound the real
+    constraint and pooled visibility an inequality, v <= tau, with equality
+    only if every bin saturates. That is the honest direction for the
+    inequality to point.
+
+    `channels` IS NOT COSMETIC. visibility_index() takes the rfft of each
+    colour channel separately and pools over all of them, so an envelope
+    normalised on a single channel is 3^(1/beta) = 1.44x too generous and the
+    bound it promises is not the bound that holds. Measured before the term was
+    added: pooled 0.0541 against a nominal tau of 0.05, an 8% overshoot that
+    every assertion in the training loop would have passed, because the
+    assertion and the normaliser shared the mistake.
+
+    THE COST is that a universal run at nominal tau is LESS visible than a
+    per-image overfit run at the same nominal tau, where tau is enforced as an
+    equality. The two are therefore compared at matched REALISED visibility as
+    well as at matched nominal tau -- which is what the realised-tau
+    distribution is reported for, and why it is not an optional extra here.
+    """
+    per_ch = (contrast_scale * budget * csf).clamp(min=0).pow(beta).sum()
+    v_full = (channels * per_ch).clamp(min=eps).pow(1.0 / beta)
+    return budget * (threshold / v_full)
+
+
+def universal_residual(raw: torch.Tensor, budget: torch.Tensor,
+                       csf: torch.Tensor, threshold: float = 1.0,
+                       beta: float = MINKOWSKI_BETA,
+                       contrast_scale: float = CONTRAST_SCALE,
+                       mask: Optional[torch.Tensor] = None,
+                       eps: float = 1e-12
+                       ) -> Tuple[torch.Tensor, torch.Tensor]:
+    r"""
+    (delta, frac_at_bound) for the universal mode.
+
+    `budget` must ALREADY be normalised by normalise_budget_to_tau() -- the
+    caller does that once at construction rather than every step, since it
+    depends only on (size, geometry, model, tau, beta) and not on the
+    parameter. Pooled visibility is then bounded by tau BY CONSTRUCTION, and
+    the assertion the training loop makes is a check on that reasoning rather
+    than a correction to it.
+
+    Only the SHAPE of `raw` matters: the projection is invariant to scaling raw
+    up (every bin ends at its bound) but not down, so the init magnitude sets
+    how saturated the residual starts.
+    """
+    delta, at_bound = projected_residual(raw, budget)
+    return delta, at_bound
+
+
+def calibrated_contrast_scale(Y_ref: float) -> float:
+    r"""
+    The contrast scale that is actually correct: 2 * (dY/dc) / Y_ref.
+
+    DERIVATION, because the factor is easy to get wrong by a power of gamma.
+    rfft2 with norm="forward" reports A_code/2 for a cosine of peak amplitude
+    A_code in CODE values. The luminance modulation it produces is
+    A_lin = (dY/dc) * A_code, and Michelson contrast is A_lin / Y_ref. So
+
+        contrast = 2 * |rfft(delta)| * (dY/dc) / Y_ref
+
+    THE LEGACY CONSTANT IS NOT A SPECIAL CASE OF THIS ONE, and it is worth
+    being exact about why. CONTRAST_SCALE = 4.0 is 2/mu at mu = 0.5 with the
+    slope term ABSENT, i.e. it assumes code values ARE luminances. This
+    function never drops the slope, so it cannot return 4.0 for any Y_ref;
+    at Y_ref = 0.5 it returns ~6.07, because a mid-LUMINANCE grey is code 0.735
+    where the transfer curve is steep. The two conventions differ by that slope
+    factor, and that is the calibration error: measured over the Cityscapes
+    train split the legacy budget is ~1.9x too permissive at mid and Nyquist
+    frequencies and ~3x too permissive at low frequency.
+    """
+    Y = max(float(Y_ref), LUMINANCE_FLOOR)
+    c = linear_to_srgb(torch.tensor(Y))
+    return contrast_scale_at_luminance(Y) * float(srgb_slope(c))
+
+
+def calibrated_visibility(delta: torch.Tensor, base: torch.Tensor,
+                          geometry: "ViewingGeometry" = None,
+                          model: str = "barten",
+                          beta: float = MINKOWSKI_BETA,
+                          mask: Optional[torch.Tensor] = None
+                          ) -> Tuple[torch.Tensor, torch.Tensor]:
+    r"""
+    (tau_calibrated [B], Y_ref [B]) — visibility of `delta` against the TRUE
+    local luminance of the content it sits on.
+
+    THE HEADLINE METRIC FOR THE UNIVERSAL MODE. tau is set once, at a fixed
+    reference luminance, because a universal patch cannot look at the image it
+    lands on. This recomputes what that one residual actually costs on each
+    val image at that image's own measured luminance, so the sentence
+    "budget set at tau = X; realised visibility ranged from a to b" can be
+    written from measurement rather than assumption.
+
+    BOTH the CSF (through Barten's retinal illuminance) and the contrast
+    denominator respond to Y_ref, so this is not a rescale of the nominal
+    number — the per-image ordering can differ from the nominal one.
+
+    `base` is the footprint content in [0,1] sRGB code values, [B,3,H,W].
+    """
+    geometry = geometry if geometry is not None else ViewingGeometry()
+    if delta.dim() == 3:
+        delta = delta.unsqueeze(0)
+    if base.dim() == 3:
+        base = base.unsqueeze(0)
+    if delta.shape[0] == 1 and base.shape[0] > 1:
+        delta = delta.expand_as(base)
+
+    m = None if mask is None else mask.to(base.dtype)
+    lum = relative_luminance(base)                              # [B,H,W]
+    if m is None:
+        Y = lum.flatten(1).mean(dim=1)
+    else:
+        mm = m.expand_as(lum)
+        Y = (lum * mm).flatten(1).sum(1) / mm.flatten(1).sum(1).clamp(min=1.0)
+
+    out = []
+    for i in range(base.shape[0]):
+        csf = csf_map_at_luminance(base.shape[-2], base.shape[-1],
+                                   float(Y[i]), geometry, model,
+                                   device=base.device)
+        out.append(visibility_index(
+            _masked(delta[i:i + 1], mask), csf, reduce="minkowski", beta=beta,
+            contrast_scale=calibrated_contrast_scale(float(Y[i]))))
+    return torch.cat(out), Y
+
+
+def radial_profile(x: torch.Tensor, n_bins: int = 32
+                   ) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Radially averaged rfft MAGNITUDE (not power) per frequency bin.
+
+    rapsd() above returns power and is the right thing for comparing against a
+    natural-image power law. This returns amplitude, because the BUDGET is an
+    amplitude bound and the quantity worth plotting for the universal mode is
+    the ratio spent/allowed — which is only meaningful if both sides are in the
+    same units.
+    """
+    if x.dim() == 3:
+        x = x.unsqueeze(0)
+    B, C, H, W = x.shape
+    mag = torch.fft.rfft2(x, norm="forward").abs().mean(dim=1)
+    f = radial_frequency_cpp(H, W, x.device)
+    edges = torch.linspace(0.0, 0.5, n_bins + 1, device=x.device)
+    idx = torch.bucketize(f.reshape(-1), edges[1:-1], right=False)
+    out = torch.zeros(B, n_bins, device=x.device)
+    cnt = torch.zeros(n_bins, device=x.device)
+    cnt.scatter_add_(0, idx, torch.ones_like(idx, dtype=torch.float))
+    for b in range(B):
+        out[b].scatter_add_(0, idx, mag[b].reshape(-1))
+    return 0.5 * (edges[:-1] + edges[1:]), out / cnt.clamp(min=1)
+
+
+def budget_radial_profile(budget: torch.Tensor, n_bins: int = 32
+                          ) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Radial mean of a budget map, on the same bins as radial_profile()."""
+    H = budget.shape[-2]
+    W = 2 * (budget.shape[-1] - 1)
+    f = radial_frequency_cpp(H, W, budget.device)
+    edges = torch.linspace(0.0, 0.5, n_bins + 1, device=budget.device)
+    idx = torch.bucketize(f.reshape(-1), edges[1:-1], right=False)
+    out = torch.zeros(n_bins, device=budget.device)
+    cnt = torch.zeros(n_bins, device=budget.device)
+    cnt.scatter_add_(0, idx, torch.ones_like(idx, dtype=torch.float))
+    out.scatter_add_(0, idx, budget.reshape(-1))
+    return 0.5 * (edges[:-1] + edges[1:]), out / cnt.clamp(min=1)

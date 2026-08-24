@@ -123,7 +123,21 @@ def test_existing_geometry_behaviour_is_untouched():
     every checkpoint and config.json recorded so far changes meaning."""
     from dataclasses import asdict
     g = C.ViewingGeometry(0.0114, 50.0)
-    assert asdict(g) == {"pixel_size_cm": 0.0114, "viewing_distance_cm": 50.0}
+    d = asdict(g)
+
+    # The two ORIGINAL fields are exactly what they always were.
+    assert d["pixel_size_cm"] == 0.0114
+    assert d["viewing_distance_cm"] == 50.0
+
+    # Later fields MAY be added -- display_peak_cd_m2 was, for the
+    # luminance-aware budget -- but every addition must carry a default, so a
+    # config.json written before it existed still round-trips to an EQUAL
+    # object. That round-trip is the property checkpoints actually depend on.
+    # Exact dict equality was a proxy for it, and a proxy strict enough to
+    # forbid the additive change it was meant to permit.
+    assert C.ViewingGeometry(pixel_size_cm=d["pixel_size_cm"],
+                             viewing_distance_cm=d["viewing_distance_cm"]) == g
+
     assert g.degrees_per_pixel == pytest.approx(0.013063, rel=1e-3)
     assert C.ViewingGeometry() == g
 
