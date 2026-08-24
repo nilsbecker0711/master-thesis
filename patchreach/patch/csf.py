@@ -78,6 +78,94 @@ class ViewingGeometry:
                                 / (2.0 * self.viewing_distance_cm))
                 * 180.0 / math.pi)
 
+    # ── constructors ─────────────────────────────────────────────────────────
+    #
+    # ONLY THE RATIO p/d MATTERS. degrees_per_pixel uses p/(2d) and nothing
+    # else, so pixel_size_cm and viewing_distance_cm are not two independent
+    # knobs — they are one. Both constructors below exploit that: they compute
+    # the angle the caller actually cares about and then pick any (p, d) pair
+    # that realises it. That is also why a geometry can be quoted as a single
+    # number, deg/px, in the writeup.
+
+    @classmethod
+    def from_screen(cls, diagonal_in: float, pixels_wide: int,
+                    distance_cm: float,
+                    aspect: Tuple[int, int] = (16, 9)) -> "ViewingGeometry":
+        r"""
+        Geometry of a real display, from the numbers written on the box.
+
+            width_cm = 2.54 * diagonal_in * a / sqrt(a^2 + b^2)
+            p        = width_cm / pixels_wide
+
+        Exists because deriving p by hand is where the mistake happens: a
+        15.6" 1080p laptop has a 0.0180 cm pixel, 1.6x the 0.0114 cm the
+        defaults assume, which at 50 cm makes a residual built for the default
+        geometry measure ~5x its requested visibility. Nothing in the code was
+        wrong there — the geometry was simply describing a different monitor.
+
+        aspect is (16, 9) for essentially every modern panel; pass (16, 10) or
+        (21, 9) for the exceptions.
+        """
+        a, b = aspect
+        width_cm = 2.54 * diagonal_in * a / math.hypot(a, b)
+        return cls(width_cm / float(pixels_wide), distance_cm)
+
+    @classmethod
+    def from_physical(cls, width_m: float, distance_m: float, patch_px: int,
+                      declare_distance_cm: float = 100.0) -> "ViewingGeometry":
+        r"""
+        Geometry of a PHYSICAL patch — the driving threat model.
+
+            theta = 2 * arctan( width / 2*distance ) / patch_px      degrees
+
+        A 0.5 m patch seen at 20 m and rendered on a 128 px grid gives
+        0.01119 deg/px, i.e. Nyquist 44.7 cpd — a FINER geometry than the
+        0.0114 cm / 50 cm default (38.3 cpd). So a real road patch has MORE
+        room to hide in than a desk monitor suggests, which is the opposite of
+        what inspecting PNGs on a laptop implies.
+
+        `patch_px` is the grid the BUDGET is computed on — PatchConfig.size,
+        i.e. --patch_size — not the rendered side p = int(H * scale). At the
+        defaults they coincide (128 = 0.25 * 512); if you change --patch_scale
+        so they differ, Patch.apply() resamples and attenuates exactly the high
+        frequencies the budget spent its allowance on, so make them match or
+        the declared geometry describes a spectrum that never reaches the model.
+
+        `declare_distance_cm` is arbitrary and does not affect the result —
+        only p/d matters — it just fixes which of the infinitely many
+        equivalent (p, d) pairs gets stored.
+        """
+        theta = math.degrees(2.0 * math.atan(width_m / (2.0 * distance_m)))
+        theta_per_px = theta / float(patch_px)
+        p = 2.0 * declare_distance_cm * math.tan(math.radians(theta_per_px) / 2.0)
+        return cls(p, declare_distance_cm)
+
+    # ── equivalences, for reporting ──────────────────────────────────────────
+
+    @property
+    def ppi(self) -> float:
+        """The display pixel density this pixel size corresponds to."""
+        return 2.54 / self.pixel_size_cm
+
+    def matched_distance_cm(self, ppi: float) -> float:
+        r"""
+        Distance at which a `ppi` display reproduces THIS geometry.
+
+            d = (2.54 / ppi) / (2 tan(theta/2))        so  d ~ 1 / ppi
+
+        The practical use is validation by eye. A patch built for one geometry
+        can be inspected on any screen, PROVIDED it is viewed at the distance
+        that reproduces that geometry — at the default, 79 cm on a 141 PPI
+        laptop or 119 cm on a 93 PPI desktop panel. Viewing closer is not a
+        stricter test of the same claim, it is a test of a different one.
+
+        This is a CONSISTENCY check, not a perceptual validation: see the note
+        on visibility_index() — no claim of imperceptibility should rest on
+        these numbers without a study with human subjects.
+        """
+        return ((2.54 / ppi)
+                / (2.0 * math.tan(math.radians(self.degrees_per_pixel) / 2.0)))
+
     def to_cycles_per_degree(self, f_cpp: torch.Tensor) -> torch.Tensor:
         """cycles/pixel -> cycles/degree."""
         return f_cpp / self.degrees_per_pixel
@@ -99,6 +187,14 @@ class ViewingGeometry:
         log(f"[csf ] geometry  : pixel {self.pixel_size_cm} cm at "
             f"{self.viewing_distance_cm} cm -> "
             f"{self.degrees_per_pixel:.5f} deg/px")
+        # EVERY visibility number below is conditional on the line above, so
+        # print what it means on real hardware. matched_distance_cm(1.0) is the
+        # constant k in d = k / PPI, because d scales as 1/ppi.
+        log(f"[csf ] equivalent: a {self.ppi:.0f} PPI display at "
+            f"{self.viewing_distance_cm:g} cm")
+        log(f"[csf ] verify by : viewing at {self.matched_distance_cm(1.0):.0f}"
+            f"/PPI cm — {self.matched_distance_cm(141):.0f} cm on a 141 PPI "
+            f"laptop, {self.matched_distance_cm(93):.0f} cm on a 93 PPI panel")
         log(f"[csf ] Nyquist   : {self.nyquist_cpd:.1f} cpd "
             f"(human cutoff is ~50-60 cpd, so the grid does not reach it)")
 
