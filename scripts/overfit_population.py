@@ -97,6 +97,16 @@ def build_parser():
 
     p.add_argument("--steps", type=int, default=300)
     p.add_argument("--lr", type=float, default=0.01)
+    # Same default as overfit.py, deliberately. optimise.py's header states the
+    # rule: anything that changes the attack changes BOTH callers or neither,
+    # or the population numbers stop matching the single-image numbers and
+    # nothing says why.
+    p.add_argument("--lr_schedule", default="cosine",
+                   choices=["none", "cosine"],
+                   help="Anneal lr to zero over each image's run. 'none' "
+                        "restores the flat-lr regime, which was measured "
+                        "swinging 9.6 mIoU points across four identical "
+                        "single-image runs.")
     p.add_argument("--log_every", type=int, default=50)
     p.add_argument("--exclude_footprint", action="store_true", default=True)
     p.add_argument("--verbose_images", action="store_true",
@@ -211,7 +221,7 @@ def main():
             loss_fn=a.loss_fn, target_class=a.target_class, steps=a.steps,
             lr=a.lr, num_classes=a.num_classes,
             exclude_footprint=a.exclude_footprint, log_every=a.log_every,
-            classes=a.classes,
+            lr_schedule=a.lr_schedule, classes=a.classes,
             clean_logits=clean_logits, out_dir=patch_dir / f"img{i:04d}",
             save_step_images=False, save_best=True,
             verbose=a.verbose_images)
