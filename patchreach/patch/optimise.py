@@ -101,6 +101,7 @@ def attack_image(model, img, label, patch, *,
                  num_classes: int = 19,
                  exclude_footprint: bool = True,
                  log_every: int = 20,
+                 lr_schedule: str = "none",
                  classes: str = "gt",
                  clean_logits: Optional[torch.Tensor] = None,
                  out_dir: Optional[Path] = None,
@@ -132,6 +133,28 @@ def attack_image(model, img, label, patch, *,
     the union figures too, so runs from before that fix stay comparable and any
     divergence stays visible rather than silent.
 
+    `lr_schedule` anneals the step size to zero across the run, and 'cosine'
+    is the answer to a MEASURED failure rather than a tidiness preference. Four
+    runs of one identical single-image config (segformer, csf, tau 0.25, lr 0.2,
+    400 steps, image 420) returned remote drops of 48.19, 44.02, 41.65 and
+    38.60 — mean 43.1, sd 4.1, range 9.6, with no code change between them.
+    Adam's update is on the order of `lr` per coordinate whatever the gradient
+    magnitude, so a FLAT lr is still taking full-size steps at step 400: the run
+    never settles, it wanders, and the reported number is wherever the walk
+    happened to be when the step counter ran out. The spread was not smooth
+    jitter either — any_flip_rate came out bimodal at 97-98% and 68-69% with
+    nothing in between, i.e. two basins, and float-level nondeterminism decided
+    which one each run found (the bilinear-upsample backward in upsample_to
+    accumulates with atomics and has no deterministic CUDA kernel, so even a
+    fixed seed does not repeat bitwise — two seed-42 reruns differed at step 1
+    in the sixth decimal). Annealing does not remove the basins; it stops the
+    tail of the run from hopping between them, so the endpoint is decided by the
+    basin rather than by the step counter.
+
+    The default is 'none' so that every number produced before this existed
+    keeps its meaning. Callers opt in, and the choice is recorded in the
+    returned record, so a run always states which regime it was.
+
     NOTE ON COMPARABILITY, inherited from overfit.py and still true: a
     single-image attack is a much EASIER problem than a universal patch trained
     across the dataset. Numbers from here belong beside per-image published
@@ -155,6 +178,13 @@ def attack_image(model, img, label, patch, *,
         loss_fn, target_class if loss_fn == "ipatch_cospgd" else 8)
     opt = torch.optim.Adam([patch.param], lr=lr, betas=(0.9, 0.999),
                            amsgrad=True)
+    if lr_schedule not in ("none", "cosine"):
+        raise ValueError(f"lr_schedule must be 'none' or 'cosine', "
+                         f"got {lr_schedule!r}")
+    sched = (torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=steps)
+             if lr_schedule == "cosine" else None)
+    if verbose and sched is not None:
+        log(f"[sched] cosine, lr {lr:g} -> 0 over {steps} steps")
 
     if out_dir is not None:
         out_dir = Path(out_dir)
@@ -182,6 +212,8 @@ def attack_image(model, img, label, patch, *,
 
         opt.step()
         patch.project()
+        if sched is not None:
+            sched.step()
 
         if step % log_every == 0 or step == 1:
             with torch.no_grad():
@@ -282,6 +314,7 @@ def attack_image(model, img, label, patch, *,
             "n_classes_adv_union": cmp_rem["n_classes_adv_union"],
             "class_set_moved": bool(cmp_rem["n_classes_clean_union"]
                                     != cmp_rem["n_classes_adv_union"]),
+            "lr_schedule": lr_schedule,
             **final_stats, **rates, "history": history}
 
 
