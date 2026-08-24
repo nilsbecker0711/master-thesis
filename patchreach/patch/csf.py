@@ -72,6 +72,15 @@ class ViewingGeometry:
     pixel_size_cm: float = 0.0114
     viewing_distance_cm: float = 50.0
 
+    # Peak white of the display, in cd/m^2. ONLY read by the luminance-aware
+    # path at the bottom of this module; the legacy mu = 0.5 convention never
+    # touches it, so adding this field changes no existing number. 100 cd/m^2
+    # is the sRGB reference white (IEC 61966-2-1) and the value CSFlow's
+    # geometry implies. It matters because Barten's sensitivity depends on
+    # RETINAL ILLUMINANCE, which needs an absolute luminance, and a relative
+    # luminance in [0,1] is not one.
+    display_peak_cd_m2: float = 100.0
+
     @property
     def degrees_per_pixel(self) -> float:
         return (2.0 * math.atan(self.pixel_size_cm
@@ -655,3 +664,211 @@ def report(H: int, W: int, geometry: ViewingGeometry = ViewingGeometry(),
     return {"geometry": asdict(geometry), "model": model,
             "threshold": threshold, "peak_csf": float(csf.max()),
             "nyquist_cpd": geometry.nyquist_cpd}
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+#  Luminance-aware budget  (ADDITIVE — nothing above this line reads it)
+# ═════════════════════════════════════════════════════════════════════════════
+#
+# WHY THIS SECTION EXISTS
+# -----------------------
+# Everything above assumes mu = 0.5 (CONTRAST_SCALE = 4.0) and a fixed retinal
+# illuminance (BartenParams.E = 500 Td). Both are wrong on Cityscapes and both
+# are wrong in the SAME direction: the frames are dark, so the real Michelson
+# denominator is smaller and the real retinal illuminance is lower.
+#
+# It is a SEPARATE, OPT-IN path rather than a correction in place, because the
+# tau ladder already run under the legacy convention has to keep its meaning.
+# A tau = 0.25 overfit result from csf_single.sh must still be a tau = 0.25
+# result after this file changes. Nothing above this banner calls anything
+# below it.
+#
+# TWO INDEPENDENT LUMINANCE EFFECTS, and they must not be conflated:
+#
+#   1. THE MICHELSON DENOMINATOR.  Contrast is A / Y_ref, so the amplitude that
+#      buys one unit of contrast is proportional to Y_ref. EXACTLY linear, and
+#      it is the large term.
+#   2. BARTEN'S SENSITIVITY.  CSF(f) itself shifts with retinal illuminance,
+#      via the pupil. Comparatively flat across the photopic range, and it
+#      moves in the COMPENSATING direction — a darker background is both a
+#      smaller denominator and a less sensitive observer.
+#
+# Reporting a single ratio hides that the two fight each other. Every function
+# here keeps them separable so the Step 0 table can decompose them.
+#
+# SOURCES: Barten (1999) Ch. 2 for the pupil formula; CSFlow (arXiv 2606.08833)
+# Appendix A for the CSF parameters and Appendix D for the cpp -> cpd
+# conversion. sRGB transfer function is IEC 61966-2-1.
+
+# Rec.709 / sRGB luminance weights, applied to LINEARISED channels. Applying
+# them to gamma-encoded RGB is the commonest way to get this wrong, and it is
+# what local_contrast_scale() above does — it means over encoded values.
+LUMA_WEIGHTS = (0.2126, 0.7152, 0.0722)
+
+# Floor on relative luminance. Y = 1e-3 at a 100 cd/m^2 peak is 0.1 cd/m^2,
+# already below the photopic range Barten's parameters are fitted for. Anything
+# darker gets reported, not silently modelled.
+LUMINANCE_FLOOR = 1e-3
+PHOTOPIC_FLOOR_CD_M2 = 1.0
+
+
+def srgb_to_linear(c: torch.Tensor) -> torch.Tensor:
+    """
+    sRGB code value in [0,1] -> linear relative luminance contribution.
+
+    IEC 61966-2-1. The linear segment below 0.04045 is not decoration: a naive
+    c**2.4 diverges from the standard by tens of percent in the darkest codes,
+    which is precisely the range Cityscapes asphalt occupies.
+    """
+    return torch.where(c <= 0.04045, c / 12.92,
+                       ((c.clamp(min=0.0) + 0.055) / 1.055) ** 2.4)
+
+
+def linear_to_srgb(y: torch.Tensor) -> torch.Tensor:
+    """Inverse of srgb_to_linear. Needed to express a budget back in code units."""
+    return torch.where(y <= 0.0031308, y * 12.92,
+                       1.055 * y.clamp(min=0.0) ** (1.0 / 2.4) - 0.055)
+
+
+def srgb_slope(c: torch.Tensor) -> torch.Tensor:
+    r"""
+    dY/dc at code value c — the local gain of the sRGB transfer function.
+
+    THE UNIT BRIDGE, and the reason it is needed: the optimiser perturbs SRGB
+    CODE VALUES, but contrast is defined on LINEAR LUMINANCE. A budget derived
+    in linear units is not a bound on the tensor the optimiser touches until it
+    is divided by this slope.
+
+    Valid only for small perturbations — it is a first-order approximation to a
+    nonlinear curve. At tau of order 1 the residual is far below one code step,
+    so the linearisation is comfortable; at a large tau it is not, and there
+    the realised-visibility measurement rather than the budget is the number to
+    trust.
+    """
+    return torch.where(c <= 0.04045,
+                       torch.full_like(c, 1.0 / 12.92),
+                       (2.4 / 1.055) * ((c.clamp(min=0.0) + 0.055) / 1.055) ** 1.4)
+
+
+def relative_luminance(rgb: torch.Tensor) -> torch.Tensor:
+    """
+    [...,3,H,W] of sRGB code values -> [...,H,W] linear relative luminance.
+
+    LINEARISE THEN WEIGHT, never the other way round. Averaging gamma-encoded
+    channels over-states the luminance of a dark region, which would make the
+    fixed-reference simplification look better than it is.
+    """
+    w = torch.tensor(LUMA_WEIGHTS, dtype=rgb.dtype, device=rgb.device)
+    lin = srgb_to_linear(rgb)
+    return (lin * w.view(*([1] * (rgb.dim() - 3)), 3, 1, 1)).sum(dim=-3)
+
+
+def pupil_diameter_mm(L_cd_m2: float) -> float:
+    """
+    Barten (1999) Eq 2.9, after Le Grand:  d = 5 - 3 tanh(0.4 log10 L).
+
+    Ranges from ~8 mm in near-darkness to ~2 mm in bright light. This is the
+    entire mechanism by which background luminance enters Barten's CSF, and it
+    is why the sensitivity term is flat: the pupil partly compensates.
+    """
+    return 5.0 - 3.0 * math.tanh(0.4 * math.log10(max(L_cd_m2, 1e-6)))
+
+
+def retinal_illuminance_td(L_cd_m2: float) -> float:
+    """Trolands: E = (pi d^2 / 4) * L, with d from pupil_diameter_mm."""
+    d = pupil_diameter_mm(L_cd_m2)
+    return math.pi * d * d / 4.0 * L_cd_m2
+
+
+def barten_params_at_luminance(
+        Y_ref: float,
+        geometry: "ViewingGeometry" = None,
+        base: BartenParams = BartenParams()):
+    """
+    (BartenParams with E set from Y_ref, absolute luminance in cd/m^2).
+
+    Y_ref is RELATIVE luminance in [0,1]; the display peak in `geometry` turns
+    it into the absolute value Barten's pupil formula needs. The absolute
+    luminance comes back too, because a run that quietly modelled 0.4 cd/m^2
+    with photopic parameters needs to say so in its log.
+    """
+    geometry = geometry if geometry is not None else ViewingGeometry()
+    L = max(float(Y_ref), LUMINANCE_FLOOR) * geometry.display_peak_cd_m2
+    return (BartenParams(**{**asdict(base), "E": retinal_illuminance_td(L)}), L)
+
+
+def contrast_scale_at_luminance(Y_ref: float) -> float:
+    r"""
+    2 / Y_ref — the luminance-aware replacement for CONTRAST_SCALE = 4.0.
+
+    Same derivation as the constant it replaces (a real cosine of peak
+    amplitude A on mean mu has Michelson contrast A/mu, and rfft2 with
+    norm="forward" reports A/2), with mu measured rather than assumed. At
+    Y_ref = 0.5 this returns exactly 4.0, so the legacy convention is the
+    special case and the two paths agree where they should.
+    """
+    return 2.0 / max(float(Y_ref), LUMINANCE_FLOOR)
+
+
+def csf_map_at_luminance(H: int, W: int, Y_ref: float,
+                         geometry: "ViewingGeometry" = None,
+                         model: str = "barten", device=None) -> torch.Tensor:
+    """
+    csf_map(), but with Barten's retinal illuminance set from Y_ref.
+
+    'sso' HAS NO LUMINANCE PARAMETER — Watson & Ramirez fit a single photopic
+    observer — so under model='sso' only the Michelson denominator responds to
+    Y_ref and this returns exactly what csf_map() returns. That is a limitation
+    of the model, not an oversight, and it makes 'sso' a useful control: it
+    isolates effect 1 from effect 2.
+    """
+    geometry = geometry if geometry is not None else ViewingGeometry()
+    if model not in CSF_MODELS:
+        raise ValueError(f"csf model must be one of {CSF_MODELS}, got {model!r}")
+    if model == "sso":
+        return csf_map(H, W, geometry, model, device)
+    fy, fx = rfft_frequency_grid(H, W, device)
+    params, _ = barten_params_at_luminance(Y_ref, geometry)
+    return barten_csf(geometry.to_cycles_per_degree((fy ** 2 + fx ** 2).sqrt()),
+                      params)
+
+
+def patch_budget_at_luminance(size: int, Y_ref: float,
+                              geometry: "ViewingGeometry" = None,
+                              model: str = "barten", threshold: float = 1.0,
+                              min_cycles: float = 2.0,
+                              max_amplitude: float = 0.25,
+                              units: str = "srgb",
+                              device=None):
+    r"""
+    (csf_values, budget) at background luminance Y_ref — the luminance-aware
+    twin of patch_budget().
+
+        B(f) = min( tau * Y_ref / (2 * CSF(f; Y_ref)) , A_max )     [linear]
+        B(f) = B_linear(f) / (dY/dc)|_{c(Y_ref)}                    [srgb]
+
+    units='srgb' is the DEFAULT because that is the space the optimiser works
+    in; units='linear' is exposed for reporting, where the physical quantity is
+    the meaningful one. Mixing them silently is the failure this argument
+    exists to prevent.
+
+    `min_cycles` carries over unchanged from patch_budget, and for the same
+    reason: below one cycle across the patch a component is a brightness
+    offset, not a grating, and the patch border turns any offset into a
+    broadband edge. Nothing about luminance changes that argument.
+    """
+    geometry = geometry if geometry is not None else ViewingGeometry()
+    if units not in ("srgb", "linear"):
+        raise ValueError(f"units must be srgb|linear, got {units!r}")
+    csf = csf_map_at_luminance(size, size, Y_ref, geometry, model, device)
+    budget = amplitude_budget(csf, threshold, max_amplitude,
+                              contrast_scale=contrast_scale_at_luminance(Y_ref))
+    if units == "srgb":
+        c_ref = linear_to_srgb(torch.tensor(float(Y_ref)))
+        budget = (budget / srgb_slope(c_ref).clamp(min=1e-6)
+                  ).clamp(max=max_amplitude)
+    if min_cycles > 0:
+        f_min = min_cycles / float(size)
+        budget = torch.where(radial_frequency_cpp(size, size, device) >= f_min,
+                             budget, torch.zeros_like(budget))
+    return csf, budget
