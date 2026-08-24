@@ -59,7 +59,26 @@ GEOM="--patch_mode universal_csf --patch_size 128 --patch_scale 0.25 --placement
 # Cityscapes decodes a 2048x1024 PNG per sample and then resizes it, and at
 # 4 workers that can cost more per batch than the segmentor step it feeds.
 # Nine runs is the wrong place to discover the loader was the bottleneck.
-OPT="--loss_fn cospgd --lr_schedule cosine --lr 0.05 --batch_size 4 --num_workers 16"
+# --lr 0.01, NOT the 0.2 that works for the single-image overfit. The two modes
+# optimise different objects. mode='csf' maps its parameter through a smooth,
+# SCALE-INVARIANT squash and then renormalises to exactly tau -- scaling that
+# parameter by 1000x moves the rendered patch by 7.5% -- so the parameter is
+# effectively a direction and lr sets how fast it rotates. Here the parameter IS
+# the residual, in pixel units (rms 0.027 at tau 0.25), and the constraint is a
+# projection, so lr sets movement inside a small ball and overshoot is thrown
+# away by the projection rather than absorbed.
+#
+# Measured mean relative change of the applied residual per step:
+#     lr      csf      universal_csf
+#     0.2     0.50     1.89   <- each step discards the previous residual
+#     0.05    0.084    1.09
+#     0.01    0.031    0.15
+#     0.001   0.0038   0.039
+#
+# and frac_at_bound after 200 steps: lr 0.2 -> 0.931 (pinned to the boundary,
+# phase-only), lr 0.01 -> 0.508 (healthy interior). WATCH frac_at_bound in the
+# logs: pinned above ~0.9 means lr is too large whatever this file says.
+OPT="--loss_fn cospgd --lr_schedule cosine --lr 0.01 --batch_size 4 --num_workers 16"
 
 # ── the tau ladder ───────────────────────────────────────────────────────────
 # 0.25 is the attack modes' default and the rung every existing overfit number
