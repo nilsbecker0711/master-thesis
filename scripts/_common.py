@@ -179,6 +179,14 @@ def add_csf_args(p):
                         "far. >0 switches to the calibrated budget, which is "
                         "~1.9x tighter at Nyquist — measured, not estimated. "
                         "0.097 is the Cityscapes train median at centre.")
+    g.add_argument("--csf_enforce", default="nominal",
+                   choices=["nominal", "realised"],
+                   help="what tau bounds. nominal: the residual we INTEND to "
+                        "add (every run to date). realised: the residual that "
+                        "SURVIVES compositing, i.e. what an observer sees -- "
+                        "clipping against real content was measured inflating "
+                        "it to 2.8x tau at 1000 steps. Use realised for any "
+                        "number quoted with a tau attached.")
     g.add_argument("--csf_composite", default="clip", choices=["clip", "fit"],
                    help="universal_csf only. clip: x+delta clamped to [0,1], "
                         "and frac_clipped reports where that bit. fit: "
@@ -328,6 +336,7 @@ def build_patch(a, device, mean_t, std_t, generator=None,
         lap_alpha=a.lap_alpha, lap_beta=a.lap_beta, lap_gamma=a.lap_gamma,
         lap_edge_thresh=a.lap_edge_thresh,
         lap_freeze_edges=a.lap_freeze_edges, init_from=a.init_from,
+        csf_enforce=getattr(a, "csf_enforce", "nominal"),
         csf_threshold=a.csf_threshold, csf_model=a.csf_model,
         csf_beta=a.csf_beta, csf_min_cycles=a.csf_min_cycles,
         csf_pixel_size_cm=a.csf_pixel_size_cm,
