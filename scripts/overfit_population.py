@@ -38,14 +38,26 @@ be needed for a given interval — see population.images_needed(). Quote the
 interval, not a bare mean, and record --sample_seed so the subset is
 reproducible.
 
-DIAGNOSTICS ARE NOT RUN PER IMAGE
----------------------------------
-The suite costs a Grad-CAM, an ERF probe and a dozen figures. Over hundreds of
-images that dominates the run and produces figures nobody opens. Only
---n_panels images get it, chosen by --panel_select, and the default is
-`spread` (best + median + worst) rather than `best`: the population summary
-reports a distribution, and a panel figure showing only the strongest attacks
-contradicts it in exactly the way a reviewer will notice.
+DIAGNOSTICS COME IN TWO KINDS AND ONLY ONE IS PER IMAGE
+-------------------------------------------------------
+AGGREGATED, over every image in the population, into <out_dir>/aggregate/.
+Everything that is pure post-processing on the clean and adversarial logits —
+the confusion flows, the reach curve, the ring profiles, contestability, the
+pooled per-class IoU, the realised CSF visibility, the convergence band — costs
+a few [H,W] reductions per image and is therefore run on all of them. Those
+figures are what a mechanism claim should be quoted from. See
+patchreach/diagnostics/aggregate.py. --no_aggregate turns it off.
+
+PER IMAGE, into <out_dir>/diagnostics/imgNNNN/, for --n_panels images only.
+The panel suite additionally costs an ERF probe (n_probes forward passes, and a
+MODEL property that does not vary by image) and a dozen figures, which over
+hundreds of images dominates the run and produces figures nobody opens.
+--panel_select decides which images those are; the default is `spread`
+(best + median + worst) rather than `best`, because a panel figure showing only
+the strongest attacks contradicts the distribution the summary reports. With
+the aggregate suite on, `best` becomes defensible — the panels then illustrate
+a claim the pooled figures carry, rather than being the evidence for it — but
+that is a decision to make deliberately, so the default does not change.
 
 RESUMABLE. Every image's record and the pooled confusion matrices are
 checkpointed as the run proceeds, so a job killed at the walltime continues
@@ -66,7 +78,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from _common import (add_model_args, add_patch_args, setup_model, build_patch,
                      image_indices)
 from patchreach.data.cityscapes import CityscapesSeg, norm_tensors, upsample_to
-from patchreach.diagnostics import report
+from patchreach.diagnostics import aggregate, report
 from patchreach.metrics import population as pop_mod
 from patchreach.patch import optimise, segmentation_cam
 from patchreach.patch.spec import Patch
@@ -121,6 +133,12 @@ def build_parser():
                    help="which images those are. 'spread' = best + median + "
                         "worst; 'best' is what you want to look at and what a "
                         "reviewer will call cherry-picking.")
+    p.add_argument("--no_aggregate", dest="aggregate", action="store_false",
+                   default=True,
+                   help="skip the pooled diagnostic suite. It costs a few "
+                        "tensor reductions per image against a full "
+                        "optimisation, so the only reason to is a rerun of an "
+                        "existing directory whose aggregate state is gone.")
     p.add_argument("--classes", default="gt", choices=["gt", "union"],
                    help="which classes enter the mIoU mean. 'gt' counts a "
                         "class iff it has ground truth, so clean and attacked "
@@ -169,13 +187,33 @@ def main():
     patch_dir = out_dir / "patches"
     patch_dir.mkdir(exist_ok=True)
     state_path = out_dir / "population_state.pt"
+    agg_path = out_dir / "aggregate_state.pt"
 
     target = a.target_class if a.loss_fn == "ipatch_cospgd" else None
     pop = pop_mod.Population(a.num_classes, device=device, target_class=target)
+    # Its own checkpoint, not a field on Population — see the note in
+    # aggregate.PopulationDiagnostics. That also means a run resumed into a
+    # directory written before this existed has pooled metrics for every image
+    # and pooled DIAGNOSTICS for none, which is a silent half-measurement if
+    # nobody says so.
+    diag = aggregate.PopulationDiagnostics(a.num_classes) if a.aggregate else None
 
     if a.resume and state_path.exists():
         pop.load_state_dict(torch.load(state_path, map_location="cpu"))
         print(f"[resume] {len(pop.records)} images already done in {out_dir}")
+        if diag is not None:
+            if agg_path.exists():
+                diag.load_state_dict(torch.load(agg_path, map_location="cpu"))
+                print(f"[resume] aggregate diagnostics carry "
+                      f"{diag.n_images} of them")
+            elif pop.records:
+                print(f"  [!] no aggregate_state.pt beside "
+                      f"{len(pop.records)} finished images. The pooled "
+                      f"diagnostics will cover")
+                print(f"      ONLY the images this invocation attacks, while "
+                      f"summary.json covers all of them.")
+                print(f"      Delete the directory and rerun, or pass "
+                      f"--no_aggregate and accept the gap.")
     todo = [i for i in idxs if i not in pop.done_images]
 
     with open(out_dir / "config.json", "w") as f:
@@ -231,11 +269,18 @@ def main():
             patched, fp = patch.apply(img)
             adv_logits = upsample_to(model(patched), label.shape[-2:])
         pop.update(clean_logits, adv_logits, label, fp, rec)
+        # BEFORE the record is written out: records.jsonl and summary.json both
+        # strip `history`, and the convergence band is built from it.
+        if diag is not None:
+            diag.update(clean_logits, adv_logits, label, fp, rec)
 
         # Checkpoint after EVERY image: the pooled confusion matrices are not
         # recoverable from the per-image records, so losing them to a walltime
-        # kill would cost the whole run rather than the current image.
+        # kill would cost the whole run rather than the current image. The same
+        # is true of every tensor in the aggregate suite.
         torch.save(pop.state_dict(), state_path)
+        if diag is not None:
+            torch.save(diag.state_dict(), agg_path)
         with open(out_dir / "records.jsonl", "a") as f:
             f.write(json.dumps({k: v for k, v in rec.items()
                                 if k != "history"}) + "\n")
@@ -267,6 +312,46 @@ def main():
                               key=a.select_key,
                               title=f"{a.arch} — {a.patch_mode} / {a.loss_fn}",
                               highlight=[r["image"] for r in panels])
+
+    # ── the pooled suite, over every image ───────────────────────────────────
+    # Written BEFORE the panels, because the panels are the expensive part and
+    # the aggregate is the part the claims are quoted from. If a walltime kill
+    # lands between the two, the run still produced its evidence.
+    agg = None
+    if diag is not None and diag.n_images:
+        agg_dir = out_dir / "aggregate"
+        agg_dir.mkdir(parents=True, exist_ok=True)
+        lines = []
+
+        def alog(s=""):
+            print(s)
+            lines.append(str(s))
+
+        title = (f"{a.arch} — {a.patch_mode} / {a.loss_fn}"
+                 + (f" / tau {a.csf_threshold:g}"
+                    if "csf" in a.patch_mode else "")
+                 + f" / {a.placement}")
+        agg = diag.summarise(
+            tau=a.csf_threshold if "csf" in a.patch_mode else None,
+            records=pop.records, log=alog)
+        agg["per_class_iou_pooled"] = aggregate.pooled_per_class_iou(
+            pop.clean_rem, pop.adv_rem, agg_dir / "per_class_iou.png",
+            target_class=target, title=f"pooled over {diag.n_images} images, "
+                                       f"remote px", log=alog)
+        figs = diag.write_figures(
+            agg_dir, tau=a.csf_threshold if "csf" in a.patch_mode else None,
+            records=pop.records, title=title)
+        if diag.n_images != len(pop.records):
+            alog(f"\n  [!] the aggregate covers {diag.n_images} images but "
+                 f"summary.json covers {len(pop.records)} — a resume without "
+                 f"aggregate_state.pt. Do not quote the two side by side.")
+        (agg_dir / "aggregate.txt").write_text("\n".join(lines),
+                                               encoding="utf-8")
+        with open(agg_dir / "aggregate.json", "w") as f:
+            json.dump(agg, f, indent=2)
+        print(f"\n  aggregate -> {agg_dir}/")
+        for nme in ["per_class_iou.png"] + figs:
+            print(f"    {nme}")
 
     if panels:
         print(f"\n  diagnostics for {len(panels)} images "
@@ -308,6 +393,12 @@ def main():
     with open(out_dir / "summary.json", "w") as f:
         json.dump({"config": {**vars(a), "images": idxs},
                    "summary": summary,
+                   # A POINTER, not a copy. aggregate.json is the file that
+                   # holds the pooled diagnostics; duplicating a few hundred
+                   # numbers here is how the two would come to disagree.
+                   "aggregate": ({"n_images": agg["n_images"],
+                                  "file": "aggregate/aggregate.json"}
+                                 if agg else None),
                    "panels": [r["image"] for r in panels],
                    "records": [{k: v for k, v in r.items() if k != "history"}
                                for r in pop.records]}, f, indent=2)
