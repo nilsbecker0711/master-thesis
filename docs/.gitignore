@@ -7,3 +7,6 @@
 *.out
 *.toc
 csf_patch_procedure.bib
+frequency_optimised_findings.bib
+*.fdb_latexmk
+*.fls
