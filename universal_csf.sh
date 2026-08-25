@@ -78,7 +78,17 @@ GEOM="--patch_mode universal_csf --patch_size 128 --patch_scale 0.25 --placement
 # and frac_at_bound after 200 steps: lr 0.2 -> 0.931 (pinned to the boundary,
 # phase-only), lr 0.01 -> 0.508 (healthy interior). WATCH frac_at_bound in the
 # logs: pinned above ~0.9 means lr is too large whatever this file says.
-OPT="--loss_fn cospgd --lr_schedule cosine --lr 0.01 --batch_size 4 --num_workers 16"
+# LR IS NOT SET HERE. It scales with tau -- see lr_for() below -- because the
+# parameter IS the residual and the residual is exactly linear in tau.
+OPT="--loss_fn cospgd --lr_schedule cosine --batch_size 4 --num_workers 16"
+
+# LR_AT_QUARTER is the learning rate AT TAU = 0.25, and it is the ONE number the
+# lr probe has to establish; every other rung follows from it. Measured per-step
+# relative movement at a FIXED lr 0.01: 0.302 at tau 0.25, 0.085 at 1.0, 0.022
+# at 4.0, 0.011 at 8.0 -- a factor of 27 across the ladder. Scaling holds it at
+# ~0.33 and frac_at_bound at ~0.20 throughout.
+LR_AT_QUARTER=0.01
+lr_for () { awk -v base="$LR_AT_QUARTER" -v tau="$1" 'BEGIN{print base*tau/0.25}'; }
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  TAU AND VISIBILITY — read this before quoting any rung
