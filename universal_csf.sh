@@ -80,57 +80,79 @@ GEOM="--patch_mode universal_csf --patch_size 128 --patch_scale 0.25 --placement
 # logs: pinned above ~0.9 means lr is too large whatever this file says.
 OPT="--loss_fn cospgd --lr_schedule cosine --lr 0.01 --batch_size 4 --num_workers 16"
 
-# ── the tau ladder ───────────────────────────────────────────────────────────
-# 0.25 is the attack modes' default and the rung every existing overfit number
-# is quoted at, so it is the one that makes the control comparable. The rungs
-# above it exist to find where the attack STARTS working: a null result at 0.25
-# is only interpretable next to a non-null result somewhere.
+# ══════════════════════════════════════════════════════════════════════════════
+#  TAU AND VISIBILITY — read this before quoting any rung
+# ══════════════════════════════════════════════════════════════════════════════
+# tau = 1 is the detection threshold of Barten's average observer under the
+# assumed geometry. A perturbation at tau <= 1 is at or below threshold; above
+# it, the claim of invisibility is simply gone.
 #
-# 20 epochs per rung, not 100. 2975 images x 20 epochs is ~15k optimiser steps
-# for 49k constrained parameters, which is ample to converge a residual that is
-# pinned to its envelope from step 0 -- and five rungs at 100 epochs would not
-# fit in any queue window. Re-run the winning rung longer.
-for TAU in 0.25 0.5 1.0 2.0 4.0; do
-  echo "===================== tau = $TAU ====================="
-  python scripts/train.py $BASE $GEOM $OPT \
-      --csf_threshold "$TAU" --epochs 20 --val_every 5 --val_images 100 \
+# BUT THE ENFORCED TAU IS NOMINAL, AND NOMINAL UNDER-STATES. The budget is
+# enforced with the legacy mu = 0.5 convention while Cityscapes footprints sit
+# near Y = 0.10, so the realised visibility is ~1.7x the nominal number:
+#
+#     full val split   Y 0.1029   1.69x   -> realised 1.0 at nominal tau 0.592
+#     train centre     Y 0.0971   1.70x   -> realised 1.0 at nominal tau 0.589
+#
+# SO THE INVISIBILITY CEILING IS NOMINAL TAU ~= 0.59, NOT 1.0. Every rung above
+# that is a DIAGNOSTIC, not a result, and must never be quoted as an attack that
+# preserves imperceptibility. They exist only to separate "the premise fails"
+# from "the plumbing is broken": a null at 0.25 means nothing until a non-null
+# exists somewhere above it.
+#
+# Run --csf_lref to enforce the calibrated budget instead, and the nominal and
+# realised numbers converge -- at the cost of no longer being comparable with
+# the overfit ladder, which is why it is a control rather than the default.
+
+# ── the ladder that carries the result: BELOW threshold ──────────────────────
+# 0.05 0.1 0.25 0.5 are EXACTLY the rungs csf_single.sh ran for the per-image
+# overfit, deliberately, so control and method are compared at identical tau
+# rather than at whatever each happened to use. All four realise below 1.0
+# (0.5 nominal -> ~0.85 realised), so the whole ladder stays sub-threshold.
+for TAU in 0.05 0.1 0.25 0.5; do
+  LR=$(lr_for "$TAU")
+  echo "========== tau = $TAU  (lr $LR)  BELOW THRESHOLD =========="
+  python scripts/train.py $BASE $GEOM $OPT --lr "$LR" \
+      --csf_threshold "$TAU" --epochs 20 --val_every 5 --val_images 500 \
       --tag sweep
 done
 
-# ── the sanity rung ──────────────────────────────────────────────────────────
-# A tau large enough to be plainly visible. If THIS produces no attack effect
-# the plumbing is broken, not the premise, and no null result below it means
-# anything. Run it first if you are debugging.
-python scripts/train.py $BASE $GEOM $OPT \
-    --csf_threshold 8.0 --epochs 20 --val_every 5 --val_images 100 \
-    --tag sanity
+# ── diagnostic rungs: ABOVE threshold, not results ───────────────────────────
+# Where does the attack start working at all? If nothing moves anywhere on this
+# ladder either, the failure is mechanical rather than perceptual.
+for TAU in 1.0 2.0 8.0; do
+  LR=$(lr_for "$TAU")
+  echo "========== tau = $TAU  (lr $LR)  ABOVE THRESHOLD — DIAGNOSTIC =========="
+  python scripts/train.py $BASE $GEOM $OPT --lr "$LR" \
+      --csf_threshold "$TAU" --epochs 20 --val_every 5 --val_images 500 \
+      --tag diagnostic
+done
 
 # ── the calibrated-budget control ────────────────────────────────────────────
 # --csf_lref 0.0971 is the measured Cityscapes train median linear luminance at
-# centre placement. It switches the budget from the legacy mu=0.5 convention to
-# the calibrated one, which is ~1.9x tighter at Nyquist. Run at the same nominal
-# tau as the default rung: the difference between the two IS the calibration
-# error, expressed as attack strength rather than as a ratio.
-python scripts/train.py $BASE $GEOM $OPT \
+# centre placement, switching the budget from the legacy mu=0.5 convention to
+# the calibrated one (~1.7x tighter). At the same nominal tau the difference IS
+# the calibration error, expressed as attack strength rather than as a ratio.
+python scripts/train.py $BASE $GEOM $OPT --lr "$(lr_for 0.25)" \
     --csf_threshold 0.25 --csf_lref 0.0971 --epochs 20 --val_every 5 \
-    --val_images 100 --tag calibrated
+    --val_images 500 --tag calibrated
 
 # ── the composite control ────────────────────────────────────────────────────
 # clip is the default and the honest threat model, but it truncates the residual
-# where content has no headroom, which violates tau in the permissive direction
-# and is reported as frac_clipped. fit rescales instead, preserving the spectrum
-# at the cost of a PER-IMAGE scale -- an adaptation a universal patch should not
-# have. If the two agree, clipping is not distorting the result and clip can be
-# quoted without a caveat. If they disagree, the gap is the caveat.
-python scripts/train.py $BASE $GEOM $OPT \
-    --csf_threshold 1.0 --csf_composite fit --epochs 20 --val_every 5 \
-    --val_images 100 --tag fitcomposite
+# where content has no headroom, violating tau permissively -- reported as
+# frac_clipped, which hit 0.098 on the darkest val frame. fit rescales instead,
+# preserving the spectrum at the cost of a PER-IMAGE scale, an adaptation a
+# universal patch should not have. Agreement means clip can be quoted without a
+# caveat; disagreement IS the caveat.
+python scripts/train.py $BASE $GEOM $OPT --lr "$(lr_for 0.5)" \
+    --csf_threshold 0.5 --csf_composite fit --epochs 20 --val_every 5 \
+    --val_images 500 --tag fitcomposite
 
 # ── the schedule control ─────────────────────────────────────────────────────
 # One rung without annealing, so the claim that cosine matters here is measured
 # on THIS mode rather than inherited from the single-image result.
-python scripts/train.py $BASE $GEOM $OPT --lr_schedule plateau \
-    --csf_threshold 1.0 --epochs 20 --val_every 5 --val_images 100 \
+python scripts/train.py $BASE $GEOM $OPT --lr "$(lr_for 0.5)" --lr_schedule plateau \
+    --csf_threshold 0.5 --epochs 20 --val_every 5 --val_images 500 \
     --tag plateau
 
 echo "Done: $(date)"
