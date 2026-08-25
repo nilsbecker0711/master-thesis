@@ -57,7 +57,8 @@ from torchvision.utils import save_image
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from _common import add_model_args, setup_model, image_indices
+from _common import (add_model_args, setup_model, image_indices,
+                     tsallis_kwargs)
 from patchreach.data.cityscapes import (CityscapesSeg, class_name,
                                         norm_tensors, upsample_to)
 from patchreach.diagnostics import conditional as cviz
@@ -174,13 +175,23 @@ def main():
 
     adv_loss = adversarial.build(
         loss_fn, target_class if loss_fn == "ipatch_cospgd" else 8)
+    # tsallis q comes from the TRAINING config, not from this CLI. There is
+    # no optimisation here -- the objective only feeds the sensitivity map --
+    # so the right q is the one the generator was trained under. Overriding
+    # it would be a transfer measurement and would have to be declared as
+    # one, the way placement and reference overrides are above.
+    tsl = tsallis_kwargs(tcfg)
+    if loss_fn == "tsallis":
+        adv_loss = adversarial.build(loss_fn, 8, **tsl)
+        print(f"[loss ] {adv_loss!r}  (from the training config)")
     tgt = target_class if loss_fn == "ipatch_cospgd" else None
 
     cam_loss_name = loss_fn if cam_objective == "attack" else cam_objective
     cam = segmentation_cam.build(
         model, cam_loss_name, target_class, layer=cam_layer, module=cam_module,
         target=cam_target,
-        attack_loss=adv_loss if cam_objective == "attack" else None)
+        attack_loss=adv_loss if cam_objective == "attack" else None,
+        tsallis=tsl)
     print(f"[cam ] S_seg = -L_{cam_loss_name} vs {cam_target} labels, "
           f"d/d {cam_module}[{cam_layer}]")
 

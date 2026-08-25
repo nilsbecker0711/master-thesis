@@ -76,7 +76,7 @@ import torch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from _common import (add_model_args, add_patch_args, setup_model, build_patch,
-                     image_indices)
+                     image_indices, tsallis_kwargs, tsallis_tag)
 from patchreach.data.cityscapes import CityscapesSeg, norm_tensors, upsample_to
 from patchreach.diagnostics import aggregate, report
 from patchreach.metrics import population as pop_mod
@@ -90,7 +90,7 @@ def build_parser():
         description="Optimise one patch per image over a population of "
                     "images and report the distribution")))
     p.add_argument("--loss_fn", default="cospgd",
-                   choices=["ce", "cospgd", "ipatch_cospgd"])
+                   choices=["ce", "cospgd", "ipatch_cospgd", "tsallis"])
     p.add_argument("--target_class", type=int, default=8)
     p.add_argument("--from_image", action="store_true",
                    help="initialise the patch base with the region it covers "
@@ -181,7 +181,8 @@ def main():
         out_dir = Path(a.out_dir)
     else:
         tag = "_".join(x for x in [a.arch, a.patch_mode, a.loss_fn,
-                                   f"n{len(idxs)}", a.tag] if x)
+                                   f"n{len(idxs)}", tsallis_tag(a),
+                                   a.tag] if x)
         out_dir = Path(increment_path(Path(a.out_root) / tag))
     out_dir.mkdir(parents=True, exist_ok=True)
     patch_dir = out_dir / "patches"
@@ -234,7 +235,8 @@ def main():
     if a.placement == "gradcam":
         cam = segmentation_cam.build(
             model, a.loss_fn if a.cam_objective == "attack" else a.cam_objective,
-            a.target_class, a.cam_layer, a.cam_module, a.cam_target)
+            a.target_class, a.cam_layer, a.cam_module, a.cam_target,
+            tsallis=tsallis_kwargs(a, a.steps))
         print(f"[cam ] objective  : {a.cam_objective}  target: {a.cam_target}  "
               f"layer {a.cam_layer} of {a.cam_module}")
         print(f"[cam ] margin     : {a.placement_margin}px keep-out from the "

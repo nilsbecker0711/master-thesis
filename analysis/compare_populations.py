@@ -74,6 +74,14 @@ def load(run_dir: Path):
     return label, d.get("records", []), d, cfg
 
 
+def _q_label(cfg) -> str:
+    """The Tsallis arm's q, as it is actually configured."""
+    if cfg.get("tsallis_schedule", "const") == "const":
+        return f"{cfg.get('tsallis_q', 0.0):g}"
+    return (f"{cfg.get('tsallis_q_start', -2.0):g}"
+            f"->{cfg.get('tsallis_q_end', 1.0):g}")
+
+
 def describe_arm(label, cfg, log=print):
     """Print the knobs that define an arm, so a mismatched pair is visible."""
     log(f"  {label:<28s} "
@@ -81,6 +89,7 @@ def describe_arm(label, cfg, log=print):
         f"loss={cfg.get('loss_fn')} placement={cfg.get('placement')}"
         + (f"(margin {cfg.get('placement_margin')})"
            if cfg.get('placement') == 'gradcam' else "")
+        + (f" q={_q_label(cfg)}" if cfg.get('loss_fn') == 'tsallis' else "")
         + f" tau={cfg.get('csf_threshold')} n={len(cfg.get('images', []))} "
           f"seed={cfg.get('sample_seed')}")
 
@@ -90,8 +99,13 @@ def warn_if_multiple_axes_differ(cfg_a, cfg_b, la, lb, log=print):
     A paired difference attributes an effect to whatever changed. If two things
     changed, it attributes it to both, and the number is uninterpretable.
     """
+    # tsallis_* included: a q sweep varies ONE axis, and without these keys
+    # a pair that differs in q AND in something else passes the check
+    # silently — the exact failure this function exists to catch.
     axes = ["arch", "patch_mode", "loss_fn", "placement", "csf_threshold",
-            "patch_scale", "patch_size", "steps", "lr", "target_class"]
+            "patch_scale", "patch_size", "steps", "lr", "target_class",
+            "tsallis_q", "tsallis_schedule", "tsallis_q_start",
+            "tsallis_q_end"]
     diff = [k for k in axes if cfg_a.get(k) != cfg_b.get(k)]
     if len(diff) > 1:
         log(f"\n  WARNING: {la} and {lb} differ on MORE THAN ONE axis: "

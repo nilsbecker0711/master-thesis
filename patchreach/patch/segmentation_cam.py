@@ -253,7 +253,7 @@ class SegmentationCAM:
 
 def build(model, loss_fn: str, target_class: int = 8, layer: int = -1,
           module: str = "backbone", target: str = "pred",
-          attack_loss=None) -> SegmentationCAM:
+          attack_loss=None, tsallis=None) -> SegmentationCAM:
     """
     Convenience constructor.
 
@@ -261,9 +261,18 @@ def build(model, loss_fn: str, target_class: int = 8, layer: int = -1,
     optimises (ablation F: "different segmentation targets for the sensitivity
     map"). Otherwise one is built from `loss_fn` via losses.adversarial.build,
     so the CAM and the attack share one implementation.
+
+    `tsallis` is the keyword dict from _common.tsallis_kwargs(), forwarded to
+    that build. Only read when loss_fn == 'tsallis' AND no attack_loss was
+    handed in. NOTE what the map then is: the CAM runs ONCE, before the loop,
+    so a scheduled q contributes its value at step 0 (q_start under 'linear').
+    That is the honest reading — the sensitivity map is a pre-optimisation
+    artefact and cannot depend on progress that has not happened yet — but it
+    means the map and a late-run attack step are not scored at the same q.
     """
     if attack_loss is None:
         from ..losses import adversarial
-        attack_loss = adversarial.build(loss_fn, target_class)
+        attack_loss = adversarial.build(loss_fn, target_class,
+                                        **(tsallis or {}))
     return SegmentationCAM(model, attack_loss, layer=layer, module=module,
                            target=target)

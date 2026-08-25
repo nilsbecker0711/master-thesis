@@ -115,7 +115,87 @@ def add_patch_args(p):
     p.add_argument("--init_from", default=None)
     add_cam_args(p)
     add_csf_args(p)
+    add_tsallis_args(p)
     return p
+
+
+def add_tsallis_args(p):
+    """
+    Tsallis attack objective (--loss_fn tsallis). Guarded like add_csf_args
+    and add_cam_args so a parser that ever takes two of these groups does not
+    raise on duplicate option strings.
+    """
+    if any(a.option_strings and "--tsallis_q" in a.option_strings
+           for a in p._actions):
+        return p
+    g = p.add_argument_group("Tsallis attack objective (--loss_fn tsallis)")
+    g.add_argument("--tsallis_q", type=float, default=0.0,
+                   help="q for --tsallis_schedule const. q -> 1 IS plain CE; "
+                        "q <= 1 is required. The gradient weight is p^(1-q), "
+                        "peaking at p* = (1-q)/(2-q), so q=0 targets pixels "
+                        "at p_y~0.5 and q=-3 targets p_y~0.8 — i.e. more "
+                        "negative aims the attack at CONFIDENT pixels. "
+                        "IGNORED when the schedule is linear.")
+    g.add_argument("--tsallis_schedule", default="const",
+                   choices=["const", "linear"],
+                   help="const: q fixed at --tsallis_q. linear: q sweeps "
+                        "--tsallis_q_start -> --tsallis_q_end across the run, "
+                        "t = step/(total_steps-1). DEFAULT const, so the "
+                        "paper's validation-selected -2 -> 1 sweep is an "
+                        "explicit choice rather than an inherited one.")
+    g.add_argument("--tsallis_q_start", type=float, default=-2.0,
+                   help="q at t=0 for --tsallis_schedule linear. IGNORED "
+                        "under const.")
+    g.add_argument("--tsallis_q_end", type=float, default=1.0,
+                   help="q at t=1 for --tsallis_schedule linear. 1.0 lands on "
+                        "the CE limit, which is the paper's setting. IGNORED "
+                        "under const.")
+    return p
+
+
+def tsallis_tag(a) -> str:
+    """
+    Run-directory slug for the active q, or '' for every other loss_fn.
+
+    Without it a q sweep writes every arm under the SAME name and
+    increment_path silently disambiguates with _2, _3, _4. The data survives;
+    nothing in the path says which q produced it, and a sweep is exactly the
+    situation where that is the only thing you need to know.
+
+    One definition, used by all four entry points that name a run.
+    """
+    if getattr(a, "loss_fn", None) != "tsallis":
+        return ""
+    if getattr(a, "tsallis_schedule", "const") == "const":
+        return f"q{getattr(a, 'tsallis_q', 0.0):g}"
+    return (f"q{getattr(a, 'tsallis_q_start', -2.0):g}"
+            f"to{getattr(a, 'tsallis_q_end', 1.0):g}")
+
+
+def tsallis_kwargs(src, total_steps: int = 1) -> dict:
+    """
+    argparse namespace (or a saved config dict) -> the tsallis_* keywords
+    adversarial.build() and segmentation_cam.build() take.
+
+    ONE mapping, for the same reason add_patch_args exists: four entry points
+    now construct an attack objective, and a q field that reaches train.py but
+    not overfit.py is precisely the drift that put three bugs into this
+    repository before the argument parsers were centralised.
+
+    `total_steps` is the schedule's horizon and differs per entry point — the
+    step count for a single-image attack, epochs x batches for a universal one.
+    It is only a fallback: on_step_begin() re-supplies it every step.
+
+    Reads with defaults because export_conditional_patches.py resolves against
+    a TRAINING CONFIG that may predate these flags entirely.
+    """
+    get = (src.get if isinstance(src, dict)
+           else lambda k, d: getattr(src, k, d))
+    return {"tsallis_q": get("tsallis_q", 0.0),
+            "tsallis_schedule": get("tsallis_schedule", "const"),
+            "tsallis_q_start": get("tsallis_q_start", -2.0),
+            "tsallis_q_end": get("tsallis_q_end", 1.0),
+            "tsallis_total_steps": total_steps}
 
 
 def add_cam_args(p):
@@ -137,7 +217,8 @@ def add_cam_args(p):
         return p
     g = p.add_argument_group("sensitivity map (Grad-CAM)")
     g.add_argument("--cam_objective", default="attack",
-                   choices=["attack", "ce", "cospgd", "ipatch_cospgd"],
+                   choices=["attack", "ce", "cospgd", "ipatch_cospgd",
+                            "tsallis"],
                    help="ABLATION F. Scalar S_seg differentiated for the CAM. "
                         "'attack' reuses --loss_fn so the map and the attack "
                         "share one objective. S_seg = -L, because every loss "
@@ -245,6 +326,11 @@ def add_generator_args(p):
     # ── sensitivity map ──────────────────────────────────────────────────────
     add_cam_args(p)
 
+    # ── attack objective (--loss_fn tsallis) ─────────────────────────────────
+    # The generator is a different threat model but the SAME attack losses, so
+    # it takes the same objective flags rather than a second copy of them.
+    add_tsallis_args(p)
+
     # ── placement ────────────────────────────────────────────────────────────
     g.add_argument("--gen_placement", default="gradcam",
                    choices=["center", "gradcam", "semantic", "fixed"],
@@ -343,6 +429,10 @@ def build_patch(a, device, mean_t, std_t, generator=None,
         csf_viewing_distance_cm=a.csf_viewing_distance_cm,
         csf_display_peak_cd_m2=getattr(a, "csf_display_peak_cd_m2", 100.0),
         csf_lref=getattr(a, "csf_lref", 0.0),
-        csf_composite=getattr(a, "csf_composite", "clip"))
+        csf_composite=getattr(a, "csf_composite", "clip"),
+        tsallis_q=getattr(a, "tsallis_q", 0.0),
+        tsallis_schedule=getattr(a, "tsallis_schedule", "const"),
+        tsallis_q_start=getattr(a, "tsallis_q_start", -2.0),
+        tsallis_q_end=getattr(a, "tsallis_q_end", 1.0))
     return Patch(cfg, device, mean_t, std_t, generator=generator,
                  init_reference=init_reference)

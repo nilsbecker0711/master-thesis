@@ -60,7 +60,7 @@ from tqdm import tqdm
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from _common import (add_model_args, add_generator_args, build_generator_config,
-                     setup_model)
+                     setup_model, tsallis_kwargs, tsallis_tag)
 from patchreach.data.cityscapes import CityscapesSeg, norm_tensors, upsample_to
 from patchreach.diagnostics import conditional as cviz, report
 from patchreach.losses import adversarial
@@ -91,7 +91,8 @@ def build_parser():
     add_model_args(p)
     add_generator_args(p)
 
-    p.add_argument("--loss_fn", choices=["ce", "cospgd", "ipatch_cospgd"],
+    p.add_argument("--loss_fn",
+                   choices=["ce", "cospgd", "ipatch_cospgd", "tsallis"],
                    default="cospgd")
     p.add_argument("--target_class", type=int, default=8)
 
@@ -153,6 +154,8 @@ def run_id(a) -> str:
             f"res-{a.gen_residual}"]
     if a.loss_fn == "ipatch_cospgd":
         bits.append(f"cls{a.target_class}")
+    if tsallis_tag(a):
+        bits.append(tsallis_tag(a))
     if a.gen_lap_alpha or a.gen_lap_beta or a.gen_lap_gamma:
         bits.append(f"lap-a{a.gen_lap_alpha:g}")
     if a.gen_reference != "center":
@@ -427,13 +430,23 @@ def main():
     # ── the attack objective, shared by training, the CAM and evaluation ─────
     adv_loss = adversarial.build(
         a.loss_fn, a.target_class if a.loss_fn == "ipatch_cospgd" else 8)
+    # theta is shared across the dataset, so the q schedule spans the whole
+    # run: epochs x batches, not epochs. Rebound BEFORE the CAM is built so
+    # --cam_objective attack really does share the training objective rather
+    # than a default-constructed copy of it.
+    total_steps = a.epochs * max(len(train_loader), 1)
+    if a.loss_fn == "tsallis":
+        adv_loss = adversarial.build(a.loss_fn, 8,
+                                     **tsallis_kwargs(a, total_steps))
+        print(f"[loss ] {adv_loss!r}")
     tgt = a.target_class if a.loss_fn == "ipatch_cospgd" else None
 
     cam_objective = a.loss_fn if a.cam_objective == "attack" else a.cam_objective
     cam = segmentation_cam.build(
         model, cam_objective, a.target_class, layer=a.cam_layer,
         module=a.cam_module, target=a.cam_target,
-        attack_loss=adv_loss if a.cam_objective == "attack" else None)
+        attack_loss=adv_loss if a.cam_objective == "attack" else None,
+        tsallis=tsallis_kwargs(a))
     print(f"[cam ] S_seg = -L_{cam_objective} vs {a.cam_target} labels, "
           f"d/d {a.cam_module}[{a.cam_layer}]")
     if a.cam_target == "gt":
@@ -498,12 +511,18 @@ def main():
 
     # ── training ────────────────────────────────────────────────────────────
     history, best, checked, t0 = [], -1e9, False, time.time()
+    gstep = 0
     generator.train()
 
     for epoch in range(1, a.epochs + 1):
         running_att = running_lap = 0.0
         for imgs, labels in tqdm(train_loader,
                                  desc=f"epoch {epoch}/{a.epochs}"):
+            # GLOBAL step: theta is one shared parameter set optimised across
+            # the whole run, so q sweeps the run, not each epoch.
+            if hasattr(adv_loss, "on_step_begin"):
+                adv_loss.on_step_begin(gstep, total_steps)
+            gstep += 1
             imgs, labels = imgs.to(device), labels.to(device)
             opt.zero_grad()
 
@@ -562,6 +581,9 @@ def main():
         sched.step(running_att)
         print(f"[epoch {epoch:3d}] {a.loss_fn}={running_att:.5f}  "
               f"lap={running_lap:.5f}  lr={opt.param_groups[0]['lr']:.2e}")
+        if a.loss_fn == "tsallis":
+            print(f"           q={adv_loss.q:+.4f}  "
+                  f"(step {gstep:,}/{total_steps:,})")
 
         if epoch % a.val_every == 0 or epoch == 1:
             ev = evaluate(attack, val_loader, device, a.num_classes, adv_loss,
@@ -640,6 +662,9 @@ def main():
         "wall_clock_s": time.time() - t0,
         "history": history,
     }
+    # tsallis ONLY — the schema for every other loss_fn is unchanged.
+    if a.loss_fn == "tsallis":
+        results["tsallis_q"] = adv_loss.q
     if panel_idx:
         render_panels(attack, val_full, panel_idx, device,
                       out_dir / "panels" / "final", mean_t, std_t,

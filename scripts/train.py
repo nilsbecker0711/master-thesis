@@ -31,7 +31,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 # Model and patch arguments come from _common so they exist in exactly ONE
 # place. train.py previously redeclared all of them, and three separate bugs
 # came from updating one copy and not the other.
-from _common import add_model_args, add_patch_args, setup_model, build_patch
+from _common import (add_model_args, add_patch_args, setup_model,
+                     build_patch, tsallis_kwargs, tsallis_tag)
 from patchreach.data.cityscapes import CityscapesSeg, norm_tensors, upsample_to
 from patchreach.diagnostics import report
 from patchreach.losses import adversarial, reach as reach_mod
@@ -55,7 +56,8 @@ def build_parser():
     add_patch_args(p)          # patch_mode, size, scale, logit_clip, shape*,
                                # placement*, reference*, lap_*, init_from
 
-    p.add_argument("--loss_fn", choices=["ce", "cospgd", "ipatch_cospgd"],
+    p.add_argument("--loss_fn",
+                   choices=["ce", "cospgd", "ipatch_cospgd", "tsallis"],
                    default="cospgd")
     p.add_argument("--target_class", type=int, default=8)
 
@@ -126,6 +128,8 @@ def run_id(a) -> str:
     bits = [a.arch, a.patch_mode, a.loss_fn, f"{a.img_h}x{a.img_w}"]
     if a.loss_fn == "ipatch_cospgd":
         bits.append(f"cls{a.target_class}")
+    if tsallis_tag(a):
+        bits.append(tsallis_tag(a))
     if a.patch_mode == "lap":
         bits.append(f"a{a.lap_alpha:g}")
     if a.patch_mode in ("csf", "universal_csf"):
@@ -318,10 +322,29 @@ def main():
         print("[sched] none — flat lr. The run will not settle; see "
               "--lr_schedule.")
 
+    # tsallis carries a q schedule that build()'s two-argument form cannot
+    # express. Rebound HERE rather than above because the schedule's horizon is
+    # total_steps, which does not exist until the loader is sized — and the
+    # horizon is the WHOLE RUN, epochs x batches, exactly like the cosine
+    # T_max above. Only this branch is touched; every other loss_fn keeps the
+    # object built earlier.
+    if args.loss_fn == "tsallis":
+        adv_loss = adversarial.build(args.loss_fn, 8,
+                                     **tsallis_kwargs(args, total_steps))
+        print(f"[loss ] {adv_loss!r}")
+
     history, best, checked, t0 = [], -1e9, False, time.time()
+    gstep = 0
     for epoch in range(1, args.epochs + 1):
         running = 0.0
         for imgs, labels in tqdm(train_loader, desc=f"epoch {epoch}/{args.epochs}"):
+            # GLOBAL step, deliberately not per-epoch: a universal patch is one
+            # tensor optimised across the whole run, so its q schedule spans the
+            # run. Resetting per epoch would sawtooth q and make every epoch a
+            # different attack.
+            if hasattr(adv_loss, "on_step_begin"):
+                adv_loss.on_step_begin(gstep, total_steps)
+            gstep += 1
             imgs, labels = imgs.to(device), labels.to(device)
             opt.zero_grad()
 
@@ -366,6 +389,9 @@ def main():
             sched.step(running)
         st = " ".join(f"{k}={v:.4f}" for k, v in patch.stats().items())
         print(f"[epoch {epoch:3d}] {args.loss_fn}={running:.5f}  {st}")
+        if args.loss_fn == "tsallis":
+            print(f"           q={adv_loss.q:+.4f}  "
+                  f"(step {gstep:,}/{total_steps:,})")
         save_image(patch.render().cpu(),
                    out_dir / "patches" / f"epoch{epoch:04d}.png")
 
@@ -423,6 +449,10 @@ def main():
                "wall_clock_s": time.time() - t0, "history": history}
     if universal_report is not None:
         results["universal_csf"] = universal_report
+    # tsallis ONLY, so the results schema for every other loss_fn is unchanged
+    # and analysis/build_index.py keeps producing the same columns.
+    if args.loss_fn == "tsallis":
+        results["tsallis_q"] = adv_loss.q
     if patch.cfg.mode == "lap":
         results["rationality"] = rationality_report(patch.render(),
                                                     patch.reference)
