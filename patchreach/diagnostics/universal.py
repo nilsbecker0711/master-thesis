@@ -145,7 +145,14 @@ def realised_tau(patch, loader, device, mean_t, std_t, max_images: int = 0
             "footprint_luminance_Y": distribution(lums),
             "frac_clipped": distribution(clipped),
             "calibration_factor_median": (float(taus.median()) / nominal
-                                          if nominal > 0 else None)}
+                                          if nominal > 0 else None),
+            # THE RAW VALUES, not just the summary. plot() drew an empty axis
+            # for one commit because it had only the quantiles to work with and
+            # nothing to histogram -- an axis labelled "images" with no images
+            # in it. They are also what lets anyone re-plot or re-test the
+            # distribution later without re-running the attack.
+            "per_image_tau_calibrated": taus.tolist(),
+            "per_image_Y": lums.tolist()}
 
 
 @torch.no_grad()
@@ -172,28 +179,55 @@ def spectral_allocation(patch, n_bins: int = 32) -> dict:
     live = bud > 0
     ratio = torch.zeros_like(amp)
     ratio[live] = amp[live] / bud[live]
+    r = ratio[live]
+    spread = float(r.max() - r.min())
+    # A FLAT RATIO HAS NO PEAK, and argmax of a constant returns bin 0 -- which
+    # reads as "the optimiser chose the lowest frequency" when in fact it chose
+    # nothing. That happens whenever the run is pinned to the bound everywhere
+    # (lr far too high, or the frozen-spectrum bug), and it is the single most
+    # misleading thing this figure could say. Report the degeneracy instead.
+    degenerate = spread < 0.02
     return {"f_cyc_per_px": f.tolist(),
             "residual_amplitude": amp.tolist(),
             "budget_amplitude": bud.tolist(),
             "spend_ratio": ratio.tolist(),
             "live_bins": int(live.sum()),
-            "peak_spend_f": float(f[int(ratio.argmax())]),
-            "mean_spend_ratio": float(ratio[live].mean())}
+            "peak_spend_f": (None if degenerate
+                             else float(f[int(ratio.argmax())])),
+            "mean_spend_ratio": float(r.mean()),
+            "spend_ratio_min": float(r.min()),
+            "spend_ratio_max": float(r.max()),
+            "spend_ratio_spread": spread,
+            "degenerate": degenerate}
 
 
 def plot(report: dict, alloc: dict, path, title: str = ""):
-    """Two panels: the realised-tau distribution, and spectral allocation."""
+    """
+    Three panels: the realised-tau DISTRIBUTION, amplitude, and the spend ratio.
+
+    The ratio gets its own axis because on a log amplitude plot the residual
+    and the budget lie on top of each other whenever the bound is active, which
+    is most of the time -- two curves that coincide look like one curve and
+    hide the only quantity worth reading.
+    """
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
-    fig, ax = plt.subplots(1, 2, figsize=(12, 4.2))
-
+    fig, ax = plt.subplots(1, 3, figsize=(16, 4.2))
     d = report["tau_calibrated"]
+
+    # ── realised tau ─────────────────────────────────────────────────────────
+    vals = report.get("per_image_tau_calibrated")
+    if vals:
+        ax[0].hist(vals, bins=min(30, max(8, len(vals) // 4)),
+                   color="#3b6ea5", alpha=0.85)
     ax[0].axvline(report["tau_nominal_legacy"], color="#c44", ls="--", lw=1.5,
                   label=f"nominal (legacy) {report['tau_nominal_legacy']:.3f}")
-    for k, c in (("p5", "#888"), ("median", "#222"), ("p95", "#888")):
-        ax[0].axvline(d[k], color=c, ls=":", lw=1.2)
+    ax[0].axvline(d["median"], color="#222", ls="-", lw=1.4,
+                  label=f"realised median {d['median']:.3f}")
+    for k in ("p5", "p95"):
+        ax[0].axvline(d[k], color="#888", ls=":", lw=1.2)
     ax[0].set_xlabel("realised tau on each val image (calibrated)")
     ax[0].set_ylabel("images")
     ax[0].set_title(f"n={d['n']}  median {d['median']:.3f}  "
@@ -201,14 +235,32 @@ def plot(report: dict, alloc: dict, path, title: str = ""):
     ax[0].legend(fontsize=8)
 
     f = alloc["f_cyc_per_px"]
-    ax[1].semilogy(f, alloc["budget_amplitude"], color="#888",
-                   label="budget (allowed)")
-    ax[1].semilogy(f, alloc["residual_amplitude"], color="#3b6ea5",
+    ax[1].semilogy(f, alloc["budget_amplitude"], color="#888", lw=3,
+                   alpha=0.55, label="budget (allowed)")
+    ax[1].semilogy(f, alloc["residual_amplitude"], color="#3b6ea5", lw=1.4,
                    label="residual (spent)")
     ax[1].set_xlabel("radial frequency (cycles/pixel)")
     ax[1].set_ylabel("mean |rfft| amplitude")
-    ax[1].set_title(f"spend/allowed peaks at {alloc['peak_spend_f']:.3f} cyc/px")
+    ax[1].set_title("amplitude — these coincide when the bound is active")
     ax[1].legend(fontsize=8)
+
+    # ── the deliverable ──────────────────────────────────────────────────────
+    ax[2].plot(f, alloc["spend_ratio"], color="#a5713b")
+    ax[2].axhline(1.0, color="#888", ls="--", lw=1)
+    ax[2].set_ylim(0, 1.1)
+    ax[2].set_xlabel("radial frequency (cycles/pixel)")
+    ax[2].set_ylabel("spent / allowed")
+    if alloc.get("degenerate"):
+        ax[2].set_title(f"FLAT (spread {alloc['spend_ratio_spread']:.3f}) — "
+                        f"pinned to the bound, no allocation was chosen")
+        msg = "no spectral preference expressed" + chr(10) +               "check frac_at_bound and lr"
+        ax[2].text(0.5, 0.45, msg,
+                   ha="center", va="center", transform=ax[2].transAxes,
+                   fontsize=9, color="#c44")
+    else:
+        ax[2].set_title(f"peak spend at {alloc['peak_spend_f']:.3f} cyc/px  "
+                        f"(range {alloc['spend_ratio_min']:.2f}-"
+                        f"{alloc['spend_ratio_max']:.2f})")
 
     if title:
         fig.suptitle(title)
@@ -243,6 +295,22 @@ def log_report(report: dict, alloc: dict, log=print):
             "THERE, and tau is violated")
         log("        in the permissive direction. Compare against "
             "--csf_composite fit before quoting tau.")
-    log(f"[univ] spectral spend  : peak at {alloc['peak_spend_f']:.3f} cyc/px, "
-        f"mean ratio {alloc['mean_spend_ratio']:.3f} over "
-        f"{alloc['live_bins']} live bins")
+    if alloc.get("degenerate"):
+        log(f"[univ] spectral spend  : FLAT at {alloc['mean_spend_ratio']:.3f} "
+            f"across all {alloc['live_bins']} live bins "
+            f"(spread {alloc['spend_ratio_spread']:.4f})")
+        log("[univ] WARNING        : the residual is pinned to its bound at "
+            "every frequency, so NO spectral")
+        log("        allocation was chosen and the peak is undefined. Either "
+            "the learning rate is far")
+        log("        too large -- check frac_at_bound in the epoch logs, "
+            "pinned above ~0.9 means yes --")
+        log("        or the attack genuinely wants the maximum everywhere. "
+            "Lower lr and re-run before")
+        log("        reading anything into the spectrum.")
+    else:
+        log(f"[univ] spectral spend  : peak at {alloc['peak_spend_f']:.3f} "
+            f"cyc/px, mean ratio {alloc['mean_spend_ratio']:.3f} "
+            f"(range {alloc['spend_ratio_min']:.2f}-"
+            f"{alloc['spend_ratio_max']:.2f}) over "
+            f"{alloc['live_bins']} live bins")
