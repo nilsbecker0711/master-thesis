@@ -176,6 +176,19 @@ def attack_image(model, img, label, patch, *,
 
     objective = adversarial.build(
         loss_fn, target_class if loss_fn == "ipatch_cospgd" else 8)
+    # tsallis needs its q schedule, which the two-argument build() cannot
+    # carry. Rebound ONLY on this branch and read off patch.cfg, so no other
+    # loss_fn and no existing call site of attack_image() is touched.
+    if loss_fn == "tsallis":
+        objective = adversarial.build(
+            loss_fn, 8,
+            tsallis_q=patch.cfg.tsallis_q,
+            tsallis_schedule=patch.cfg.tsallis_schedule,
+            tsallis_q_start=patch.cfg.tsallis_q_start,
+            tsallis_q_end=patch.cfg.tsallis_q_end,
+            tsallis_total_steps=steps)
+        if verbose:
+            log(f"[loss ] {objective!r}")
     opt = torch.optim.Adam([patch.param], lr=lr, betas=(0.9, 0.999),
                            amsgrad=True)
     if lr_schedule not in ("none", "cosine"):
@@ -193,6 +206,10 @@ def attack_image(model, img, label, patch, *,
     history, best_drop = [], -1e9
     la = None
     for step in range(1, steps + 1):
+        # `step` is 1-BASED here, so step-1 is the 0-based progress counter the
+        # schedule is defined on (t = 0 at the first step, 1 at the last).
+        if hasattr(objective, "on_step_begin"):
+            objective.on_step_begin(step - 1, steps)
         opt.zero_grad()
         patched, fp = patch.apply(img)
         logits = upsample_to(model(patched), hw)
@@ -315,6 +332,9 @@ def attack_image(model, img, label, patch, *,
             "class_set_moved": bool(cmp_rem["n_classes_clean_union"]
                                     != cmp_rem["n_classes_adv_union"]),
             "lr_schedule": lr_schedule,
+            # tsallis ONLY, so the record schema for every other loss_fn is
+            # byte-for-byte what it was and downstream parsers do not move.
+            **({"tsallis_q": objective.q} if loss_fn == "tsallis" else {}),
             **final_stats, **rates, "history": history}
 
 

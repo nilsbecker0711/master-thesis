@@ -6,8 +6,12 @@ Adversarial objectives.
                 (Agnihotri et al., ICML 2024)
   ipatch_cospgd TARGETED, drives every scored pixel toward target_class
                 (IPatch objective + targeted CosPGD weighting)
+  tsallis       untargeted, -L_q(p_y), maximised — CE carrying a per-pixel
+                gradient weight p^(1-q), with q optionally scheduled across
+                the run. Defined in tsallis.py because it is stateful; build()
+                below dispatches it. (Matyasko et al., IJCNN 2026)
 
-All three take an optional `support` mask restricting which pixels are scored.
+All four take an optional `support` mask restricting which pixels are scored.
 That is where patch-footprint exclusion and reach-restriction compose: the
 caller intersects them and passes one mask, rather than each loss knowing about
 both.
@@ -133,13 +137,25 @@ def ipatch_cospgd_loss(logits, target_class: int,
     return _reduce(weight * ce, valid)
 
 
-def build(loss_fn: str, target_class: int = 8):
+def build(loss_fn: str, target_class: int = 8,
+          tsallis_q: float = 0.0, tsallis_schedule: str = "const",
+          tsallis_q_start: float = -2.0, tsallis_q_end: float = 1.0,
+          tsallis_total_steps: int = 1):
     """
     Returns f(logits, labels, footprint, support) -> scalar.
 
     ipatch ALWAYS receives the footprint regardless of the exclusion flag —
     camouflage prevention is not optional for a targeted objective.
+
+    The tsallis_* arguments are read by the 'tsallis' branch ONLY. They carry
+    defaults so every existing two-argument call site is unchanged, and no
+    other branch reads them.
     """
+    if loss_fn == "tsallis":
+        from .tsallis import TsallisCELoss
+        return TsallisCELoss(q=tsallis_q, schedule=tsallis_schedule,
+                             q_start=tsallis_q_start, q_end=tsallis_q_end,
+                             total_steps=tsallis_total_steps)
     if loss_fn == "ipatch_cospgd":
         return lambda lg, lb, fp, sp: ipatch_cospgd_loss(lg, target_class,
                                                          fp, sp)

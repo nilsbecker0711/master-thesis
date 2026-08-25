@@ -38,7 +38,8 @@ from pathlib import Path
 import torch
 from torchvision.utils import save_image
 
-from _common import (add_model_args, add_patch_args, setup_model, build_patch)
+from _common import (add_model_args, add_patch_args, setup_model,
+                     build_patch, tsallis_kwargs, tsallis_tag)
 from patchreach.data.cityscapes import CityscapesSeg, norm_tensors, upsample_to
 from patchreach.diagnostics import report
 from patchreach.patch import optimise, segmentation_cam
@@ -88,7 +89,8 @@ def run_one(a, seed: int, model, img, label, device, mean_t, std_t, G,
     if a.placement == "gradcam":
         cam = segmentation_cam.build(
             model, a.loss_fn if a.cam_objective == "attack" else a.cam_objective,
-            a.target_class, a.cam_layer, a.cam_module, a.cam_target)
+            a.target_class, a.cam_layer, a.cam_module, a.cam_target,
+            tsallis=tsallis_kwargs(a, a.steps))
     clean_logits = optimise.prepare(model, img, patch, a.img_h, a.img_w,
                                     a.from_image, mean_t, std_t,
                                     cam=cam, label=label, log=print)
@@ -206,7 +208,7 @@ def summarise(rows, out_dir: Path) -> dict:
 def main():
     p = add_patch_args(add_model_args(argparse.ArgumentParser()))
     p.add_argument("--loss_fn", default="cospgd",
-                   choices=["ce", "cospgd", "ipatch_cospgd"])
+                   choices=["ce", "cospgd", "ipatch_cospgd", "tsallis"])
     p.add_argument("--from_image", action="store_true",
                     help="Initialise the patch with the image region it will replace.")
     p.add_argument("--target_class", type=int, default=8)
@@ -257,7 +259,8 @@ def main():
             q.requires_grad_(False)
 
     tag = "_".join(x for x in [a.arch, a.patch_mode, a.loss_fn,
-                               f"img{a.image}", a.tag] if x)
+                               f"img{a.image}", tsallis_tag(a),
+                               a.tag] if x)
     out_dir = Path(increment_path(Path(a.out_root) / tag))
     out_dir.mkdir(parents=True, exist_ok=True)
 

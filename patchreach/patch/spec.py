@@ -120,6 +120,20 @@ class PatchConfig:
     #            correction -- but 'realised' is the honest one to quote.
     csf_enforce: str = "nominal"   # nominal | realised
 
+    # ── Tsallis attack objective (--loss_fn tsallis) ─────────────────────────
+    # These describe the LOSS, not the patch, and they live here for one
+    # reason: attack_image() receives the Patch and nothing else that carries
+    # run configuration, so this is the only channel that reaches it without
+    # changing a call site in every script. They also then land in the
+    # checkpoint alongside the parameter they produced, which is the provenance
+    # a q-schedule ablation needs. Every other patch_mode ignores them.
+    # q_start/q_end are inert under schedule='const'; q is inert under
+    # 'linear'.
+    tsallis_q: float = 0.0
+    tsallis_schedule: str = "const"       # const | linear
+    tsallis_q_start: float = -2.0
+    tsallis_q_end: float = 1.0
+
     init_from: Optional[str] = None       # checkpoint to seed from (LAP stage 2)
 
     def validate(self):
@@ -146,6 +160,13 @@ class PatchConfig:
         if self.shape != "square" and not self.reference:
             raise ValueError(f"shape={self.shape!r} needs `reference` — the "
                              "silhouette is derived from it")
+        # Tsallis is defined for q <= 1 only. Checked HERE, at config time,
+        # rather than at the first backward pass. Imported locally so spec.py
+        # keeps no import-time dependency on the losses package, and so there
+        # is exactly ONE implementation of the rule.
+        from ..losses.tsallis import validate_q
+        validate_q(self.tsallis_q, self.tsallis_schedule,
+                   self.tsallis_q_start, self.tsallis_q_end)
         return self
 
 
