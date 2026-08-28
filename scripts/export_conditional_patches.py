@@ -57,8 +57,8 @@ from torchvision.utils import save_image
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from _common import (add_model_args, setup_model, image_indices,
-                     tsallis_kwargs)
+from _common import (add_model_args, add_image_args, setup_model,
+                     resolve_images, tsallis_kwargs)
 from patchreach.data.cityscapes import (CityscapesSeg, class_name,
                                         norm_tensors, upsample_to)
 from patchreach.diagnostics import conditional as cviz
@@ -81,8 +81,7 @@ def build_parser():
                    help="generator = baseline C (proposed). "
                         "reference = baseline A (p_i = r_i).")
     p.add_argument("--split", default="val", choices=["val", "train", "test"])
-    p.add_argument("--images", default="fixed10",
-                   help="'fixed10' | 'all' | '2 5 45'")
+    add_image_args(p, default_images="fixed10")
 
     p.add_argument("--loss_fn", default=None,
                    help="defaults to the value stored in the checkpoint")
@@ -209,7 +208,8 @@ def main():
               f"trained on — report this as a transfer measurement.")
 
     ds = CityscapesSeg(a.cityscapes_root, a.split, a.img_h, a.img_w)
-    idxs = image_indices(a.images, len(ds))
+    idxs = resolve_images(a.images, len(ds), a.n_images, a.sample_seed,
+                          a.exclude_image)
     print(f"[data] {a.split} split, {len(idxs)} image(s) "
           f"@ {a.img_h}x{a.img_w}, patch {cg.patch_side(a.img_h, scale)}px")
 

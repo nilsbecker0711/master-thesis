@@ -573,13 +573,20 @@ def plot_paired(a_records: Sequence[Dict], b_records: Sequence[Dict], out_path,
 def plot_distribution(records: Sequence[Dict], out_path,
                       key: str = "drop_remote",
                       title: str = "Per-image attack strength",
-                      highlight: Sequence[int] = ()):
+                      highlight: Sequence[int] = (),
+                      subtitle: str = "one patch optimised per image"):
     """
     Histogram + per-image strip. Standalone, own title and legend.
 
     The strip matters as much as the histogram: it shows the individual images,
     which is what makes the spread legible when n is small enough that the
     histogram is mostly empty bins.
+
+    `subtitle` states WHAT the n images are, and it is not decoration: the same
+    figure is produced by overfit_population.py (n patches, one per image) and
+    by evaluate.py (ONE patch, applied to n images). Those are different
+    claims, and a figure that does not say which one it is showing invites the
+    stronger reading.
     """
     import matplotlib
     matplotlib.use("Agg")
@@ -605,7 +612,7 @@ def plot_distribution(records: Sequence[Dict], out_path,
     ax.axvline(d["median"], color="#55a868", lw=1.6, ls="--",
                label=f"median {d['median']:+.2f}")
     ax.set_ylabel("images")
-    ax.set_title(f"{title}\nn = {d['n']} images, one patch optimised per image")
+    ax.set_title(f"{title}\nn = {d['n']} images, {subtitle}")
     ax.legend(fontsize=8)
 
     ids = [r.get("image") for r in records if r.get(key) is not None]
