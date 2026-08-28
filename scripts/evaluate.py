@@ -3,7 +3,13 @@ r"""
 Evaluate a trained patch on a fixed image set. NO TRAINING.
 
     python scripts/evaluate.py --checkpoint results/runs/<id>/best.pt \
-        --arch segformer_b0 --cityscapes_root $CS --img_h 512 --img_w 1024
+        --arch segformer_b0 --cityscapes_root $CS --img_h 512 --img_w 1024 \
+        --from_image
+
+--from_image IS REQUIRED FOR mode='csf' and the script refuses without it. The
+checkpoint stores the parameter and the placement; the BASE is the image region
+the patch covers and is rebuilt per image, so evaluating without it silently
+substitutes flat grey for scene content.
 
 RESOLUTION TRANSFER: pass an --img_h/--img_w different from training. Nothing
 in the patch is tied to resolution — the checkpoint stores the parameter, and
@@ -47,6 +53,13 @@ def main():
     p.add_argument("--diagnostics_on", type=int, default=0,
                    help="run the full diagnostic suite on this image index "
                         "(-1 to skip)")
+    p.add_argument("--from_image", action="store_true",
+                   help="rebuild the base from the image being evaluated, as "
+                        "overfit.py --from_image did during training. REQUIRED "
+                        "for mode='csf': the checkpoint stores the parameter "
+                        "and the placement, never the base, so without this "
+                        "the base falls back to flat grey and the patch is a "
+                        "visible square with an invisible texture.")
 
     p.add_argument("--out_root", default="results/eval")
     p.add_argument("--tag", default="")
@@ -70,6 +83,24 @@ def main():
             G.set_classes(259)
         G.eval().to(device)
     patch = Patch.load(a.checkpoint, device, mean_t, std_t, generator=G)
+
+    # REFUSE RATHER THAN RENDER A GREY SQUARE. Patch.load restores `param` and
+    # `placement`; `reference` is NOT in the checkpoint, and `from_image` is a
+    # script flag rather than a PatchConfig field, so it cannot round-trip.
+    # A csf patch rendered with reference=None takes the 0.5 grey fallback in
+    # Patch.render() — the failure --patch_mode's own help text warns about —
+    # and every number below would silently describe a different patch.
+    if pcfg.get("mode") == "csf" and not a.from_image:
+        raise SystemExit(
+            "\nThis checkpoint is mode='csf'. Its base is the image region the\n"
+            "patch covers, and that base is NOT stored in the checkpoint — only\n"
+            "the parameter and the placement are. Re-run with --from_image so\n"
+            "the base is rebuilt from each evaluated image, exactly as\n"
+            "overfit.py --from_image did during training.\n\n"
+            "Without it the base is flat grey, the patch becomes a visible\n"
+            "square with an invisible texture, and drop_remote describes that\n"
+            "square rather than the residual under test.\n")
+
     loss_fn = a.loss_fn or "cospgd"
     tgt = a.target_class
 
@@ -97,6 +128,12 @@ def main():
             # placement is resolved per image; semantic placement depends on
             # scene content, so a fixed offset would be wrong here
             patch.resolve_placement(a.img_h, a.img_w, lc.argmax(1)[0])
+            # AFTER resolve_placement, never before: set_reference_from_image
+            # copies the region at the RESOLVED placement, so the order here
+            # matches optimise.prepare() and semantic/gradcam placement stays
+            # consistent between training and evaluation.
+            if a.from_image:
+                patch.set_reference_from_image(img, mean_t, std_t)
             patched, fp = patch.apply(img)
             la = upsample_to(model(patched), hw)
 
