@@ -36,10 +36,10 @@ from patchreach.utils import get_device, seed_everything
 def main():
     p = add_model_args(argparse.ArgumentParser())
     p.add_argument("--n_images", type=int, default=20)
-    p.add_argument("--out", default="results/clean_baselines.json")
-    p.add_argument("--tag", type=str, default="")
+    p.add_argument("--out", default=f"results/clean_baselines")
+    p.add_argument("--tag", type=str, default=None)
     a = p.parse_args()
-
+    a.out= f'{a.out}_{a.tag}.json' if a.tag else a.out
     seed_everything(a.seed)
     device = get_device()
     model, n_ch, n_act, spec = setup_model(a)
