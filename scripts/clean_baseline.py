@@ -37,6 +37,7 @@ def main():
     p = add_model_args(argparse.ArgumentParser())
     p.add_argument("--n_images", type=int, default=20)
     p.add_argument("--out", default="results/clean_baselines.json")
+    p.add_argument("--tag", type=str, default="")
     a = p.parse_args()
 
     seed_everything(a.seed)
@@ -81,7 +82,7 @@ def main():
            "per_class_iou": {class_name(c): (None if torch.isnan(iou[c])
                                              else float(iou[c]))
                              for c in range(min(a.num_classes, 19))}}
-    out = Path(a.out)
+    out = Path(f"{a.out}_{a.tag}" if a.tag else a.out)
     out.parent.mkdir(parents=True, exist_ok=True)
     all_rec = json.loads(out.read_text()) if out.exists() else []
     all_rec.append(rec)
