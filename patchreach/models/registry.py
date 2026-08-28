@@ -125,6 +125,9 @@ REGISTRY["segformer"] = REGISTRY["segformer_b0"]
 #REGISTRY["swin"] = REGISTRY["swin_t"]
 REGISTRY["unet"] = REGISTRY["unet_s5d16"]
 #REGISTRY["ocrnet"] = REGISTRY["ocrnet_hr48"]
+# No "ocrnet" alias: OCRNet was dropped from the lineup and its ArchSpec went
+# with it. The alias outlived the entry and raised KeyError at IMPORT time,
+# which took every script down with it — REGISTRY is imported by _common.
 REGISTRY["deeplab"] = REGISTRY["deeplabv3plus_r101"]
 
 
