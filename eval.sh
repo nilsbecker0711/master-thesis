@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH -p accelerated   # Use the dev_gpu_4_a100 partition with A100 GPUs dev_gpu_4
+#SBATCH -p dev_gpu_a100_il   # Use the dev_gpu_4_a100 partition with A100 GPUs dev_gpu_4
 #SBATCH -n 1                   # Number of tasks (1 for single node)
 #SBATCH -t 00:05:00            # Time limit (10 minutes for debugging purposes)
 #SBATCH --mem=400000        # Memory request (adjust as needed)
@@ -39,5 +39,5 @@ CS="/hkfs/work/workspace/scratch/ma_nilbecke-thesis/data/cityscapes"
 #python scripts/evaluate.py --checkpoint ${CHECKPOINT} \
  #       --arch segformer --cityscapes_root ${CS} --img_h 512 --img_w 1024
 
-python scripts/evaluate.py --checkpoint "/hkfs/work/workspace/scratch/ma_nilbecke-thesis/patch-reach/results/runs/segformer_lap_cospgd_512x1024_a0_smoke_s42/best.pt" \
+python scripts/evaluate.py --checkpoint "/pfs/work9/workspace/scratch/ma_nilbecke-thesis/master-thesis/results/runs/segformer_universal_csf_cospgd_512x1024_tau0.25_lr-cosine_lrprobe0.01_s42/best.pt" \
         --arch segformer --cityscapes_root "/pfs/work9/workspace/scratch/ma_nilbecke-thesis/data/cityscapes" --img_h 512 --img_w 1024

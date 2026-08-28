@@ -1,7 +1,7 @@
 #!/bin/bash
-#SBATCH -p gpu_a100_short
+#SBATCH -p dev_gpu_a100_il
 #SBATCH -n 1
-#SBATCH -t 00:20:00
+#SBATCH -t 00:30:00
 #SBATCH --mem=40000
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=16
@@ -64,6 +64,6 @@ python scripts/measure_frequency_sensitivity.py \
 # ── the bracket comparison ───────────────────────────────────────────────────
 # Label-free and dataset-independent, exactly like measure_erf.py, so this runs
 # on whatever weights the registry resolves — ADE20K included.
-python scripts/measure_frequency_sensitivity.py \
-    --arch internimage --cityscapes_root "$CS" $RES \
-    --target "$TAU" --n_images 5 --region patch
+#python scripts/measure_frequency_sensitivity.py \
+#    --arch internimage --cityscapes_root "$CS" $RES \
+#    --target "$TAU" --n_images 5 --region patch

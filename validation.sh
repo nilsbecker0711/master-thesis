@@ -1,7 +1,7 @@
 #!/bin/bash
-#SBATCH -p accelerated
+#SBATCH -p gpu_a100_il
 #SBATCH -n 1
-#SBATCH -t 20:00:00
+#SBATCH -t 08:00:00
 #SBATCH --mem=100000
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=16
@@ -64,8 +64,8 @@ python --version
 # Start at 100. summary.json reports images_needed_pm2 against the spread it
 # ACTUALLY observed, so raise N only if that number says to — and if it does,
 # resume rather than restart (see the bottom of this file).
-export N=100
-export SEED=0
+export N=500
+export SEED=68
 
 # ── the config under test. DO NOT edit these three without a reason ──────────
 # --csf_threshold 0.25   the rung every existing overfit number is quoted at.

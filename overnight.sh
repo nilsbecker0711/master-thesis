@@ -1,8 +1,8 @@
 #!/bin/bash
-#SBATCH -p accelerated
+#SBATCH -p gpu_a100_il
 #SBATCH -n 1
-#SBATCH -t 12:00:00
-#SBATCH --mem=100000
+#SBATCH -t 24:00:00
+#SBATCH --mem=400000
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=16
 #SBATCH --ntasks-per-node=1
@@ -11,7 +11,7 @@
 #  GRID SWEEP:  patch_mode  x  tau  x  learning rate
 # ═══════════════════════════════════════════════════════════════════════════
 #
-# 25 population runs (20 csf + 5 raw), ~6 h at the defaults below.
+# 50 population runs (40 csf + 10 raw), ~6 h at the defaults below.
 #
 # Nothing aborts the sweep: a failed run is logged and skipped, so one bad
 # combination does not cost the night. Each run writes its own directory under
@@ -45,7 +45,7 @@ export LD_LIBRARY_PATH=${LD_LIBRARY_PATH:-}:/pfs/work9/workspace/scratch/ma_nilb
 
 # ── knobs ────────────────────────────────────────────────────────────────────
 : "${CS:=/hkfs/work/workspace/scratch/ma_nilbecke-thesis/data/cityscapes}"
-: "${N:=25}"                 # images per run
+: "${N:=50}"                 # images per run
 : "${STEPS:=600}"            # per-image optimisation steps
 : "${SEED:=0}"
 : "${VIS_CEILING:=1.0}"      # JND — 1.0 is the detection threshold

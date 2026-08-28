@@ -1,7 +1,7 @@
 #!/bin/bash
 #SBATCH -p gpu_a100_short    # Use the dev_gpu_4_a100 partition with A100 GPUs dev_gpu_4
 #SBATCH -n 1                   # Number of tasks (1 for single node)
-#SBATCH -t 00:10:00            # Time limit (10 minutes for debugging purposes)
+#SBATCH -t 00:07:00            # Time limit (10 minutes for debugging purposes)
 #SBATCH --mem=40000        # Memory request (adjust as needed)
 #SBATCH --gres=gpu:1           # Request 1 GPU (adjust if you need more)
 #SBATCH --cpus-per-task=16     # Number of CPUs per GPU (16 for A100)
@@ -32,5 +32,5 @@ python -c "import sys; print(sys.executable)"
 
 echo "Python version:"
 python --version
-for TAU in 0.05 0.1 0.25 0.5; do python scripts/overfit.py --arch segformer --cityscapes_root "/pfs/work9/workspace/scratch/ma_nilbecke-thesis/data/cityscapes" \
+for TAU in 0.6 0.7 0.8; do python scripts/overfit.py --arch segformer --cityscapes_root "/pfs/work9/workspace/scratch/ma_nilbecke-thesis/data/cityscapes" \
     --patch_mode csf --from_image --loss_fn cospgd --image 420 --steps 300 --csf_threshold $TAU --tag tau$TAU; done

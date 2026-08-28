@@ -55,6 +55,7 @@ _M = f"{_W}/checkpoints"
 #/pfs/work9/workspace/scratch/ma_nilbecke-thesis/master-thesis
 
 REGISTRY = {
+
     # ── DCNv3, no global attention ───────────────────────────────────────────
     "internimage_t": ArchSpec(
         "internimage_t", "none",
@@ -109,6 +110,37 @@ REGISTRY = {
 # quotes, which left REGISTRY = { unterminated and made registry.py — and so
 # every script that imports _common — a SyntaxError.
 _PARKED = '''
+    "segformer_b5": ArchSpec("segformer_b5", "global",
+        cfg=f"{_M}/segformer_b5.py",
+        weights=f"{_M}/segformer_mit-b5_8x1_1024x1024_160k_cityscapes_20211206_072934-87a052ec.pth",
+        note="Same MiT architecture as b0 at ~22x params. Note its stem is "
+            "expansive (3->64 at stride 4) where b0's is compressive (3->32)."),
+
+    "deeplabv3plus_r101": ArchSpec("deeplabv3plus_r101", "none",
+        cfg=f"{_M}/deeplabv3plus_r101.py",
+        weights=f"{_M}/deeplabv3plus_r101-d8_512x1024_80k_cityscapes_20200606_114143-068fcfe9.pth",
+        note="Dilated ResNet-101, no attention. Entry stride 8, deepest in the set."),
+
+    "unet_s5d16": ArchSpec("unet_s5d16", "none",
+        cfg=f"{_M}/unet_s5d16.py",
+        weights=f"{_M}/fcn_unet_s5-d16_4x4_512x1024_160k_cityscapes_20211210_145204-6860854e.pth",
+        note="Entry stride 1 — the only full-resolution path. Clean mIoU 69.10 is "
+            "the lowest in the set; normalise drops by clean score."),
+
+    "setr_pup": ArchSpec("setr_pup", "global",
+        cfg=f"{_M}/setr_pup.py",
+        weights=f"{_M}/setr_pup_vit-large_8x1_768x768_80k_cityscapes_20211122_155115-f6f37b8f.pth",
+        note="ViT-L, 16x16 non-overlapping patch embed. Entry stride 16, the other "
+            "extreme from UNet. Stem is information-preserving (768->1024), so a "
+            "failure here is architectural rather than information loss."),
+}
+
+    # ── Swin windowed attention ──────────────────────────────────────────────
+    # Stock-mmseg alternative for the no-attention bracket — needs no custom
+    # ops. Yuan et al. Table 1 used exactly UPerNet/ConvNeXt for this row
+    # (targeted attack mIoU 5.86, their most robust model), so it is arguably
+    # the more faithful comparison point anyway.
+'''
     "convnext_t": ArchSpec(
         "convnext_t", "none",
         note="UPerNet/ConvNeXt. Stock mmseg, no DCNv3. Check the mmseg zoo for "
@@ -122,10 +154,15 @@ _PARKED = '''
              "dataset-independent — so the three-bracket ERF comparison is "
              "possible even without Cityscapes training."),
 '''
+#}
 
 # Convenience aliases so short names keep working.
 REGISTRY["internimage"] = REGISTRY["internimage_t"]
 REGISTRY["segformer"] = REGISTRY["segformer_b0"]
+#REGISTRY["swin"] = REGISTRY["swin_t"]
+REGISTRY["unet"] = REGISTRY["unet_s5d16"]
+REGISTRY["ocrnet"] = REGISTRY["ocrnet_hr48"]
+REGISTRY["deeplab"] = REGISTRY["deeplabv3plus_r101"]
 
 
 def resolve(name: str, cfg_override=None, weights_override=None):
