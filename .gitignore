@@ -5,3 +5,5 @@ __pycache__/
 *.egg-info/
 .ipynb_checkpoints/
 slurm-*.out
+/slurm
+/results_old

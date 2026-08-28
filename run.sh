@@ -1,8 +1,8 @@
 #!/bin/bash
-#SBATCH -p accelerated   # Use the dev_gpu_4_a100 partition with A100 GPUs dev_gpu_4
+#SBATCH -p gpu_a100_il   # Use the dev_gpu_4_a100 partition with A100 GPUs dev_gpu_4
 #SBATCH -n 1                   # Number of tasks (1 for single node)
-#SBATCH -t 11:07:00            # Time limit (10 minutes for debugging purposes)
-#SBATCH --mem=400000        # Memory request (adjust as needed)
+#SBATCH -t 10:00:00            # Time limit (10 minutes for debugging purposes)
+#SBATCH --mem=400000       # Memory request (adjust as needed)
 #SBATCH --gres=gpu:1           # Request 1 GPU (adjust if you need more)
 #SBATCH --cpus-per-task=16     # Number of CPUs per GPU (16 for A100)
 #SBATCH --ntasks-per-node=1    # Number of tasks per node (1 in this case)
@@ -34,13 +34,4 @@ echo "Python version:"
 python --version
 #    --shape alpha \
     #--lap_freeze_edges --lap_edge_thresh 0.15 --target_class 13 \
-python scripts/train.py \
-    --arch segformer \
-    --cityscapes_root /pfs/work9/workspace/scratch/ma_nilbecke-thesis/data/cityscapes \
-    --patch_mode lap --loss_fn ce \
-    --reference refs/sign_cut.png \
-    --shape alpha \
-    --lap_freeze_edges --lap_edge_thresh 0.15 --target_class 13 \
-    --img_h 512 --img_w 1024 \
-    --epochs 100 --val_every 10 \
-    --tag "untargeted" \
+for LR in 0.1 0.2 0.5; do python scripts/train.py --arch segformer --cityscapes_root $CS --img_h 512 --img_w 1024 --patch_mode universal_csf --patch_size 128 --patch_scale 0.25 --loss_fn cospgd --lr_schedule cosine --lr $LR --batch_size 4 --num_workers 16 --epochs 150 --val_images 500 --csf_threshold 0.25 --no_diagnostics --panel_images "" --tag 150_lr$LR; done

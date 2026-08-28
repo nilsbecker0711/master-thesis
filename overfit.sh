@@ -1,7 +1,7 @@
 #!/bin/bash
-#SBATCH -p gpu_a100_short    # Use the dev_gpu_4_a100 partition with A100 GPUs dev_gpu_4
+#SBATCH -p dev_gpu_a100_il    # Use the dev_gpu_4_a100 partition with A100 GPUs dev_gpu_4
 #SBATCH -n 1                   # Number of tasks (1 for single node)
-#SBATCH -t 00:04:00            # Time limit (10 minutes for debugging purposes)
+#SBATCH -t 00:10:00            # Time limit (10 minutes for debugging purposes)
 #SBATCH --mem=40000        # Memory request (adjust as needed)
 #SBATCH --gres=gpu:1           # Request 1 GPU (adjust if you need more)
 #SBATCH --cpus-per-task=16     # Number of CPUs per GPU (16 for A100)
@@ -11,10 +11,7 @@
 
 echo "Running on $(hostname)"
 echo "Date: $(date)"
-TARGET_CLASS=-1
-LOSS="cospgd"
-exec 1> "slurm/attack/${SLURM_JOB_ID}_cls${TARGET_CLASS}_loss_${LOSS}_512x256.out"
-exec 2> "slurm/attack/${SLURM_JOB_ID}_cls${TARGET_CLASS}_loss_${LOSS}_512x256.err"
+
 module --ignore_cache load "cuda/11.8"
 
 # initialize YOUR conda
@@ -33,8 +30,5 @@ python -c "import sys; print(sys.executable)"
 echo "Python version:"
 python --version
 #--lap_freeze_edges --lap_edge_thresh 0.15 --patch_scale 0.35
-python scripts/overfit.py --arch segformer --cityscapes_root "/pfs/work9/workspace/scratch/ma_nilbecke-thesis/data/cityscapes" \
-    --patch_mode lap --reference refs/street.png --loss_fn "cospgd" --image 3 \
-    --steps 300  --placement center \
-    --lap_alpha 0 --lap_beta 0 --placement_class 0 --tag "TEST DELETE" \
-    #--lap_freeze_edges --lap_edge_thresh 0.15 
+#python scripts/overfit.py --arch segformer --cityscapes_root $CS --patch_mode csf --from_image --loss_fn ipatch_cospgd --target_class 16 --image 420 --steps 1000 --lr 0.2 --csf_threshold 0.25 --csf_enforce realised --seeds 5 --log_every 50 --out_root results/overfit --tag targeted_train_n5
+python scripts/overfit.py --arch segformer --cityscapes_root $CS --patch_mode csf --from_image --loss_fn tsallis --tsallis_schedule linear --tsallis_q_start -2 --tsallis_q_end 1 --image 420 --steps 1000 --lr 0.2 --csf_threshold 0.25 --csf_enforce realised --seeds 5 --log_every 50 --out_root results/overfit --tag q-2to1_lr0_2_n5

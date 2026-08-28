@@ -1,7 +1,7 @@
 #!/bin/bash
-#SBATCH -p gpu_a100_short    # Use the dev_gpu_4_a100 partition with A100 GPUs dev_gpu_4
+#SBATCH -p gpu_a100_il   # Use the dev_gpu_4_a100 partition with A100 GPUs dev_gpu_4
 #SBATCH -n 1                   # Number of tasks (1 for single node)
-#SBATCH -t 00:15:00            # Time limit (10 minutes for debugging purposes)
+#SBATCH -t 20:20:00            # Time limit (10 minutes for debugging purposes)
 #SBATCH --mem=40000        # Memory request (adjust as needed)
 #SBATCH --gres=gpu:1           # Request 1 GPU (adjust if you need more)
 #SBATCH --cpus-per-task=16     # Number of CPUs per GPU (16 for A100)
@@ -34,4 +34,5 @@ echo "Python version:"
 python --version
 
 #python scripts/train_conditional_generator.py --arch segformer --cityscapes_root "/pfs/work9/workspace/scratch/ma_nilbecke-thesis/data/cityscapes" --epochs 1 --train_images 128 --val_images 4 --panel_images "" --no_lpips --tag TIMING
-python scripts/train_conditional_generator.py --arch segformer --cityscapes_root "/pfs/work9/workspace/scratch/ma_nilbecke-thesis/data/cityscapes" --epochs 3 --train_images 512 --val_images 20 --gen_residual none --tag CONTROL
+#python scripts/train_conditional_generator.py --arch segformer --cityscapes_root "/pfs/work9/workspace/scratch/ma_nilbecke-thesis/data/cityscapes" --epochs 3 --train_images 512 --val_images 20 --gen_residual none --tag CONTROL
+python scripts/train_conditional_generator.py --arch segformer --cityscapes_root /pfs/work9/workspace/scratch/ma_nilbecke-thesis/data/cityscapes --loss_fn cospgd --gen_residual csf --csf_threshold 0.4 --gen_reference window --gen_placement gradcam --gen_placement_margin 64 --img_h 512 --img_w 1024 --epochs 150 --val_every 10 --tag 150epoch_scsf-tau0.4
