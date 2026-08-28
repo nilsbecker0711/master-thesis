@@ -124,7 +124,7 @@ REGISTRY["internimage"] = REGISTRY["internimage_t"]
 REGISTRY["segformer"] = REGISTRY["segformer_b0"]
 #REGISTRY["swin"] = REGISTRY["swin_t"]
 REGISTRY["unet"] = REGISTRY["unet_s5d16"]
-REGISTRY["ocrnet"] = REGISTRY["ocrnet_hr48"]
+#REGISTRY["ocrnet"] = REGISTRY["ocrnet_hr48"]
 REGISTRY["deeplab"] = REGISTRY["deeplabv3plus_r101"]
 
 
