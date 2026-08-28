@@ -57,8 +57,8 @@ REGISTRY = {
     # ── DCNv3, no global attention ───────────────────────────────────────────
     "internimage_t": ArchSpec(
         "internimage_t", "none",
-        cfg=f"{_W}/Combined/configs/cityscapes/upernet_internimage_t_512x1024_160k_cityscapes.py",
-        weights=f"{_W}/checkpoints_internimage/upernet_internimage_t_512x1024_160k_cityscapes.pth",
+        cfg=f"{_W}/checkpoints/upernet_internimage_t_512x1024_160k_cityscapes.py",
+        weights=f"{_W}/checkpoints/upernet_internimage_t_512x1024_160k_cityscapes.pth",
         note="UPerNet head. Emits a 150-channel ADE20K-dimensioned head; only "
              "0..18 are active. The channel probe reports this at startup."),
     "internimage_l": ArchSpec("internimage_l", "none"),
@@ -67,12 +67,35 @@ REGISTRY = {
     # ── MiT efficient self-attention ─────────────────────────────────────────
     "segformer_b0": ArchSpec(
         "segformer_b0", "global",
-        cfg=f"{_W}/checkpoints_segformer/segformer_mit-b0_8x1_1024x1024_160k_cityscapes.py",
-        weights=f"{_W}/checkpoints_segformer/segformer_mit-b0_8x1_1024x1024_160k_cityscapes_20211208_101857-e7f88502.pth",
+        cfg=f"{_W}/checkpoints/segformer_mit-b0_8x1_1024x1024_160k_cityscapes.py",
+        weights=f"{_W}/checkpoints/segformer_mit-b0_8x1_1024x1024_160k_cityscapes_20211208_101857-e7f88502.pth",
         note="Weakest MiT variant (~76 dataset mIoU vs B5's ~82). Fine for the "
              "ERF probe; consider B2/B5 for a baseline closer to InternImage-T."),
-    "segformer_b2": ArchSpec("segformer_b2", "global"),
-    "segformer_b5": ArchSpec("segformer_b5", "global"),
+    "segformer_b5": ArchSpec(
+    "segformer_b5", "global",
+        cfg=f"{_M}/segformer_mit-b5_8x1_1024x1024_160k_cityscapes.py",
+        weights=f"{_M}/<downloaded>.pth",
+        note="Same MiT architecture as b0 at 6x capacity — the capacity control."),
+
+    "deeplabv3plus_r101": ArchSpec(
+        "deeplabv3plus_r101", "none",
+        cfg=f"{_M}/deeplabv3plus_r101-d8_512x1024_80k_cityscapes.py",
+        weights=f"{_M}/<downloaded>.pth",
+        note="Dilated ResNet-101, no attention. The robust bracket."),
+
+    "ocrnet_hr48": ArchSpec(
+        "ocrnet_hr48", "local",
+        cfg=f"{_M}/ocrnet_hr48_512x1024_160k_cityscapes.py",
+        weights=f"{_M}/<downloaded>.pth",
+        note="HRNet keeps high-res branches throughout; OCR head does explicit "
+            "object-region attention. Replaces Mask2Former, absent from mmseg 0.x."),
+
+    "unet_s5d16": ArchSpec(
+        "unet_s5d16", "none",
+        cfg=f"{_M}/fcn_unet_s5-d16_4x4_512x1024_160k_cityscapes.py",
+        weights=f"{_M}/<downloaded>.pth",
+        note="Plain encoder-decoder, no dilation, no attention. Weakest clean "
+            "mIoU (69.10) — normalise drops by clean score when comparing."),
 
     # ── Swin windowed attention ──────────────────────────────────────────────
     # Stock-mmseg alternative for the no-attention bracket — needs no custom
