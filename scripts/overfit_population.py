@@ -75,8 +75,9 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from _common import (add_model_args, add_patch_args, setup_model, build_patch,
-                     image_indices, tsallis_kwargs, tsallis_tag)
+from _common import (add_model_args, add_patch_args, add_image_args,
+                     setup_model, build_patch, resolve_images, tsallis_kwargs,
+                     tsallis_tag)
 from patchreach.data.cityscapes import CityscapesSeg, norm_tensors, upsample_to
 from patchreach.diagnostics import aggregate, report
 from patchreach.metrics import population as pop_mod
@@ -96,16 +97,13 @@ def build_parser():
                    help="initialise the patch base with the region it covers "
                         "(csf modes)")
 
-    p.add_argument("--images", default="random",
-                   help="'random' (seeded sample of --n_images) | 'fixed10' | "
-                        "'all' | an explicit list like '2 5 45'")
-    p.add_argument("--n_images", type=int, default=100,
-                   help="population size. 500 = the full Cityscapes val set, "
-                        "which is what the field does when it can afford to; "
-                        "the run reports whether this n supports the claim.")
-    p.add_argument("--sample_seed", type=int, default=0,
-                   help="seed for --images random. RECORD THIS — it is what "
-                        "makes the subset reproducible.")
+    # The --images family is defined in _common.add_image_args, shared with
+    # evaluate.py, so "the same 100 images" means the same 100 images whether
+    # they are being attacked or a finished patch is being tested on them.
+    add_image_args(p, default_images="random", default_n=100,
+                   n_help="Population size. 500 = the full Cityscapes val set, "
+                          "which is what the field does when it can afford to; "
+                          "the run reports whether this n supports the claim.")
 
     p.add_argument("--steps", type=int, default=300)
     p.add_argument("--lr", type=float, default=0.01)
@@ -158,15 +156,6 @@ def build_parser():
     return p
 
 
-def resolve_images(a, n_val: int):
-    """The image list, and it is recorded in config.json either way."""
-    if a.images == "random":
-        g = torch.Generator().manual_seed(a.sample_seed)
-        perm = torch.randperm(n_val, generator=g).tolist()
-        return sorted(perm[:min(a.n_images, n_val)])
-    return image_indices(a.images, n_val)[:a.n_images]
-
-
 def main():
     a = build_parser().parse_args()
     seed_everything(a.seed)
@@ -175,7 +164,8 @@ def main():
     mean_t, std_t = norm_tensors(device)
 
     ds = CityscapesSeg(a.cityscapes_root, "val", a.img_h, a.img_w)
-    idxs = resolve_images(a, len(ds))
+    idxs = resolve_images(a.images, len(ds), a.n_images, a.sample_seed,
+                          a.exclude_image)
 
     if a.out_dir:
         out_dir = Path(a.out_dir)

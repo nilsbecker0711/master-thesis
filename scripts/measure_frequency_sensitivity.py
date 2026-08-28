@@ -45,8 +45,8 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from _common import (add_model_args, add_patch_args, setup_model, build_patch,
-                     image_indices)
+from _common import (add_model_args, add_patch_args, add_image_args,
+                     setup_model, build_patch, resolve_images)
 from patchreach.data.cityscapes import CityscapesSeg, norm_tensors, upsample_to
 from patchreach.diagnostics import spectral
 from patchreach.patch import csf as csf_mod
@@ -57,10 +57,9 @@ def build_parser():
     p = add_patch_args(add_model_args(argparse.ArgumentParser(
         description="Measure segmentation sensitivity per spatial-frequency "
                     "band, at equal perceptual cost")))
-    p.add_argument("--images", default="fixed10",
-                   help="'fixed10' | 'all' | '2 5 45'")
-    p.add_argument("--n_images", type=int, default=5,
-                   help="how many of --images to actually use")
+    add_image_args(p, default_images="fixed10", default_n=5,
+                   n_help="Each image costs n_probes forward passes per band, "
+                          "so this is the run's cost knob.")
     p.add_argument("--n_probes", type=int, default=8,
                    help="noise draws per band per image")
     p.add_argument("--region", default="patch",
@@ -135,7 +134,10 @@ def main():
     print(f" WHAT THE NETWORK READS — {a.arch} ({spec.bracket} attention)")
     print(f"{'=' * 72}")
 
-    idxs = image_indices(a.images, len(ds))[:a.n_images]
+    # Through the shared resolver, so --images random draws n images at
+    # random instead of truncating a shuffled list back to its lowest indices.
+    idxs = resolve_images(a.images, len(ds), a.n_images, a.sample_seed,
+                          a.exclude_image)
     per_image = []
     for i in idxs:
         img = ds[i][0].unsqueeze(0).to(device)

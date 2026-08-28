@@ -149,3 +149,53 @@ echo "Done: $(date)"
 # compare_populations.py pairs BY IMAGE INDEX, and the paired difference is the
 # only test that resolves a small effect under this attack's scene-to-scene
 # spread. That is why both arms must keep --sample_seed $SEED.
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  THE OTHER QUESTION: DOES ONE PATCH WORK ON IMAGES IT NEVER SAW?
+# ═══════════════════════════════════════════════════════════════════════════
+#
+# Everything above optimises a FRESH patch per image, so it answers "how strong
+# is this attack, on average, when it gets to see its target". It says nothing
+# about whether ONE patch transfers. That is scripts/evaluate.py, which now
+# takes the same --images vocabulary (one resolver, _common.resolve_images, so
+# "n images under seed s" means the same thing in both scripts):
+#
+#   export CKPT=results/runs/segformer_csf_cospgd_img420/best.pt
+#   export EV="--arch segformer --cityscapes_root $CS --img_h 512 --img_w 1024"
+#
+#   a) one random image        — the cheapest sanity check, and NOT a result
+#      python scripts/evaluate.py --checkpoint $CKPT $EV \
+#          --images random --n_images 1 --sample_seed 7
+#
+#   b) n random images         — an interval, from a reproducible sample
+#      python scripts/evaluate.py --checkpoint $CKPT $EV \
+#          --images random --n_images 50 --sample_seed 0
+#
+#   c) n fixed images          — the same images for every checkpoint you
+#                                compare; FIXED10 first, then a fixed order
+#      python scripts/evaluate.py --checkpoint $CKPT $EV \
+#          --images fixed --n_images 50
+#
+#   d) every val image but the one it was trained on
+#      python scripts/evaluate.py --checkpoint $CKPT $EV \
+#          --images all --exclude_image 420
+#      ... and --exclude_image -1 for all 500, training image included.
+#
+# --exclude_image is applied BEFORE --n_images, so (b) with an exclusion still
+# returns n images. Leaving the training image in is the one thing that makes
+# the number meaningless — it averages a ~50-point overfit with whatever the
+# transfer is — and evaluate.py says so in words when the checkpoint path names
+# an image that is still in the set.
+#
+# WHAT TRANSFERS FOR csf IS THE RESIDUAL. The base was the region of image 420
+# the patch covered, and Patch.save() does not store it. evaluate.py re-derives
+# the base from EACH evaluated image and adds the optimised residual, which is
+# both the only well-defined reading and the only one that stays invisible on
+# the new image. Checkpoints record --from_image now; for one written before
+# that, pass --from_image explicitly or the run measures a grey square.
+#
+# THE COMPARISON TO QUOTE IT AGAINST is the per-image number above, on the same
+# images: (b)/(c) with --sample_seed $SEED next to the summary.json from this
+# file's main run. Same images, same tau, same metric — one is what the attack
+# gets when it optimises on the target, the other is what one patch carries to
+# an image it has never seen, and the GAP is the transfer result.

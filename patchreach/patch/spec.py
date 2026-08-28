@@ -79,6 +79,17 @@ class PatchConfig:
     # shaped patch was only possible in lap mode. One field for both fixes it.
     reference: Optional[str] = None
     init_reference: Optional[torch.Tensor] = None
+
+    # PROVENANCE, not behaviour: nothing in Patch reads this. The image-derived
+    # base is installed by optimise.prepare() -> set_reference_from_image(),
+    # which is a caller's decision, and the base itself is NOT in the
+    # checkpoint (save() stores the parameter, the config and the placement).
+    # So a csf checkpoint loaded later cannot tell whether its base was the
+    # image region or 0.5 grey, and render() silently returns the grey one —
+    # a patch that was never optimised. This flag is what lets evaluate.py
+    # re-derive the base from whatever image it is now being applied to, which
+    # is exactly the operation a CROSS-IMAGE test consists of.
+    from_image: bool = False
     # ── LAP (lap.py) ─────────────────────────────────────────────────────────
     lap_alpha: float = 0.0                # 0 = stage 1 (transition patch)
     lap_beta: float = 0.0

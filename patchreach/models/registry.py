@@ -97,13 +97,18 @@ REGISTRY = {
         weights=f"{_M}/<downloaded>.pth",
         note="Plain encoder-decoder, no dilation, no attention. Weakest clean "
             "mIoU (69.10) — normalise drops by clean score when comparing."),
+}
 
-    # ── Swin windowed attention ──────────────────────────────────────────────
-    # Stock-mmseg alternative for the no-attention bracket — needs no custom
-    # ops. Yuan et al. Table 1 used exactly UPerNet/ConvNeXt for this row
-    # (targeted attack mIoU 5.86, their most robust model), so it is arguably
-    # the more faithful comparison point anyway.
-    '''
+# ── Swin windowed attention ──────────────────────────────────────────────────
+# PARKED, not registered. Stock-mmseg alternative for the no-attention bracket
+# — needs no custom ops. Yuan et al. Table 1 used exactly UPerNet/ConvNeXt for
+# this row (targeted attack mIoU 5.86, their most robust model), so it is
+# arguably the more faithful comparison point anyway.
+#
+# The closing brace above used to sit at the BOTTOM of this block, inside the
+# quotes, which left REGISTRY = { unterminated and made registry.py — and so
+# every script that imports _common — a SyntaxError.
+_PARKED = '''
     "convnext_t": ArchSpec(
         "convnext_t", "none",
         note="UPerNet/ConvNeXt. Stock mmseg, no DCNv3. Check the mmseg zoo for "
@@ -116,12 +121,11 @@ REGISTRY = {
              "are FINE for measure_erf.py — that probe is label- and "
              "dataset-independent — so the three-bracket ERF comparison is "
              "possible even without Cityscapes training."),
-}
 '''
+
 # Convenience aliases so short names keep working.
 REGISTRY["internimage"] = REGISTRY["internimage_t"]
 REGISTRY["segformer"] = REGISTRY["segformer_b0"]
-REGISTRY["swin"] = REGISTRY["swin_t"]
 
 
 def resolve(name: str, cfg_override=None, weights_override=None):

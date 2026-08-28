@@ -19,6 +19,12 @@ from patchreach.utils import get_device, seed_everything, channel_probe
 # rather than accidental.
 FIXED10 = [430, 46, 441, 331, 45, 162, 195, 424, 91, 353]
 
+# Seed for the TAIL of `--images fixed` beyond those ten. HARD-CODED, and
+# deliberately not --sample_seed: a fixed set that moves when a seed moves is
+# not a fixed set. Changing this number silently redefines every `fixed` result
+# with n > 10, so it is a constant and not a flag.
+FIXED_TAIL_SEED = 20240617
+
 
 def add_model_args(p):
     p.add_argument("--arch", default="internimage_t",
@@ -400,13 +406,138 @@ def setup_model(a):
     return model, n_ch, n_act, spec
 
 
-def image_indices(arg, n_val):
-    """'fixed10' | 'all' | comma/space separated indices."""
-    if arg in (None, "fixed10"):
-        return FIXED10
-    if arg == "all":
-        return list(range(n_val))
-    return [int(x) for x in str(arg).replace(",", " ").split()]
+# ═════════════════════════════════════════════════════════════════════════════
+#  IMAGE SELECTION — ONE resolver, shared by every script that takes --images
+# ═════════════════════════════════════════════════════════════════════════════
+# overfit_population.py carried its own seeded sampler while evaluate.py could
+# only take a hard-coded ten or the whole set, so "the same n images" meant two
+# different things depending on which script you asked. That is the same
+# failure mode as the duplicated argument parsers this file exists to prevent:
+# both copies work, and nothing says they disagree.
+
+
+def _seeded_perm(n_val: int, seed: int):
+    g = torch.Generator().manual_seed(int(seed))
+    return torch.randperm(n_val, generator=g).tolist()
+
+
+def fixed_order(n_val: int):
+    """
+    A deterministic PRIORITY ORDER over the whole val set: FIXED10 first, then
+    everything else under a hard-coded permutation.
+
+    `--images fixed --n_images n` is its first n. Two properties matter:
+
+      * it does not read --sample_seed. `fixed` naming different images in two
+        runs because a seed moved would make the word a lie.
+      * it is NESTED — fixed(n) is a prefix of fixed(n+1), and fixed(n<=10) is
+        FIXED10 — so raising n adds images instead of replacing them, and every
+        number already reported on FIXED10 stays inside the set.
+    """
+    head = [i for i in FIXED10 if i < n_val]
+    seen = set(head)
+    return head + [i for i in _seeded_perm(n_val, FIXED_TAIL_SEED)
+                   if i not in seen]
+
+
+def resolve_images(images, n_val: int, n_images=None, sample_seed: int = 0,
+                   exclude=None):
+    """
+    --images / --n_images / --sample_seed / --exclude_image -> list of indices.
+
+        random    a seeded sample of n_images. Nested in n: n=200 under one
+                  seed is n=100 plus 100 new images, so a run can GROW.
+        fixed     the first n_images of fixed_order() — the same images every
+                  time, no seed involved. n<=10 is FIXED10.
+        fixed10   exactly FIXED10, the ten every existing number is quoted on.
+        all       the whole split (500 for Cityscapes val).
+        '2 5 45'  an explicit list, comma- or space-separated.
+
+    EXCLUSION IS APPLIED BEFORE TRUNCATION, so `--n_images 100 --exclude_image
+    420` returns 100 images and not 99. The point of that flag is to hold out
+    the image a patch was OVERFIT on: leaving it in makes the mean a mixture of
+    a training number and a transfer number, which is the one thing a
+    cross-image check must not be.
+
+    Negative entries in `exclude` are ignored, so -1 is a legal "exclude
+    nothing" and a script can default to it.
+    """
+    excl = {int(x) for x in (exclude or []) if int(x) >= 0}
+    if images == "random":
+        pool, ordered = _seeded_perm(n_val, sample_seed), True
+    elif images == "fixed":
+        pool, ordered = fixed_order(n_val), False
+    elif images in (None, "fixed10"):
+        pool, ordered = list(FIXED10), False
+    elif images == "all":
+        pool, ordered = list(range(n_val)), True
+    else:
+        pool, ordered = [int(x) for x in
+                         str(images).replace(",", " ").split()], False
+        bad = [i for i in pool if not 0 <= i < n_val]
+        if bad:
+            raise SystemExit(f"--images {images!r}: {bad} out of range for a "
+                             f"{n_val}-image split")
+    pool = [i for i in pool if i not in excl]
+    if n_images:
+        pool = pool[:int(n_images)]
+    if not pool:
+        raise SystemExit(f"--images {images!r} with --exclude_image "
+                         f"{sorted(excl)} selects no images")
+    # sorted() for the sampled and whole-set modes only: it is what the
+    # population runs have always recorded, and it makes two arms trivially
+    # comparable. fixed/fixed10/explicit keep their written order.
+    return sorted(pool) if ordered else pool
+
+
+def add_image_args(p, default_images="fixed10", default_n=None, n_help=""):
+    """
+    The --images family, defined ONCE. Defaults differ per script (a population
+    run samples 100 by default, an evaluation takes the fixed ten); the
+    vocabulary must not.
+    """
+    g = p.add_argument_group("image selection")
+    g.add_argument("--images", default=default_images,
+                   help="'random' (seeded sample of --n_images) | 'fixed' "
+                        "(the first --n_images of a fixed, seed-independent "
+                        "order, FIXED10 first) | 'fixed10' | 'all' | an "
+                        "explicit list like '2 5 45'")
+    g.add_argument("--n_images", type=int, default=default_n,
+                   help="how many images. 0 or unset = every image --images "
+                        "names (500 for 'all'). " + n_help)
+    g.add_argument("--sample_seed", type=int, default=0,
+                   help="seed for --images random. RECORD THIS — it is what "
+                        "makes the subset reproducible. --images fixed does "
+                        "NOT read it.")
+    g.add_argument("--exclude_image", type=int, nargs="+", default=[-1],
+                   metavar="IDX",
+                   help="hold these val indices OUT of the selection — the "
+                        "image a single-image patch was overfit on, so the "
+                        "number reported is transfer and not training. -1 "
+                        "excludes nothing and is the default.")
+    return p
+
+
+def sample_tag(a) -> str:
+    """
+    Run-directory slug for the image selection, so two evaluations of one
+    checkpoint on different image sets do not land on the same name and get
+    silently disambiguated into _2 by increment_path. Same reason tsallis_tag()
+    exists.
+    """
+    n = getattr(a, "n_images", None) or 0
+    images = getattr(a, "images", None)
+    if images == "random":
+        s = f"rand{n or 'all'}s{getattr(a, 'sample_seed', 0)}"
+    elif images == "fixed":
+        s = f"fixed{n or len(FIXED10)}"
+    elif images in (None, "fixed10", "all"):
+        s = images or "fixed10"
+    else:
+        idx = str(images).replace(",", " ").split()
+        s = f"img{idx[0]}" if len(idx) == 1 else f"list{len(idx)}"
+    ex = [x for x in (getattr(a, "exclude_image", None) or []) if x >= 0]
+    return s + ("_ex" + "-".join(str(x) for x in ex) if ex else "")
 
 
 def build_patch(a, device, mean_t, std_t, generator=None,
@@ -416,6 +547,9 @@ def build_patch(a, device, mean_t, std_t, generator=None,
         mode=a.patch_mode, size=a.patch_size, scale=a.patch_scale,
         shape=a.shape, placement=a.placement,
         placement_class=a.placement_class, reference=a.reference,
+        # Recorded so a later evaluation knows the base was the image region
+        # and can re-derive it. train.py has no --from_image, hence getattr.
+        from_image=bool(getattr(a, "from_image", False)),
         placement_xy=tuple(a.placement_xy),
         placement_margin=getattr(a, "placement_margin", 0),
         reference_fit=a.reference_fit, logit_clip=a.logit_clip, shape_bg=a.shape_bg, shape_thresh=a.shape_thresh,
