@@ -51,14 +51,15 @@ class ArchSpec:
 
 
 _W = "/pfs/work9/workspace/scratch/ma_nilbecke-thesis"
+_M = f"{_W}/checkpoints"
 #/pfs/work9/workspace/scratch/ma_nilbecke-thesis/master-thesis
 
 REGISTRY = {
     # ── DCNv3, no global attention ───────────────────────────────────────────
     "internimage_t": ArchSpec(
         "internimage_t", "none",
-        cfg=f"{_W}/checkpoints/upernet_internimage_t_512x1024_160k_cityscapes.py",
-        weights=f"{_W}/checkpoints/upernet_internimage_t_512x1024_160k_cityscapes.pth",
+        cfg=f"{_M}/upernet_internimage_t_512x1024_160k_cityscapes.py",
+        weights=f"{_M}/upernet_internimage_t_512x1024_160k_cityscapes.pth",
         note="UPerNet head. Emits a 150-channel ADE20K-dimensioned head; only "
              "0..18 are active. The channel probe reports this at startup."),
     "internimage_l": ArchSpec("internimage_l", "none"),
@@ -67,12 +68,12 @@ REGISTRY = {
     # ── MiT efficient self-attention ─────────────────────────────────────────
     "segformer_b0": ArchSpec(
         "segformer_b0", "global",
-        cfg=f"{_W}/checkpoints/segformer_mit-b0_8x1_1024x1024_160k_cityscapes.py",
-        weights=f"{_W}/checkpoints/segformer_mit-b0_8x1_1024x1024_160k_cityscapes_20211208_101857-e7f88502.pth",
+        cfg=f"{_M}/segformer_mit-b0_8x1_1024x1024_160k_cityscapes.py",
+        weights=f"{_M}/segformer_mit-b0_8x1_1024x1024_160k_cityscapes_20211208_101857-e7f88502.pth",
         note="Weakest MiT variant (~76 dataset mIoU vs B5's ~82). Fine for the "
              "ERF probe; consider B2/B5 for a baseline closer to InternImage-T."),
     "segformer_b5": ArchSpec(
-    "segformer_b5", "global",
+        "segformer_b5", "global",
         cfg=f"{_M}/segformer_mit-b5_8x1_1024x1024_160k_cityscapes.py",
         weights=f"{_M}/<downloaded>.pth",
         note="Same MiT architecture as b0 at 6x capacity — the capacity control."),
@@ -102,6 +103,7 @@ REGISTRY = {
     # ops. Yuan et al. Table 1 used exactly UPerNet/ConvNeXt for this row
     # (targeted attack mIoU 5.86, their most robust model), so it is arguably
     # the more faithful comparison point anyway.
+    '''
     "convnext_t": ArchSpec(
         "convnext_t", "none",
         note="UPerNet/ConvNeXt. Stock mmseg, no DCNv3. Check the mmseg zoo for "
@@ -115,7 +117,7 @@ REGISTRY = {
              "dataset-independent — so the three-bracket ERF comparison is "
              "possible even without Cityscapes training."),
 }
-
+'''
 # Convenience aliases so short names keep working.
 REGISTRY["internimage"] = REGISTRY["internimage_t"]
 REGISTRY["segformer"] = REGISTRY["segformer_b0"]
