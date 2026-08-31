@@ -525,9 +525,39 @@ def main():
     (root / "decisions").mkdir(exist_ok=True)
 
     stages = [s.strip() for s in a.stages.split(",") if s.strip()]
+
+    # PICK UP WHERE A KILLED JOB STOPPED. The cells were already recoverable
+    # from disk -- cell_complete() finds them -- but the DECISIONS were not:
+    # they live only in sweep.json, and starting from an empty manifest threw
+    # away the chosen run length and learning rate of every stage that had
+    # finished. On a scheduler with a four-hour walltime that is the difference
+    # between resuming a sweep and restarting one.
+    #
+    # It also lets the two objectives run as SEPARATE JOBS into one directory:
+    # `--losses cospgd` then `--losses ce` under the same --name accumulates
+    # both, and the cross-loss comparison fires on the second because it reads
+    # the merged decisions rather than only what this invocation measured.
+    prev = {}
+    sweep_json = root / "sweep.json"
+    if sweep_json.exists() and not a.force:
+        try:
+            prev = json.loads(sweep_json.read_text())
+            done = [c for c in prev.get("cells", [])
+                    if c.get("status") in ("ok", "reused")]
+            if done or prev.get("decisions"):
+                print(f"  resuming {sweep_json}: {len(done)} finished cells, "
+                      f"decisions for {sorted(prev.get('decisions', {}))}")
+        except json.JSONDecodeError:
+            # A manifest truncated mid-write by the kill. The cells survive on
+            # disk regardless, so this costs the decisions and nothing else.
+            print(f"  {sweep_json} is unreadable; starting a fresh manifest")
+
     man = {"name": name, "config": vars(a), "stages": stages,
-           "started": time.strftime("%Y-%m-%d %H:%M:%S"),
-           "cells": [], "decisions": {}}
+           "started": prev.get("started", time.strftime("%Y-%m-%d %H:%M:%S")),
+           "resumed": (time.strftime("%Y-%m-%d %H:%M:%S") if prev else None),
+           "cells": [c for c in prev.get("cells", [])
+                     if c.get("status") in ("ok", "reused")],
+           "decisions": prev.get("decisions", {})}
 
     def save():
         (root / "sweep.json").write_text(json.dumps(man, indent=2))
@@ -544,6 +574,15 @@ def main():
     # same, so a second run of an identical cell is not an independent repeat
     # of anything. --seeds is what measures the spread.
     seen: dict[tuple, dict] = {}
+
+    # Primed from the resumed manifest so a finished cell is neither re-run nor
+    # appended twice. Keyed on the CONFIGURATION, not the tag, which is what
+    # makes it work across a stage boundary: the same cell reached from the tau
+    # ladder and from the interaction block is one entry.
+    for c in man["cells"]:
+        if all(k in c for k in ("loss", "tau", "lr", "steps", "enforce")):
+            seen[(c["loss"], c["tau"], c["lr"], c["steps"],
+                  c["enforce"])] = c
 
     def cell(loss, tag, **kw):
         key = (loss, kw["tau"], kw["lr"], kw["steps"], kw["enforce"])
@@ -567,7 +606,10 @@ def main():
 
         losses = [x.strip() for x in a.losses.replace(",", " ").split()
                   if x.strip()]
-        per_loss = {}
+        # Seeded with the decisions already in the manifest, so a per-loss job
+        # run separately still reaches the cross-loss comparison.
+        per_loss = {k: v for k, v in man["decisions"].items()
+                    if isinstance(v, dict) and "operating_point" in v}
 
         # THE LOSS IS AN OUTER AXIS, NOT A CELL. Each objective gets its own
         # run length, its own learning rate and its own tau curve, because the
