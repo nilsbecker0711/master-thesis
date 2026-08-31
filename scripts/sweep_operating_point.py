@@ -153,7 +153,7 @@ def read_cell(run_dir: Path) -> dict | None:
     return out
 
 
-def cell_complete(cells_dir: Path, tag: str, loss: str,
+def cell_complete(cells_dir: Path, tag: str, arch: str, loss: str,
                   image: int) -> Path | None:
     """
     An existing, FINISHED directory for this cell tag, or None.
@@ -162,13 +162,14 @@ def cell_complete(cells_dir: Path, tag: str, loss: str,
     leaves a numbered directory behind for a run that crashed on step three,
     and treating that as done would silently put a hole in the sweep.
 
-    THE LOSS IS PART OF THE MATCH, not decoration. overfit.py names a run
-    <arch>_csf_<loss>_img<N>_<tag>, so two losses sharing a cell tag differ
-    only in a field the old glob did not look at -- and it sorted REVERSE, so
-    the ce cell would have been "resumed" from the cospgd directory and the
-    sweep would have reported one loss twice.
+    THE ARCH AND THE LOSS ARE PART OF THE MATCH, not decoration. overfit.py
+    names a run <arch>_csf_<loss>_img<N>_<tag>, so a b5 cell and a b0 cell with
+    the same tag differ only in fields a leading-wildcard glob does not look
+    at -- and it sorts REVERSE, so the second architecture would have been
+    "resumed" from the first one's directories and the sweep would have
+    reported b0's numbers under b5's name. The same held for two losses.
     """
-    for d in sorted(cells_dir.glob(f"*_{loss}_img{image}_{tag}"),
+    for d in sorted(cells_dir.glob(f"{arch}_*_{loss}_img{image}_{tag}"),
                     reverse=True):
         if (d / "summary.json").exists() or (d / "results.json").exists():
             return d
@@ -221,7 +222,7 @@ def run_cell(a, cells_dir: Path, tag: str, *, loss: str, tau: float,
               f"steps={steps:<5d} enforce={enforce}")
         return rec
 
-    done = cell_complete(cells_dir, tag, loss, a.image)
+    done = cell_complete(cells_dir, tag, a.arch, loss, a.image)
     if done is not None and not a.force:
         print(f"\n  [skip] {tag} — already complete at {done}")
         rec.update({"status": "reused"}, **(read_cell(done) or {}))
@@ -249,7 +250,7 @@ def run_cell(a, cells_dir: Path, tag: str, *, loss: str, tau: float,
               f"decisions will skip it.")
         return rec
 
-    got = cell_complete(cells_dir, tag, loss, a.image)
+    got = cell_complete(cells_dir, tag, a.arch, loss, a.image)
     if got is None:
         rec["status"] = "no_result"
         return rec
@@ -544,6 +545,31 @@ def main():
             prev = json.loads(sweep_json.read_text())
             done = [c for c in prev.get("cells", [])
                     if c.get("status") in ("ok", "reused")]
+            # WHAT MAKES TWO INVOCATIONS THE SAME SWEEP. Not the name --
+            # the name is a directory the user chose and can reuse by
+            # accident. These are the fields that decide what a cell MEANS,
+            # so a mismatch is a different experiment sharing a folder, and
+            # merging the two would put one architecture's numbers under
+            # another's name. --losses is deliberately NOT here: running the
+            # objectives as separate jobs into one directory is the point.
+            IDENTITY = ("arch", "image", "img_h", "img_w", "csf_param",
+                        "patch_scale", "placement", "lr_schedule")
+            old_cfg = prev.get("config", {})
+            clash = {k: (old_cfg.get(k), getattr(a, k)) for k in IDENTITY
+                     if k in old_cfg and old_cfg[k] != getattr(a, k)}
+            if clash:
+                print("", file=sys.stderr)
+                print(f"  REFUSING TO RESUME {sweep_json}", file=sys.stderr)
+                for k, (was, now) in clash.items():
+                    print(f"    {k}: manifest has {was!r}, "
+                          f"this run has {now!r}", file=sys.stderr)
+                print("  That directory holds a DIFFERENT experiment. "
+                      "Merging them would file one", file=sys.stderr)
+                print("  configuration's results under another's name. "
+                      "Use a new --name", file=sys.stderr)
+                print(f"  (the default, {a.arch}_img{a.image}, is already "
+                      f"unique), or --force to overwrite.", file=sys.stderr)
+                return 2
             if done or prev.get("decisions"):
                 print(f"  resuming {sweep_json}: {len(done)} finished cells, "
                       f"decisions for {sorted(prev.get('decisions', {}))}")
