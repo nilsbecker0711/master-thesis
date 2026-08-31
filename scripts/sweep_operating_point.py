@@ -234,8 +234,14 @@ def run_cell(a, cells_dir: Path, tag: str, *, loss: str, tau: float,
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
                             stderr=subprocess.STDOUT, text=True,
                             bufsize=1, cwd=str(REPO))
+    # The last lines are kept as well as echoed: a cell that dies leaves
+    # its reason in the collective log, thousands of lines from where
+    # anyone reads the manifest. sweep.json recorded only "failed".
+    tail = []
     for line in proc.stdout:
         print(line, end="")
+        tail.append(line.rstrip())
+        del tail[:-12]
     code = proc.wait()
     rec["returncode"] = code
     rec["cell_wall_clock_s"] = time.time() - t0
@@ -246,8 +252,11 @@ def run_cell(a, cells_dir: Path, tag: str, *, loss: str, tau: float,
         # failure and every decision below skips the cell rather than reading
         # a half-written result.
         rec["status"] = "failed"
-        print(f"\n  CELL FAILED (exit {code}) — continuing; "
-              f"decisions will skip it.")
+        rec["error_tail"] = tail
+        err = next((x for x in reversed(tail) if x.strip()), "")
+        print("")
+        print(f"  CELL FAILED (exit {code}): {err}")
+        print("  continuing; decisions will skip it.")
         return rec
 
     got = cell_complete(cells_dir, tag, a.arch, loss, a.image)
@@ -256,6 +265,46 @@ def run_cell(a, cells_dir: Path, tag: str, *, loss: str, tau: float,
         return rec
     rec.update({"status": "ok"}, **(read_cell(got) or {}))
     return rec
+
+
+def require(recs: list, stage: str, loss: str) -> bool:
+    r"""
+    True if the stage has something to decide from; otherwise say why, loudly.
+
+    THE STAGES ARE A CHAIN. The lr stage runs at the run length the steps
+    stage chose; the tau curve runs at the lr the lr stage chose. A stage with
+    no usable cells has not chosen anything, so continuing means running every
+    later stage against a default nobody measured -- and filing the result as
+    though it had been.
+
+    The failure that motivated this was environmental: a sweep launched with an
+    interpreter that had no mmcv, so every cell died identically. The sweep
+    printed "CHOSEN steps = 200  (no usable cells)" and moved on to the next
+    stage. On the full grid that is 132 doomed runs and a manifest of decisions
+    with nothing behind them.
+
+    Prints rather than raises, so the explanation lands in sweep.log with the
+    failures it refers to, and returns False so the caller can skip this
+    objective and try the next one.
+    """
+    if usable(recs):
+        return True
+    failed = [r for r in recs if r.get("status") == "failed"]
+    print("")
+    print(f"  STAGE '{stage}' ({loss}) PRODUCED NO USABLE CELLS "
+          f"out of {len(recs)}.")
+    if failed:
+        tail = failed[0].get("error_tail") or []
+        err = next((x for x in reversed(tail) if x.strip()), "")
+        if err:
+            print(f"  first failure: {err}")
+    print("  Nothing downstream can be measured against a decision that was "
+          "never made, so this")
+    print("  objective stops here rather than running its remaining stages "
+          "against a default.")
+    print("  Check the cell's run.log, and the interpreter named in the "
+          "banner above.")
+    return False
 
 
 def _mean(rec: dict, key: str):
@@ -628,6 +677,13 @@ def main():
               f"#  losses: {a.losses}   stages: {', '.join(stages)}   seeds/cell: {a.seeds}\n"
               f"#  csf_param {a.csf_param}   incumbent lr {a.incumbent_lr:g}   incumbent tau {a.incumbent_tau:g}   "
               f"enforce {a.enforce}" + chr(10) +
+              # EVERY CELL RUNS UNDER THIS INTERPRETER -- run_cell passes
+              # sys.executable to the child, so a sweep launched with the
+              # wrong `python` hands the wrong `python` to all 132 runs
+              # and the first cell dies inside mmcv. Printed because that
+              # failure names the missing module and never names the
+              # interpreter that was missing it.
+              f"#  python: {sys.executable}" + chr(10) +
               f"{'#' * 78}")
 
         losses = [x.strip() for x in a.losses.replace(",", " ").split()
@@ -636,6 +692,7 @@ def main():
         # run separately still reaches the cross-loss comparison.
         per_loss = {k: v for k, v in man["decisions"].items()
                     if isinstance(v, dict) and "operating_point" in v}
+        aborted: dict[str, str] = {}
 
         # THE LOSS IS AN OUTER AXIS, NOT A CELL. Each objective gets its own
         # run length, its own learning rate and its own tau curve, because the
@@ -661,6 +718,9 @@ def main():
                              enforce=a.enforce)
                         for s in parse_grid(a.steps_grid, int)]
                 if not a.dry_run:
+                    if not require(recs, "steps", loss):
+                        aborted[loss] = "steps"
+                        continue
                     d = decide_steps(recs, a.steps_tol)
                     dec["steps"] = d
                     steps = d["steps"] or steps
@@ -683,6 +743,9 @@ def main():
                     # THE SELECTION RULE LIVES IN pick_lr.py, and is invoked rather
                     # than reimplemented. Two copies of "best at equal perceptual
                     # cost" is one copy too many; its --out gives the audit trail.
+                    if not require(recs, "lr", loss):
+                        aborted[loss] = "lr"
+                        continue
                     dirs = [r["dir"] for r in usable(recs) if r.get("dir")]
                     out = root / "decisions" / f"lr_{loss}.json"
                     pr = subprocess.run(
@@ -710,6 +773,9 @@ def main():
                              tau=t, lr=lr, steps=steps, enforce=a.enforce)
                         for t in parse_grid(a.tau_grid, float)]
                 if not a.dry_run:
+                    if not require(recs, "tau", loss):
+                        aborted[loss] = "tau"
+                        continue
                     d = decide_tau_range(recs, a.tau_slack)
                     dec["tau_range"] = d
                     print(f"\n  TAU CURVE — realised/requested per rung:")
@@ -807,12 +873,20 @@ def main():
                 capture_output=True, text=True, cwd=str(REPO))
             print(idx.stdout or idx.stderr)
 
+        if aborted:
+            man["aborted"] = aborted
+            save()
+            for k, v in aborted.items():
+                print(f"\n  {k}: STOPPED at stage '{v}' — its later stages "
+                      f"were not run.")
         n_ok = sum(1 for c in man["cells"] if c.get("status") in
                    ("ok", "reused"))
         print(f"\n{'#' * 78}\n#  {n_ok}/{len(man['cells'])} cells with "
               f"results\n#  {root}/sweep.json   {root}/index.csv\n{'#' * 78}")
 
-    return 0
+    # Non-zero when any objective stopped early, so a scheduler script and a
+    # human both see a partial sweep as a failure rather than as a result.
+    return 1 if aborted else 0
 
 
 if __name__ == "__main__":
