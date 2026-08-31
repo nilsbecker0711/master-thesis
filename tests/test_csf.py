@@ -388,9 +388,12 @@ def test_shape_mask_excludes_padding_from_the_range_fit():
     if not os.path.exists("refs/cover_cut.png"):
         pytest.skip("reference image not present")
 
+    # csf_param='squash' explicitly: this test is about the MASKED
+    # visibility guarantee, which is the squash's to make. pgd bounds per bin
+    # on the full square and is refused for shaped patches for that reason.
     shaped = Patch(PatchConfig(mode="csf", size=128, scale=0.25,
                                reference="refs/cover_cut.png", shape="alpha",
-                               csf_threshold=0.25),
+                               csf_threshold=0.25, csf_param="squash"),
                    torch.device("cpu"), MEAN, STD)
     st = shaped.stats()
     assert st["visibility"] == pytest.approx(0.25, rel=0.1)
@@ -448,9 +451,105 @@ def test_tau_ladder_is_monotone_where_it_controls():
         pytest.skip("reference image not present")
     seen = []
     for tau in (0.05, 0.1, 0.25):
+        # squash: tau is an EQUALITY there, which is what a ladder asserting
+        # approx(tau) is testing. Under pgd tau is an inequality, v <= tau.
         p = Patch(PatchConfig(mode="csf", size=128, scale=0.25,
                               reference="refs/cover_cut.png", shape="alpha",
-                              csf_threshold=tau), torch.device("cpu"), MEAN, STD)
+                              csf_threshold=tau, csf_param="squash"),
+                  torch.device("cpu"), MEAN, STD)
         seen.append(p.stats()["visibility"])
         assert seen[-1] == pytest.approx(tau, rel=0.1)
     assert seen == sorted(seen)
+
+
+# ── csf_param: squash vs projected PGD ───────────────────────────────────────
+
+def _square_csf(param, tau=0.25, size=64):
+    p = Patch(PatchConfig(mode="csf", size=size, scale=0.25,
+                          csf_threshold=tau, csf_param=param),
+              torch.device("cpu"), MEAN, STD)
+    p.reference = torch.full((3, size, size), 0.5)
+    return p
+
+
+def test_pgd_starts_at_tau_so_a_ladder_still_means_something():
+    """
+    Under pgd tau is an inequality, but the init is chosen so the run STARTS
+    at the bound. If this drifts low, a tau ladder stops comparing what it
+    claims to compare.
+    """
+    for tau in (0.05, 0.1, 0.25):
+        st = _square_csf("pgd", tau).stats()
+        assert st["visibility"] == pytest.approx(tau, rel=0.1)
+
+
+def test_pgd_never_exceeds_tau_on_a_square_patch():
+    """The direction the inequality is allowed to point."""
+    for tau in (0.05, 0.25):
+        assert _square_csf("pgd", tau).stats()["visibility"] <= tau + 1e-6
+
+
+def test_frac_at_bound_is_reported_for_both_parameterisations():
+    """
+    The stat mode='csf' was missing. Without it a frozen spectral allocation is
+    invisible in the logs — resid_rms simply stops moving and nothing says why.
+    """
+    for param in ("pgd", "squash"):
+        st = _square_csf(param).stats()
+        assert {"frac_at_bound", "spend_mean"} <= set(st)
+        assert 0.0 <= st["frac_at_bound"] <= 1.0
+        assert 0.0 <= st["spend_mean"] <= 1.0
+
+
+def test_pgd_lets_a_bin_leave_the_bound():
+    """
+    THE WHOLE POINT OF THE PROJECTION. Clamping in the forward pass makes
+    saturation an absorbing state; clamping in project() leaves the gradient
+    unflattened, so a bin pushed to its budget can still come back down when
+    the loss wants it lower. Measured, not asserted from the docstring.
+    """
+    torch.manual_seed(0)
+    p = _square_csf("pgd")
+    start = p.stats()["frac_at_bound"]
+    assert start > 0.9, "init should land at the bound"
+
+    target = torch.randn(3, 64, 64) * 0.01
+    opt = torch.optim.Adam([p.param], lr=0.2, amsgrad=True)
+    for _ in range(50):
+        opt.zero_grad()
+        (p.render() - p.reference - target).pow(2).mean().backward()
+        opt.step()
+        p.project()
+    assert p.stats()["frac_at_bound"] < start - 0.1, (
+        "no bin left the bound — the allocation is frozen and the projection "
+        "is behaving like a forward clamp")
+
+
+def test_pgd_is_refused_for_shaped_patches():
+    """A silhouette moves energy between bins, so the per-bin bound stops
+    describing the pasted signal and tau overshoots in the permissive
+    direction (measured: 0.0665 against tau 0.05)."""
+    with pytest.raises(ValueError, match="square only"):
+        PatchConfig(mode="csf", shape="alpha", reference="refs/cover_cut.png",
+                    csf_param="pgd").validate()
+
+
+def test_an_unknown_csf_param_is_refused():
+    with pytest.raises(ValueError, match="csf_param"):
+        PatchConfig(mode="csf", csf_param="projected").validate()
+
+
+def test_old_checkpoints_load_as_squash(tmp_path):
+    """
+    A patch written before csf_param existed was trained under the squash and
+    its parameter means something different there. Taking the dataclass default
+    would silently reinterpret every earlier csf run.
+    """
+    p = _square_csf("squash")
+    p.save(tmp_path / "old.pt")
+    ck = torch.load(tmp_path / "old.pt")
+    del ck["config"]["csf_param"]                 # pre-field checkpoint
+    torch.save(ck, tmp_path / "old.pt")
+
+    loaded = Patch.load(tmp_path / "old.pt", torch.device("cpu"), MEAN, STD)
+    assert loaded.cfg.csf_param == "squash"

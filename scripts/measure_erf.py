@@ -70,12 +70,14 @@ def main():
     print(f" {a.arch} ({spec.bracket} attention) — ERF averaged over "
           f"{len(all_stats)} images")
     print(f"{'='*66}")
-    for k, (lo, hi, _) in enumerate(rings):
+    for k, (lo, hi, _, _) in enumerate(rings):
         vals = torch.tensor([s[k][2] for s in all_stats if k < len(s)])
-        mean_stats.append((lo, hi, float(vals.mean())))
+        nulls = torch.tensor([s[k][3] for s in all_stats if k < len(s)])
+        mean_stats.append((lo, hi, float(vals.mean()), float(nulls.mean())))
         print(f"    {lo:5d}-{hi:<5d}px : {vals.mean():6.2f}% "
-              f"+/- {vals.std():.2f}  {'#' * int(vals.mean())}")
-    below = [lo for lo, hi, r in mean_stats if r < 5.0]
+              f"+/- {vals.std():.2f}  (null {nulls.mean():5.2f}%)  "
+              f"{'#' * int(vals.mean())}")
+    below = [lo for lo, hi, r, _ in mean_stats if r < 5.0]
     if below:
         print(f"    -> below 5% at ~{below[0]}px")
 
@@ -85,8 +87,9 @@ def main():
         json.dump({"arch": a.arch, "bracket": spec.bracket,
                    "img_h": a.img_h, "img_w": a.img_w,
                    "n_images": len(all_stats), "n_probes": a.n_probes,
-                   "rings": [{"lo": lo, "hi": hi, "rate": r}
-                             for lo, hi, r in mean_stats],
+                   "rings": [{"lo": lo, "hi": hi, "rate": r,
+                              "null_rate": n}
+                             for lo, hi, r, n in mean_stats],
                    "collapse_px": below[0] if below else None,
                    "sweep": {str(k): v for k, v in sweeps.items()}}, f, indent=2)
     print(f"\n  -> {out_dir}/")

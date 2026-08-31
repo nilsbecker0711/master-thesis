@@ -260,6 +260,18 @@ def add_csf_args(p):
                         "far. >0 switches to the calibrated budget, which is "
                         "~1.9x tighter at Nyquist — measured, not estimated. "
                         "0.097 is the Cityscapes train median at centre.")
+    g.add_argument("--csf_param", default="pgd", choices=["pgd", "squash"],
+                   help="mode=csf only. How the parameter becomes a residual. "
+                        "pgd: the parameter IS the residual and every rfft bin "
+                        "is clamped to its budget after each step (phase free), "
+                        "as universal_csf has always done. squash: the original "
+                        "B(f)*Z/sqrt(1+|Z|^2) reparameterisation plus a rescale "
+                        "to exactly tau — it saturates, freezing bin magnitudes "
+                        "and leaving the optimiser only phase to rotate. Kept "
+                        "so pre-existing csf runs stay reproducible. Note the "
+                        "taus are NOT interchangeable: squash enforces tau as "
+                        "an equality, pgd as v <= tau. Compare at matched "
+                        "realised visibility.")
     g.add_argument("--csf_enforce", default="nominal",
                    choices=["nominal", "realised"],
                    help="what tau bounds. nominal: the residual we INTEND to "
@@ -423,6 +435,7 @@ def build_patch(a, device, mean_t, std_t, generator=None,
         lap_edge_thresh=a.lap_edge_thresh,
         lap_freeze_edges=a.lap_freeze_edges, init_from=a.init_from,
         csf_enforce=getattr(a, "csf_enforce", "nominal"),
+        csf_param=getattr(a, "csf_param", "pgd"),
         csf_threshold=a.csf_threshold, csf_model=a.csf_model,
         csf_beta=a.csf_beta, csf_min_cycles=a.csf_min_cycles,
         csf_pixel_size_cm=a.csf_pixel_size_cm,

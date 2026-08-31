@@ -120,6 +120,64 @@ class PatchConfig:
     #            correction -- but 'realised' is the honest one to quote.
     csf_enforce: str = "nominal"   # nominal | realised
 
+    # HOW THE PARAMETER BECOMES A RESIDUAL, and the two answers are not a
+    # style choice — one of them freezes the run.
+    #
+    # squash : the original. csf_residual() maps param through
+    #          Zhat = B(f)*Z/sqrt(1+|Z|^2), then rescales the whole thing so
+    #          pooled visibility equals tau EXACTLY.
+    # pgd    : the parameter IS the residual; every rfft bin is clamped to its
+    #          budget in project() with phase untouched, exactly as
+    #          universal_csf has done since it was written.
+    #
+    # WHY THE DEFAULT MOVED. Under the squash the residual's MAGNITUDE
+    # spectrum stops being a free variable, and it does so from either end:
+    #
+    #   large |Z| : the squash saturates. d|Zhat|/d|Z| falls off as |Z|^-3, so
+    #               past |Z| ~ 7 a bin's magnitude is pinned. residual()
+    #               documents this for universal_csf, measured — frac_at_bound
+    #               0.989 held for 200 Adam steps while the per-bin spend ratio
+    #               moved by 2e-05 — and that mode was moved to a projection
+    #               because of it.
+    #   small |Z| : the squash is approximately LINEAR (B*Z/sqrt(1+|Z|^2) ~ B*Z),
+    #               and csf_residual then rescales to exactly tau. Linear-then-
+    #               normalise is scale-INVARIANT, so the loss gradient has no
+    #               radial component, Adam's step is orthogonal to the
+    #               parameter, ||param|| grows without bound and the effective
+    #               angular step decays. The render converges to a fixed
+    #               direction and stops moving.
+    #
+    # Both ends look identical in the logs — resid_rms simply stops changing —
+    # and mode='csf' had no stat that could tell them apart, or show either one
+    # happening at all. Observed on four architectures at lr 0.2, 1000 steps,
+    # image 42: resid_rms and resid_absmax frozen to four significant figures
+    # from step ~460 (b5, deeplabv3+) and ~600 (setr), with each run's outcome
+    # decided inside the first ~120 steps. WHICH END those runs froze at was
+    # not measured — spend_mean on their checkpoints is what settles it, and it
+    # did not exist when they ran. In a toy reproduction here the squash froze
+    # at spend_mean ~ 0.01, i.e. the scale-invariance end, nowhere near
+    # saturation; do not assume the segmentation runs froze the same way.
+    #
+    # pgd removes both: there is no rescale, so the map is not scale-invariant,
+    # and the bound is a projection rather than a squash, so a bin at its
+    # budget still has a true gradient and can descend.
+    #
+    # WHAT CHANGES, and it is not free. Under 'squash' tau is an EQUALITY —
+    # the rescale drives pooled visibility to tau whatever the parameter is.
+    # Under 'pgd' the per-bin bound is the real constraint and tau becomes an
+    # INEQUALITY, v <= tau, with equality only when every bin sits at its
+    # budget. normalise_budget_to_tau() explains why both cannot hold on one
+    # envelope (a smoke test put bins at 90x their own budget trying), and the
+    # init is randn*10 so the construction-time projection lands at the bound
+    # and a run STARTS at v = tau. It can only fall from there, so a pgd run
+    # at nominal tau is <= as visible as a squash run at the same tau, never
+    # more. Compare the two at matched REALISED visibility, not matched tau.
+    #
+    # 'squash' stays reachable, and Patch.load() forces it for any checkpoint
+    # written before this field existed, so every earlier csf number keeps its
+    # meaning and can still be reproduced.
+    csf_param: str = "pgd"         # pgd | squash
+
     # ── Tsallis attack objective (--loss_fn tsallis) ─────────────────────────
     # These describe the LOSS, not the patch, and they live here for one
     # reason: attack_image() receives the Patch and nothing else that carries
@@ -145,6 +203,29 @@ class PatchConfig:
             if self.csf_enforce not in ("nominal", "realised"):
                 raise ValueError("csf_enforce must be nominal|realised, got "
                                  f"{self.csf_enforce!r}")
+        if self.mode == "csf":
+            if self.csf_param not in ("pgd", "squash"):
+                raise ValueError("csf_param must be pgd|squash, got "
+                                 f"{self.csf_param!r}")
+            if self.csf_param == "pgd" and self.shape != "square":
+                # The same objection universal_csf raises below, and it is not
+                # theoretical: this was caught by test_tau_ladder, which
+                # measured 0.0665 against a tau of 0.05 — a 33% OVERSHOOT, in
+                # the permissive direction.
+                #
+                # pgd bounds each rfft bin of the FULL SQUARE. Masking a
+                # silhouette is a multiplication in pixel space and therefore a
+                # convolution in frequency: the pasted signal has a spectrum
+                # the per-bin bound never described, and pooled visibility can
+                # land above tau. The squash does not have this problem because
+                # csf_residual normalises the MASKED residual's visibility
+                # directly, so it bounds the thing the observer actually sees
+                # whatever the mask does to the spectrum.
+                raise ValueError(
+                    "csf_param='pgd' supports --shape square only; the "
+                    "spectral bound is defined on the full footprint and a "
+                    "silhouette moves energy between bins, overshooting tau. "
+                    "Use --csf_param squash for shaped patches.")
         if self.mode == "universal_csf":
             if self.csf_composite not in ("clip", "fit"):
                 raise ValueError("csf_composite must be clip|fit, got "
@@ -228,14 +309,40 @@ class Patch:
                 budget, self._csf_values, c.csf_threshold, c.csf_beta,
                 self._contrast_scale)
         if self.cfg.mode == "csf":
-            self._csf_values, self._csf_budget = csf_mod.patch_budget(
-                c_size := self.cfg.size,
+            self._contrast_scale = csf_mod.CONTRAST_SCALE
+            # THE THRESHOLD GOES IN EXACTLY ONE PLACE, and which place depends
+            # on the parameterisation.
+            #
+            # squash : patch_budget carries tau, so B(f) = tau/(cs*CSF(f)) and
+            #          each bin alone is tau JND. Pooled visibility over ~8k
+            #          bins x 3 channels is far above tau, which is fine there
+            #          because csf_residual's global rescale sets the pooled
+            #          figure afterwards.
+            # pgd    : there is no rescale to correct it, so the envelope
+            #          itself must be the thing that pools to tau. Build it at
+            #          tau = 1 and hand the real tau to normalise_budget_to_tau,
+            #          exactly as universal_csf does above. Passing
+            #          csf_threshold to BOTH would apply it twice and quietly
+            #          square the budget.
+            tau_here = (1.0 if self.cfg.csf_param == "pgd"
+                        else self.cfg.csf_threshold)
+            self._csf_values, budget = csf_mod.patch_budget(
+                self.cfg.size,
                 csf_mod.ViewingGeometry(self.cfg.csf_pixel_size_cm,
                                         self.cfg.csf_viewing_distance_cm),
-                self.cfg.csf_model, self.cfg.csf_threshold,
+                self.cfg.csf_model, tau_here,
                 self.cfg.csf_min_cycles, device=self.device)
+            self._csf_budget = (
+                csf_mod.normalise_budget_to_tau(
+                    budget, self._csf_values, self.cfg.csf_threshold,
+                    self.cfg.csf_beta, self._contrast_scale)
+                if self.cfg.csf_param == "pgd" else budget)
         self.param = self._init_param()
-        if self.cfg.mode == "universal_csf":
+        if self.cfg.mode == "universal_csf" or (
+                self.cfg.mode == "csf" and self.cfg.csf_param == "pgd"):
+            # Once at construction, so the FIRST forward pass is already inside
+            # the constraint set rather than one step behind it — and so that
+            # describe() reports the visibility the run actually starts at.
             self._project_spectrum()
 
     # ── construction ─────────────────────────────────────────────────────────
@@ -292,10 +399,21 @@ class Patch:
                     ).requires_grad_(True)
 
         if c.mode == "csf":
-            # NOT zeros. csf_residual normalises to exactly tau, so a zero raw
-            # tensor is 0/0 with an undefined gradient. The reparameterisation
-            # is scale-invariant, so only the SHAPE of this init matters and
-            # its magnitude is irrelevant.
+            if c.csf_param == "pgd":
+                # Large, for the reason universal_csf gives above: the
+                # construction-time projection then lands AT the budget on
+                # every live bin, so pooled visibility starts at exactly tau
+                # and a tau ladder means at step 0 what it means at step 1000.
+                # Starting far below would under-report tau for as long as the
+                # run took to climb there. randn*10 puts |Z| ~ 10/size per bin
+                # against a normalised budget of order 1e-5..1e-3, so the clamp
+                # binds everywhere.
+                return (torch.randn(3, c.size, c.size, device=self.device)
+                        * 10.0).requires_grad_(True)
+            # squash: NOT zeros. csf_residual normalises to exactly tau, so a
+            # zero raw tensor is 0/0 with an undefined gradient. That
+            # reparameterisation is scale-invariant, so only the SHAPE of this
+            # init matters and its magnitude is irrelevant.
             return torch.randn(3, c.size, c.size,
                                device=self.device).requires_grad_(True)
 
@@ -359,9 +477,17 @@ class Patch:
             base = (self.reference if self.reference is not None
                     else torch.full((3, c.size, c.size), 0.5,
                                     device=self.device))
-            d = csf_mod.csf_residual(self.param.unsqueeze(0), self._csf_budget,
-                                     self._csf_values, c.csf_threshold,
-                                     c.csf_beta, mask=self.shape_mask)
+            if c.csf_param == "pgd":
+                # THE PARAMETER IS THE RESIDUAL. No squash, no rescale, no
+                # projection inside the graph — see project(), which is where
+                # the constraint is applied, and residual() above for the
+                # measurement that says why it cannot live here instead.
+                d = self.param.unsqueeze(0)
+            else:
+                d = csf_mod.csf_residual(
+                    self.param.unsqueeze(0), self._csf_budget,
+                    self._csf_values, c.csf_threshold,
+                    c.csf_beta, mask=self.shape_mask)
             d = csf_mod.fit_to_range(d, base.unsqueeze(0),
                                      mask=self.shape_mask)
             if c.csf_enforce == "realised":
@@ -586,7 +712,12 @@ class Patch:
                 self.param.data.clamp_(-self.cfg.latent_clip,
                                        self.cfg.latent_clip)
             elif self.cfg.mode == "csf":
-                pass          # scale-invariant reparameterisation; nothing to clip
+                if self.cfg.csf_param == "pgd":
+                    self._project_spectrum()
+                # squash: scale-invariant reparameterisation, nothing to clip.
+                # It is also why that path freezes — the squash bounds the bin
+                # instead, and does it with a vanishing gradient. See
+                # PatchConfig.csf_param.
             elif self.cfg.mode == "universal_csf":
                 # PROJECTED GRADIENT DESCENT, and the projection is on the
                 # PARAMETER -- the tensor the optimiser owns -- not on a render
@@ -620,6 +751,45 @@ class Patch:
             ((scale < 1.0) & (self._csf_budget > 0)).float().mean())
         self.param.data = torch.fft.irfft2(
             spec * scale, s=self.param.shape[-2:], norm="forward")
+
+    @torch.no_grad()
+    def _spectral_occupancy(self, eps: float = 1e-12) -> Tuple[float, float]:
+        r"""
+        How much of the per-bin budget the current residual actually spends.
+
+        Returns (frac_at_bound, spend_mean) over LIVE bins — those with a
+        non-zero budget; the sub-min_cycles band is zeroed by construction and
+        would otherwise dilute both figures toward nothing.
+
+        The ratio is |Zhat(f)| / B(f), and it is defined for BOTH
+        parameterisations so a squash run and a pgd run are directly
+        comparable:
+
+            pgd    : Zhat = clamp(Z), so the ratio is min(|Z|/B, 1) and
+                     reaches 1 only where project() actually bit.
+            squash : Zhat = B*Z/sqrt(1+|Z|^2), so the ratio is
+                     |Z|/sqrt(1+|Z|^2) — independent of B, and >= 0.99 once
+                     |Z| >= 7.02, which is where d|Zhat|/d|Z| has already
+                     fallen by ~350x and the bin is effectively frozen.
+
+        THIS IS THE STAT THAT WAS MISSING. universal_csf has reported
+        frac_at_bound since it was written and that is how its saturation was
+        caught; mode='csf' ran the same risk with no instrument, so four
+        architectures froze mid-run and the logs showed only that resid_rms had
+        stopped moving. frac_at_bound -> 1 with spend_mean -> 1 means the
+        spectral allocation is no longer a free variable and the optimiser is
+        only rotating phase.
+        """
+        spec = torch.fft.rfft2(self.param.detach(), norm="forward")
+        mag = spec.abs()
+        if self.cfg.csf_param == "pgd":
+            ratio = (mag / self._csf_budget.clamp(min=eps)).clamp(max=1.0)
+        else:
+            ratio = mag / (1.0 + mag.pow(2)).sqrt()
+        live = (self._csf_budget > 0).expand_as(ratio)
+        n = live.sum().clamp(min=1)
+        return (float(((ratio >= 0.99) & live).sum() / n),
+                float((ratio * live).sum() / n))
 
     def active_mask(self) -> Optional[torch.Tensor]:
         r"""
@@ -728,13 +898,20 @@ class Patch:
                 self._csf_values, beta=self.cfg.csf_beta,
                 contrast_scale=csf_mod.local_contrast_scale(
                     base.unsqueeze(0), self.shape_mask)))
+            frac_at_bound, spend_mean = self._spectral_occupancy()
             return {"visibility": float(csf_mod.realised_visibility(
                         rendered.unsqueeze(0), base.unsqueeze(0),
                         self._csf_values, self.cfg.csf_beta,
                         mask=self.shape_mask)),
                     "visibility_local": vis_local,
                     "resid_rms": float(dd.pow(2).mean().sqrt()),
-                    "resid_absmax": float(dd.abs().max())}
+                    "resid_absmax": float(dd.abs().max()),
+                    # climbing toward 1 means every bin sits on its bound and
+                    # the run is only re-phasing, not reallocating — the same
+                    # early warning universal_csf has always had, and the one
+                    # mode='csf' was missing while it froze.
+                    "frac_at_bound": frac_at_bound,
+                    "spend_mean": spend_mean}
         px = torch.sigmoid(self.param)
         lim = self.cfg.logit_clip if self.cfg.logit_clip > 0 else 12.0
         return {"pixel_std": px.std().item(),
@@ -758,7 +935,17 @@ class Patch:
     @classmethod
     def load(cls, path, device, mean_t, std_t, generator=None):
         ck = torch.load(path, map_location="cpu")
-        cfg = PatchConfig(**ck["config"])
+        saved = dict(ck["config"])
+        # PROVENANCE, not tidiness. csf_param defaults to 'pgd', but every
+        # checkpoint written before the field existed was produced under the
+        # squash, and its parameter means something different: the same tensor
+        # renders as a squashed-and-rescaled residual there and as a raw one
+        # here. Taking the dataclass default would silently reinterpret every
+        # earlier csf patch and the drop it reports would not be the drop it
+        # was trained to.
+        if saved.get("mode") == "csf" and "csf_param" not in saved:
+            saved["csf_param"] = "squash"
+        cfg = PatchConfig(**saved)
         cfg.init_from = None                     # param comes from the file
         obj = cls(cfg, device, mean_t, std_t, generator)
         obj.param = ck["param"].to(device).clone().requires_grad_(True)
@@ -790,10 +977,24 @@ class Patch:
             log(f"[patch] top-left  : ({top}, {left})  {d:.0f}px from centre")
         if c.mode == "csf":
             st = self.stats()
+            rel = "==" if c.csf_param == "squash" else "<="
             log(f"[patch] CSF       : {c.csf_model} tau={c.csf_threshold:g} "
                 f"requested -> {st['visibility']:.4f} realised   "
                 f"(residual rms {st['resid_rms']:.5f}, "
                 f"max {st['resid_absmax']:.4f})")
+            log(f"[patch] CSF param : {c.csf_param}  "
+                f"(tau {rel} requested; bins at bound "
+                f"{100*st['frac_at_bound']:.1f}%, mean spend "
+                f"{st['spend_mean']:.3f})")
+            if c.csf_param == "squash":
+                log("          NOTE: under the squash the magnitude spectrum "
+                    "stops being a free variable from")
+                log("          EITHER end — saturation (spend -> 1, the "
+                    "squash flattens) or scale-invariance")
+                log("          (spend -> 0, the rescale to exactly tau makes "
+                    "||param|| irrelevant). Watch")
+                log("          spend_mean to see which. --csf_param pgd "
+                    "removes both.")
             frac = st["visibility"] / max(c.csf_threshold, 1e-12)
             if frac < 0.5:
                 # The failure this exists to prevent: a five-epoch run whose
