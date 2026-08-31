@@ -49,15 +49,54 @@ from statistics import mean
 VISIBILITY_KEYS = ("final_visibility_local", "final_visibility")
 
 
-def load(run_dir: Path):
+def _read(run_dir: Path):
+    r"""
+    (config, records) from any of the THREE layouts that produce tuning runs.
+
+    This existed for overfit_population.py only, and silently skipped every
+    other producer -- the "no summary.json / no records" branch fired on all of
+    them. overfit.py's own docstring says "analysis/pick_lr.py globs for them",
+    which was not true of either of its layouts:
+
+      population    summary.json {config, records}          <- the original
+      overfit n=1   results.json {config, seed, **record}   <- no summary at all
+      overfit n>1   summary.json {n_seeds, per_seed, stats} <- no config key,
+                                                                no records key
+
+    Normalising here rather than at three call sites keeps ONE selection rule.
+    The rule is the whole point of the script: picking at equal perceptual cost
+    rather than argmax, and a second reader would be a second place for that to
+    drift.
+    """
     s = run_dir / "summary.json"
-    if not s.exists():
+    if s.exists():
+        d = json.loads(s.read_text())
+        if d.get("records"):                       # population
+            return d.get("config", {}), d["records"]
+        if d.get("per_seed"):                      # overfit, repeated
+            # The seed rows carry the metrics but no config -- that lives in
+            # each repeat's own results.json, so take it from the first one.
+            cfg = {}
+            for sub in sorted(run_dir.glob("seed*/results.json")):
+                cfg = json.loads(sub.read_text()).get("config", {})
+                break
+            return cfg, d["per_seed"]
         return None
-    d = json.loads(s.read_text())
-    cfg = d.get("config", {})
-    recs = d.get("records", [])
+    r = run_dir / "results.json"                   # overfit, single seed
+    if r.exists():
+        d = json.loads(r.read_text())
+        return d.get("config", {}), [d]
+    return None
+
+
+def load(run_dir: Path):
+    got = _read(run_dir)
+    if got is None:
+        return None
+    cfg, recs = got
     if not recs:
         return None
+    d = {"config": cfg, "records": recs}
 
     vis_key = next((k for k in VISIBILITY_KEYS
                     if any(r.get(k) is not None for r in recs)), None)
@@ -69,6 +108,43 @@ def load(run_dir: Path):
             "n": len(recs), "vis_key": vis_key, "visibility": vis}, d
 
 
+def _write(out, best, rows, eligible, a, *, edge: bool, fell_back: bool):
+    """
+    Persist the decision. No-op without --out, so the stdout contract is
+    unchanged for anything already capturing it.
+
+    The chosen lr otherwise exists ONLY on stdout, which means the number
+    behind a headline result survives as terminal scrollback and nothing else.
+    The candidate table goes in too, so the choice can be audited later without
+    re-running the sweep.
+    """
+    if out is None:
+        return
+    out = Path(out)
+    if out.parent != Path(""):
+        out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(json.dumps({
+        "lr": best["lr"],
+        "metric": a.metric,
+        "ceiling": a.ceiling,
+        "chosen_run": str(best["dir"]),
+        "score": best.get("score"),
+        "visibility": best["visibility"],
+        "visibility_key": best["vis_key"],
+        # True means the grid stopped at the answer, so the answer IS the grid.
+        "at_grid_edge": edge,
+        # True means NOTHING met the ceiling and this is the least-visible run
+        # rather than the best one. A caller that ignores this is quoting a
+        # fallback as if it were a choice.
+        "fell_back_to_least_visible": fell_back,
+        "n_eligible": len(eligible),
+        "candidates": [{"lr": r["lr"], "score": r.get("score"),
+                        "visibility": r["visibility"], "n": r["n"],
+                        "run": r["dir"].name} for r in rows],
+    }, indent=2))
+    print(f"  written: {out}", file=sys.stderr)
+
+
 def main():
     p = argparse.ArgumentParser(description="Pick a learning rate from tuning runs")
     p.add_argument("runs", nargs="+", type=Path)
@@ -77,6 +153,11 @@ def main():
                    help="max acceptable mean realised visibility, in JND. 1.0 "
                         "is the detection threshold. Ignored for modes that "
                         "record no visibility.")
+    p.add_argument("--out", type=Path, default=None,
+                   help="also write the decision to this JSON file: the lr, the "
+                        "ceiling it was judged against, the full candidate "
+                        "table, and whether it landed at a grid edge or fell "
+                        "back. Without this the answer exists only on stdout.")
     p.add_argument("--default", type=float, default=None,
                    help="printed if nothing can be read at all, so an "
                         "overnight script still has a usable value")
@@ -86,7 +167,8 @@ def main():
     for d in a.runs:
         got = load(d)
         if got is None:
-            print(f"  skip {d} (no summary.json / no records)", file=sys.stderr)
+            print(f"  skip {d} (no results.json/summary.json, or no records)",
+                  file=sys.stderr)
             continue
         meta, full = got
         vals = [r[a.metric] for r in full.get("records", [])
@@ -125,6 +207,7 @@ def main():
               f"{best_vis['visibility']:.3f}) — but the right fix is a lower\n"
               f"  --csf_threshold, not a different learning rate.",
               file=sys.stderr)
+        _write(a.out, best_vis, rows, [], a, edge=False, fell_back=True)
         print(best_vis["lr"])
         return 1
 
@@ -133,6 +216,18 @@ def main():
     print(f"\n  chosen: lr={best['lr']:g}  ({a.metric} {best['score']:.2f}, "
           f"visibility {vis})  from {len(eligible)}/{len(rows)} eligible",
           file=sys.stderr)
+
+    # AT AN EDGE OF THE GRID the answer is where the grid stopped, not an
+    # optimum, and the two are indistinguishable from the chosen number alone.
+    # Said here because this is the last place anyone looks before quoting it.
+    edge = len(rows) > 1 and best["lr"] in (rows[0]["lr"], rows[-1]["lr"])
+    if edge:
+        which = "LOWEST" if best["lr"] == rows[0]["lr"] else "HIGHEST"
+        print(f"  WARNING: that is the {which} lr tested, so the sweep is "
+              f"truncated.\n           Extend the grid past {best['lr']:g} and "
+              f"re-run before quoting it as best.", file=sys.stderr)
+
+    _write(a.out, best, rows, eligible, a, edge=edge, fell_back=False)
     print(best["lr"])
     return 0
 

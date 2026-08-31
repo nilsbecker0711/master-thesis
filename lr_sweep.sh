@@ -1,7 +1,7 @@
 #!/bin/bash
 #SBATCH -p accelerated
 #SBATCH -n 1
-#SBATCH -t 02:00:00
+#SBATCH -t 04:00:00
 #SBATCH --mem=40000
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=16
@@ -21,21 +21,38 @@
 # ranking that depends on which checkpoint you read is not a measurement of
 # architecture, it is a measurement of the optimiser. This sweep separates them.
 #
-# ── THE LR RANGE IS CENTRED ON 0.01, NOT 0.2 ────────────────────────────────
-# --csf_param pgd (the new default) changes what the parameter IS. Under the
-# old squash the parameter was a DIRECTION -- the render renormalised to
-# exactly tau, so scaling the parameter 1000x moved the patch by 7.5% -- and
-# lr set how fast that direction rotated. Under pgd the parameter IS the
-# residual, in pixel units, with rms ~0.027 at tau 0.25. An Adam step of 0.2
-# per coordinate is then ~7x the entire parameter every step: it overshoots the
-# constraint ball and the projection throws the overshoot away.
+# ── THE RANGE SPANS 0.001 TO 1.0, AND WHY IT IS NOT CENTRED ON 0.2 ──────────
+# The 0.2 that produced the +54.54 on segformer_b0 was measured under the
+# SQUASH, where the parameter is a DIRECTION: the render renormalises to
+# exactly tau, so the parameter's magnitude is meaningless and lr sets how fast
+# that direction rotates. Measured here at tau 0.25, size 128:
 #
-# 0.01 is what universal_csf.sh already uses for this exact parameterisation.
-# The sweep brackets it by a decade either side.
+#     squash : param rms 0.9939  ->  an Adam step of 0.2 is 0.2x the
+#                                    per-coordinate magnitude. A 20% step.
+#     pgd    : param rms 0.0272  ->  an Adam step of 0.2 is 7.4x it.
+#
+# So the SCALE-EQUIVALENT of squash's 0.2 under pgd is 0.2 * 0.0272/0.9939
+# ~= 0.0055, and 0.01 is what universal_csf.sh already uses for this same
+# parameterisation. That is why the range is centred where it is.
+#
+# BUT THE RANGE STILL RUNS TO 1.0, DELIBERATELY. "lr so large that every step
+# overshoots the constraint set and is clipped back" is not obviously wrong for
+# an adversarial attack -- it is bang-bang descent against the boundary, which
+# is what classical PGD attacks do with sign(grad) steps at the epsilon ball,
+# and they work. The scale argument says the equivalent lr is ~0.005; it does
+# not say the loss landscape in residual space has its optimum in the same
+# place as in direction space. That is an experiment, not a deduction, so the
+# sweep is built so it cannot foreclose the answer.
+#
+# IF THE WINNER LANDS AT EITHER EDGE (0.001 or 1.0) THE SWEEP IS TRUNCATED and
+# the number is an artifact of where the grid stopped -- extend it and re-run.
+# The same failure as reading a 400-step run that had not converged.
 #
 # ── SMOKE FIRST ─────────────────────────────────────────────────────────────
 #     MODE=smoke sbatch lr_sweep.sh     # 8 short runs, checks plumbing only
-#     MODE=full  sbatch lr_sweep.sh     # the real sweep, ~100 min
+#     MODE=full  sbatch lr_sweep.sh     # the real sweep: 4 archs x 7 lrs = 28
+#                                       # runs. --no_diagnostics drops the
+#                                       # expensive part, so ~2-3 min each.
 
 echo "Running on $(hostname)"
 echo "Date: $(date)"
@@ -54,7 +71,7 @@ MODE="${MODE:-smoke}"
 IMAGE="${IMAGE:-42}"
 
 if [ "$MODE" = "full" ]; then
-    STEPS=1000; LRS="0.001 0.003 0.01 0.03 0.1"
+    STEPS=1000; LRS="0.001 0.003 0.01 0.03 0.1 0.3 1.0"
     ARCHS="segformer_b0 segformer_b5 deeplabv3plus_r101 setr_pup"
 else
     STEPS=40;   LRS="0.01 0.1"
@@ -99,4 +116,8 @@ for ARCH in $ARCHS; do
   echo "    python analysis/pick_lr.py results/lr_sweep/${ARCH}_*  \\"
   echo "        --metric best_drop_remote --ceiling 0.25"
 done
+echo ""
+echo "  If a chosen lr is 0.001 or 1.0 -- an EDGE of the grid -- the sweep is"
+echo "  truncated and that number is where the grid stopped, not an optimum."
+echo "  Extend LRS in this script and re-run that arch."
 echo "=============================================================="
