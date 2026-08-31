@@ -68,6 +68,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import subprocess
 import sys
 import time
@@ -234,8 +235,14 @@ def run_cell(a, cells_dir: Path, tag: str, *, loss: str, tau: float,
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
                             stderr=subprocess.STDOUT, text=True,
                             bufsize=1, cwd=str(REPO))
+    # The last lines are kept as well as echoed: a cell that dies leaves
+    # its reason in the collective log, thousands of lines from where
+    # anyone reads the manifest. sweep.json recorded only "failed".
+    tail = []
     for line in proc.stdout:
         print(line, end="")
+        tail.append(line.rstrip())
+        del tail[:-12]
     code = proc.wait()
     rec["returncode"] = code
     rec["cell_wall_clock_s"] = time.time() - t0
@@ -246,8 +253,11 @@ def run_cell(a, cells_dir: Path, tag: str, *, loss: str, tau: float,
         # failure and every decision below skips the cell rather than reading
         # a half-written result.
         rec["status"] = "failed"
-        print(f"\n  CELL FAILED (exit {code}) — continuing; "
-              f"decisions will skip it.")
+        rec["error_tail"] = tail
+        err = next((x for x in reversed(tail) if x.strip()), "")
+        print("")
+        print(f"  CELL FAILED (exit {code}): {err}")
+        print("  continuing; decisions will skip it.")
         return rec
 
     got = cell_complete(cells_dir, tag, a.arch, loss, a.image)
@@ -256,6 +266,46 @@ def run_cell(a, cells_dir: Path, tag: str, *, loss: str, tau: float,
         return rec
     rec.update({"status": "ok"}, **(read_cell(got) or {}))
     return rec
+
+
+def require(recs: list, stage: str, loss: str) -> bool:
+    r"""
+    True if the stage has something to decide from; otherwise say why, loudly.
+
+    THE STAGES ARE A CHAIN. The lr stage runs at the run length the steps
+    stage chose; the tau curve runs at the lr the lr stage chose. A stage with
+    no usable cells has not chosen anything, so continuing means running every
+    later stage against a default nobody measured -- and filing the result as
+    though it had been.
+
+    The failure that motivated this was environmental: a sweep launched with an
+    interpreter that had no mmcv, so every cell died identically. The sweep
+    printed "CHOSEN steps = 200  (no usable cells)" and moved on to the next
+    stage. On the full grid that is 132 doomed runs and a manifest of decisions
+    with nothing behind them.
+
+    Prints rather than raises, so the explanation lands in sweep.log with the
+    failures it refers to, and returns False so the caller can skip this
+    objective and try the next one.
+    """
+    if usable(recs):
+        return True
+    failed = [r for r in recs if r.get("status") == "failed"]
+    print("")
+    print(f"  STAGE '{stage}' ({loss}) PRODUCED NO USABLE CELLS "
+          f"out of {len(recs)}.")
+    if failed:
+        tail = failed[0].get("error_tail") or []
+        err = next((x for x in reversed(tail) if x.strip()), "")
+        if err:
+            print(f"  first failure: {err}")
+    print("  Nothing downstream can be measured against a decision that was "
+          "never made, so this")
+    print("  objective stops here rather than running its remaining stages "
+          "against a default.")
+    print("  Check the cell's run.log, and the interpreter named in the "
+          "banner above.")
+    return False
 
 
 def _mean(rec: dict, key: str):
@@ -520,10 +570,34 @@ def main():
         a.incumbent_lr = INCUMBENT_LR[a.csf_param]
 
     name = a.name or f"{a.arch}_img{a.image}"
-    root = Path(a.out_root) / name
+    # ABSOLUTE. This process resolves the sweep tree against ITS working
+    # directory, then launches overfit.py with cwd=REPO; a relative --out_root
+    # therefore means two different places whenever the sweep is submitted from
+    # anywhere but the repo root, which on a scheduler is the normal case.
+    # Absolute paths make parent and child agree by construction, and survive
+    # anything that changes the working directory mid-run.
+    root = (Path(a.out_root) / name).resolve()
     cells = root / "cells"
-    cells.mkdir(parents=True, exist_ok=True)
-    (root / "decisions").mkdir(exist_ok=True)
+
+    # FAIL AT SECOND ZERO, NOT AT MINUTE THIRTY. The tree is written to
+    # throughout the sweep but was only first written after the opening cell
+    # had already run, so an unwritable output directory -- a full quota, a
+    # stale mount, a workspace that expired since the last job -- cost a GPU
+    # allocation before it was noticed. One probe file says the same thing
+    # immediately.
+    try:
+        cells.mkdir(parents=True, exist_ok=True)
+        (root / "decisions").mkdir(exist_ok=True)
+        probe = root / ".writable"
+        probe.write_text("ok")
+        probe.unlink()
+    except OSError as e:
+        print(f"  CANNOT WRITE TO {root}", file=sys.stderr)
+        print(f"    {e}", file=sys.stderr)
+        print("  Nothing has run. Check the workspace exists, is mounted on "
+              "this node,", file=sys.stderr)
+        print("  and is within quota.", file=sys.stderr)
+        return 2
 
     stages = [s.strip() for s in a.stages.split(",") if s.strip()]
 
@@ -586,7 +660,27 @@ def main():
            "decisions": prev.get("decisions", {})}
 
     def save():
-        (root / "sweep.json").write_text(json.dumps(man, indent=2))
+        # WRITE-THEN-RENAME, because several jobs may share this directory:
+        # splitting the lr stage across the cluster means N processes with one
+        # --name, each rewriting the manifest as its cell finishes. A
+        # half-written file is survivable -- the CELLS on disk are what resume
+        # actually needs -- but it would discard every decision recorded so
+        # far. os.replace is atomic on POSIX and on Windows.
+        # A MANIFEST FAILURE MUST NOT KILL THE SWEEP. The cells are the
+        # expensive part and they are already on disk; cell_complete() finds
+        # them again without this file. Losing the manifest costs the
+        # decisions, which are cheap to recompute -- losing the run costs GPU
+        # hours. Previously an OSError here propagated out of cell() and ended
+        # the job one cell after a transient filesystem error.
+        try:
+            tmp = root / "sweep.json.tmp"
+            tmp.write_text(json.dumps(man, indent=2))
+            os.replace(tmp, root / "sweep.json")
+        except OSError as e:
+            print(f"  WARNING: could not write the manifest ({e}).",
+                  file=sys.stderr)
+            print(f"           The cells are unaffected and remain readable "
+                  f"from {cells}.", file=sys.stderr)
 
     # THE STAGES OVERLAP, AND WITHOUT THIS THE OVERLAP IS PAID FOR. The star's
     # centre lies on every stage that passes through it -- (tau 0.25, lr*,
@@ -628,6 +722,13 @@ def main():
               f"#  losses: {a.losses}   stages: {', '.join(stages)}   seeds/cell: {a.seeds}\n"
               f"#  csf_param {a.csf_param}   incumbent lr {a.incumbent_lr:g}   incumbent tau {a.incumbent_tau:g}   "
               f"enforce {a.enforce}" + chr(10) +
+              # EVERY CELL RUNS UNDER THIS INTERPRETER -- run_cell passes
+              # sys.executable to the child, so a sweep launched with the
+              # wrong `python` hands the wrong `python` to all 132 runs
+              # and the first cell dies inside mmcv. Printed because that
+              # failure names the missing module and never names the
+              # interpreter that was missing it.
+              f"#  python: {sys.executable}" + chr(10) +
               f"{'#' * 78}")
 
         losses = [x.strip() for x in a.losses.replace(",", " ").split()
@@ -636,6 +737,7 @@ def main():
         # run separately still reaches the cross-loss comparison.
         per_loss = {k: v for k, v in man["decisions"].items()
                     if isinstance(v, dict) and "operating_point" in v}
+        aborted: dict[str, str] = {}
 
         # THE LOSS IS AN OUTER AXIS, NOT A CELL. Each objective gets its own
         # run length, its own learning rate and its own tau curve, because the
@@ -647,10 +749,31 @@ def main():
         # single lr that lr_sweep.sh was written to undo.
         for loss in losses:
             print(f"\n{'*' * 78}\n*  LOSS {loss}\n{'*' * 78}")
-            dec = {}
+            # Reuse this loss's existing block rather than replacing it, so a
+            # stage that ran in an earlier job survives into this one.
+            dec = man["decisions"].get(loss) or {}
             man["decisions"][loss] = dec
             steps = int(parse_grid(a.steps_grid, int)[-1])
             lr = a.incumbent_lr
+
+            # STORED IS NOT THE SAME AS USED. The manifest already carried the
+            # chosen run length and learning rate across invocations, but the
+            # stage loop re-derived both from the incumbent every time -- so a
+            # job launched as --stages tau swept tau at the INCUMBENT lr while
+            # the manifest sat there recording a different one. That surfaces
+            # three stages later, as a curve measured at a learning rate
+            # nothing chose.
+            #
+            # This is what makes the sweep splittable across jobs at all. The
+            # big architectures do not fit one walltime, so --stages steps,
+            # then --stages lr, then --stages tau,grid,enforce has to carry its
+            # answers forward exactly as one long job would.
+            if (dec.get("steps") or {}).get("steps"):
+                steps = dec["steps"]["steps"]
+                print(f"  [resume] steps = {steps} (decided by an earlier job)")
+            if (dec.get("lr") or {}).get("lr") is not None:
+                lr = dec["lr"]["lr"]
+                print(f"  [resume] lr = {lr:g} (decided by an earlier job)")
 
             # ── stage 1: run length ─────────────────────────────────────────────
             if "steps" in stages:
@@ -661,6 +784,9 @@ def main():
                              enforce=a.enforce)
                         for s in parse_grid(a.steps_grid, int)]
                 if not a.dry_run:
+                    if not require(recs, "steps", loss):
+                        aborted[loss] = "steps"
+                        continue
                     d = decide_steps(recs, a.steps_tol)
                     dec["steps"] = d
                     steps = d["steps"] or steps
@@ -683,6 +809,9 @@ def main():
                     # THE SELECTION RULE LIVES IN pick_lr.py, and is invoked rather
                     # than reimplemented. Two copies of "best at equal perceptual
                     # cost" is one copy too many; its --out gives the audit trail.
+                    if not require(recs, "lr", loss):
+                        aborted[loss] = "lr"
+                        continue
                     dirs = [r["dir"] for r in usable(recs) if r.get("dir")]
                     out = root / "decisions" / f"lr_{loss}.json"
                     pr = subprocess.run(
@@ -710,6 +839,9 @@ def main():
                              tau=t, lr=lr, steps=steps, enforce=a.enforce)
                         for t in parse_grid(a.tau_grid, float)]
                 if not a.dry_run:
+                    if not require(recs, "tau", loss):
+                        aborted[loss] = "tau"
+                        continue
                     d = decide_tau_range(recs, a.tau_slack)
                     dec["tau_range"] = d
                     print(f"\n  TAU CURVE — realised/requested per rung:")
@@ -807,12 +939,20 @@ def main():
                 capture_output=True, text=True, cwd=str(REPO))
             print(idx.stdout or idx.stderr)
 
+        if aborted:
+            man["aborted"] = aborted
+            save()
+            for k, v in aborted.items():
+                print(f"\n  {k}: STOPPED at stage '{v}' — its later stages "
+                      f"were not run.")
         n_ok = sum(1 for c in man["cells"] if c.get("status") in
                    ("ok", "reused"))
         print(f"\n{'#' * 78}\n#  {n_ok}/{len(man['cells'])} cells with "
               f"results\n#  {root}/sweep.json   {root}/index.csv\n{'#' * 78}")
 
-    return 0
+    # Non-zero when any objective stopped early, so a scheduler script and a
+    # human both see a partial sweep as a failure rather than as a result.
+    return 1 if aborted else 0
 
 
 if __name__ == "__main__":
