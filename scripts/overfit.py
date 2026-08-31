@@ -33,6 +33,7 @@ from __future__ import annotations
 import argparse
 import json
 import statistics
+import time
 from pathlib import Path
 
 import torch
@@ -44,7 +45,8 @@ from patchreach.data.cityscapes import CityscapesSeg, norm_tensors, upsample_to
 from patchreach.diagnostics import report
 from patchreach.patch import optimise, segmentation_cam
 from patchreach.patch.lap import magnitude_report
-from patchreach.utils import get_device, seed_everything, increment_path
+from patchreach.utils import (get_device, seed_everything, increment_path,
+                             tee_output)
 
 
 # The keys a repeat run aggregates. Deliberately a FIXED list rather than
@@ -62,7 +64,8 @@ AGGREGATE_KEYS = ("drop_remote", "drop_all", "best_drop_remote",
                   # report whether its spectral allocation had frozen, which is
                   # the one number that distinguishes a converged run from a
                   # stalled one.
-                  "final_frac_at_bound", "final_spend_mean")
+                  "final_frac_at_bound", "final_spend_mean",
+                  "wall_clock_s")
 
 
 def run_one(a, seed: int, model, img, label, device, mean_t, std_t, G,
@@ -82,6 +85,7 @@ def run_one(a, seed: int, model, img, label, device, mean_t, std_t, G,
     sources of spread together rather than pretending to control either.
     """
     seed_everything(seed)
+    t0 = time.time()
     patch = build_patch(a, device, mean_t, std_t, generator=G)
 
     # ORDERING: clean forward -> resolve_placement -> first apply().
@@ -143,6 +147,11 @@ def run_one(a, seed: int, model, img, label, device, mean_t, std_t, G,
         patched, fp = patch.apply(img)
         adv_logits = upsample_to(model(patched), label.shape[-2:])
 
+    # COST IS PART OF THE RESULT for a per-image attack: the whole trade
+    # against a universal patch is strength bought with per-image compute,
+    # and analysis/build_index.py has carried a wall_clock_s column since it
+    # was written -- empty on every overfit run until now.
+    res["wall_clock_s"] = time.time() - t0
     out = {"config": vars(a), "seed": seed, **res}
     if patch.cfg.mode == "lap":
         from patchreach.patch.lap import rationality_report
@@ -240,6 +249,31 @@ def main():
     if a.seeds < 1:
         p.error("--seeds must be at least 1")
 
+    # RESOLVED BEFORE THE MODEL IS BUILT, so run.log below captures the whole
+    # invocation -- the checkpoint that was loaded, the classes present in the
+    # image, the CSF budget table -- rather than only the part after the first
+    # attack step. The directory name depends on the ARGUMENTS alone, so
+    # nothing here needs the model or the dataset.
+    tag = "_".join(x for x in [a.arch, a.patch_mode, a.loss_fn,
+                               f"img{a.image}", tsallis_tag(a),
+                               a.tag] if x)
+    out_dir = Path(increment_path(Path(a.out_root) / tag))
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    with tee_output(out_dir / "run.log"):
+        _run(a, out_dir)
+    print("\n  -> " + str(out_dir) + "/")
+
+
+def _run(a, out_dir: Path):
+    """
+    The invocation proper, with stdout and stderr already mirrored into
+    out_dir/run.log.
+
+    Split out of main() rather than indented inside a `with` block there, so
+    the tee covers model setup and data loading as well and the body stays at
+    one indentation level.
+    """
     seed_everything(a.seed)
     device = get_device()
     model, n_ch, n_act, spec = setup_model(a)
@@ -264,11 +298,14 @@ def main():
         for q in G.parameters():
             q.requires_grad_(False)
 
-    tag = "_".join(x for x in [a.arch, a.patch_mode, a.loss_fn,
-                               f"img{a.image}", tsallis_tag(a),
-                               a.tag] if x)
-    out_dir = Path(increment_path(Path(a.out_root) / tag))
-    out_dir.mkdir(parents=True, exist_ok=True)
+    # The full argument namespace, written ONCE per invocation instead of only
+    # inside each repeat's results.json. analysis/build_index.py prefers this
+    # file when it exists, and a --seeds run otherwise had to be read through
+    # seed*/results.json to recover the config it was launched under.
+    with open(out_dir / "config.json", "w") as f:
+        json.dump({**vars(a), "bracket": spec.bracket,
+                   "backbone_channels": n_ch,
+                   "backbone_active_channels": n_act}, f, indent=2)
 
     # --seeds 1 keeps the ORIGINAL layout — results.json directly in out_dir,
     # no nesting, no summary — so everything that already reads these runs
@@ -290,7 +327,6 @@ def main():
 
     if a.seeds > 1:
         summarise(rows, out_dir)
-    print(f"\n  -> {out_dir}/")
 
 
 if __name__ == "__main__":
