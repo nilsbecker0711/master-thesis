@@ -290,11 +290,21 @@ def attack_image(model, img, label, patch, *,
 
     degraded = best_drop > (clean_rem - final_rem) + 1.0
     if degraded and verbose:
+        # NAME THE RIGHT STAT. csf never touches the sigmoid — render() adds a
+        # spectral residual to a base — and its stats() has no frac_at_clip, so
+        # the original message sent a csf user looking for a key that does not
+        # exist in their history. The csf failure with the same signature is
+        # spectral saturation, and frac_at_bound is what shows it.
+        hint = ("frac_at_bound in the history (-> 1 means the spectral "
+                "allocation\n  is frozen and the run can only rotate phase; "
+                "under --csf_param squash that is\n  expected and --csf_param "
+                "pgd is the fix)"
+                if patch.cfg.mode in ("csf", "universal_csf")
+                else "frac_at_clip in the history for sigmoid saturation")
         log(f"\n  WARNING: best drop was {best_drop:+.2f} but the FINAL "
             f"patch only reaches {clean_rem-final_rem:+.2f}.\n"
-            f"  The run degraded after its peak — check frac_at_clip in the "
-            f"history for\n  sigmoid saturation, and use best.pt rather "
-            f"than final.pt.")
+            f"  The run degraded after its peak — check {hint},\n"
+            f"  and use best.pt rather than final.pt.")
 
     # WHERE the patch ended up is part of the result, not bookkeeping. Under
     # --placement gradcam it varies per image, so a population run cannot be

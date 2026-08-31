@@ -479,8 +479,12 @@ def run(model, img, label, patch, out_dir, loss_fn: str, K: int = 19,
     if not skip_geometric:
         _, stats = geometric.receptive_field(model, img, patch, n_probes, log=L)
         geometric.plot_erf(stats, out_dir / "receptive_field.png")
-        res["receptive_field"] = [{"lo": lo, "hi": hi, "rate": r}
-                                  for lo, hi, r in stats]
+        # 'rate' stays the CEILING so every earlier diagnostics.json keeps the
+        # same key meaning; 'null_rate' is the tau-matched probe, which is what
+        # the old 'rate' had silently been for csf runs.
+        res["receptive_field"] = [{"lo": lo, "hi": hi,
+                                   "rate": c, "null_rate": n}
+                                  for lo, hi, c, n in stats]
 
     curves = []
 
