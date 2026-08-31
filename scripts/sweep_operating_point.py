@@ -153,7 +153,7 @@ def read_cell(run_dir: Path) -> dict | None:
     return out
 
 
-def cell_complete(cells_dir: Path, tag: str, loss: str,
+def cell_complete(cells_dir: Path, tag: str, arch: str, loss: str,
                   image: int) -> Path | None:
     """
     An existing, FINISHED directory for this cell tag, or None.
@@ -162,13 +162,14 @@ def cell_complete(cells_dir: Path, tag: str, loss: str,
     leaves a numbered directory behind for a run that crashed on step three,
     and treating that as done would silently put a hole in the sweep.
 
-    THE LOSS IS PART OF THE MATCH, not decoration. overfit.py names a run
-    <arch>_csf_<loss>_img<N>_<tag>, so two losses sharing a cell tag differ
-    only in a field the old glob did not look at -- and it sorted REVERSE, so
-    the ce cell would have been "resumed" from the cospgd directory and the
-    sweep would have reported one loss twice.
+    THE ARCH AND THE LOSS ARE PART OF THE MATCH, not decoration. overfit.py
+    names a run <arch>_csf_<loss>_img<N>_<tag>, so a b5 cell and a b0 cell with
+    the same tag differ only in fields a leading-wildcard glob does not look
+    at -- and it sorts REVERSE, so the second architecture would have been
+    "resumed" from the first one's directories and the sweep would have
+    reported b0's numbers under b5's name. The same held for two losses.
     """
-    for d in sorted(cells_dir.glob(f"*_{loss}_img{image}_{tag}"),
+    for d in sorted(cells_dir.glob(f"{arch}_*_{loss}_img{image}_{tag}"),
                     reverse=True):
         if (d / "summary.json").exists() or (d / "results.json").exists():
             return d
@@ -221,7 +222,7 @@ def run_cell(a, cells_dir: Path, tag: str, *, loss: str, tau: float,
               f"steps={steps:<5d} enforce={enforce}")
         return rec
 
-    done = cell_complete(cells_dir, tag, loss, a.image)
+    done = cell_complete(cells_dir, tag, a.arch, loss, a.image)
     if done is not None and not a.force:
         print(f"\n  [skip] {tag} — already complete at {done}")
         rec.update({"status": "reused"}, **(read_cell(done) or {}))
@@ -249,7 +250,7 @@ def run_cell(a, cells_dir: Path, tag: str, *, loss: str, tau: float,
               f"decisions will skip it.")
         return rec
 
-    got = cell_complete(cells_dir, tag, loss, a.image)
+    got = cell_complete(cells_dir, tag, a.arch, loss, a.image)
     if got is None:
         rec["status"] = "no_result"
         return rec
@@ -525,15 +526,99 @@ def main():
     (root / "decisions").mkdir(exist_ok=True)
 
     stages = [s.strip() for s in a.stages.split(",") if s.strip()]
+
+    # PICK UP WHERE A KILLED JOB STOPPED. The cells were already recoverable
+    # from disk -- cell_complete() finds them -- but the DECISIONS were not:
+    # they live only in sweep.json, and starting from an empty manifest threw
+    # away the chosen run length and learning rate of every stage that had
+    # finished. On a scheduler with a four-hour walltime that is the difference
+    # between resuming a sweep and restarting one.
+    #
+    # It also lets the two objectives run as SEPARATE JOBS into one directory:
+    # `--losses cospgd` then `--losses ce` under the same --name accumulates
+    # both, and the cross-loss comparison fires on the second because it reads
+    # the merged decisions rather than only what this invocation measured.
+    prev = {}
+    sweep_json = root / "sweep.json"
+    if sweep_json.exists() and not a.force:
+        try:
+            prev = json.loads(sweep_json.read_text())
+            done = [c for c in prev.get("cells", [])
+                    if c.get("status") in ("ok", "reused")]
+            # WHAT MAKES TWO INVOCATIONS THE SAME SWEEP. Not the name --
+            # the name is a directory the user chose and can reuse by
+            # accident. These are the fields that decide what a cell MEANS,
+            # so a mismatch is a different experiment sharing a folder, and
+            # merging the two would put one architecture's numbers under
+            # another's name. --losses is deliberately NOT here: running the
+            # objectives as separate jobs into one directory is the point.
+            IDENTITY = ("arch", "image", "img_h", "img_w", "csf_param",
+                        "patch_scale", "placement", "lr_schedule")
+            old_cfg = prev.get("config", {})
+            clash = {k: (old_cfg.get(k), getattr(a, k)) for k in IDENTITY
+                     if k in old_cfg and old_cfg[k] != getattr(a, k)}
+            if clash:
+                print("", file=sys.stderr)
+                print(f"  REFUSING TO RESUME {sweep_json}", file=sys.stderr)
+                for k, (was, now) in clash.items():
+                    print(f"    {k}: manifest has {was!r}, "
+                          f"this run has {now!r}", file=sys.stderr)
+                print("  That directory holds a DIFFERENT experiment. "
+                      "Merging them would file one", file=sys.stderr)
+                print("  configuration's results under another's name. "
+                      "Use a new --name", file=sys.stderr)
+                print(f"  (the default, {a.arch}_img{a.image}, is already "
+                      f"unique), or --force to overwrite.", file=sys.stderr)
+                return 2
+            if done or prev.get("decisions"):
+                print(f"  resuming {sweep_json}: {len(done)} finished cells, "
+                      f"decisions for {sorted(prev.get('decisions', {}))}")
+        except json.JSONDecodeError:
+            # A manifest truncated mid-write by the kill. The cells survive on
+            # disk regardless, so this costs the decisions and nothing else.
+            print(f"  {sweep_json} is unreadable; starting a fresh manifest")
+
     man = {"name": name, "config": vars(a), "stages": stages,
-           "started": time.strftime("%Y-%m-%d %H:%M:%S"),
-           "cells": [], "decisions": {}}
+           "started": prev.get("started", time.strftime("%Y-%m-%d %H:%M:%S")),
+           "resumed": (time.strftime("%Y-%m-%d %H:%M:%S") if prev else None),
+           "cells": [c for c in prev.get("cells", [])
+                     if c.get("status") in ("ok", "reused")],
+           "decisions": prev.get("decisions", {})}
 
     def save():
         (root / "sweep.json").write_text(json.dumps(man, indent=2))
 
+    # THE STAGES OVERLAP, AND WITHOUT THIS THE OVERLAP IS PAID FOR. The star's
+    # centre lies on every stage that passes through it -- (tau 0.25, lr*,
+    # steps*) is the last rung of the steps ladder, a rung of the lr ladder, a
+    # rung of the tau ladder, the centre of the interaction block AND the
+    # realised arm of the enforcement pair -- and the block's factor-1 column
+    # is contained in the tau ladder outright. Measured on the default grid
+    # that is 14 of 58 cells, 42 of 174 runs.
+    #
+    # Nothing is lost by running each configuration once: the seeds are the
+    # same, so a second run of an identical cell is not an independent repeat
+    # of anything. --seeds is what measures the spread.
+    seen: dict[tuple, dict] = {}
+
+    # Primed from the resumed manifest so a finished cell is neither re-run nor
+    # appended twice. Keyed on the CONFIGURATION, not the tag, which is what
+    # makes it work across a stage boundary: the same cell reached from the tau
+    # ladder and from the interaction block is one entry.
+    for c in man["cells"]:
+        if all(k in c for k in ("loss", "tau", "lr", "steps", "enforce")):
+            seen[(c["loss"], c["tau"], c["lr"], c["steps"],
+                  c["enforce"])] = c
+
     def cell(loss, tag, **kw):
+        key = (loss, kw["tau"], kw["lr"], kw["steps"], kw["enforce"])
+        if key in seen:
+            prev = seen[key]
+            print(f"  [dedup] {loss} {tag}"
+                  f"  ==  {prev['tag']}, not re-run")
+            return prev
         rec = run_cell(a, cells, tag, loss=loss, dry=a.dry_run, **kw)
+        seen[key] = rec
         man["cells"].append(rec)
         save()
         return rec
@@ -547,7 +632,10 @@ def main():
 
         losses = [x.strip() for x in a.losses.replace(",", " ").split()
                   if x.strip()]
-        per_loss = {}
+        # Seeded with the decisions already in the manifest, so a per-loss job
+        # run separately still reaches the cross-loss comparison.
+        per_loss = {k: v for k, v in man["decisions"].items()
+                    if isinstance(v, dict) and "operating_point" in v}
 
         # THE LOSS IS AN OUTER AXIS, NOT A CELL. Each objective gets its own
         # run length, its own learning rate and its own tau curve, because the
@@ -683,17 +771,16 @@ def main():
             dec["operating_point"] = {"tau": a.incumbent_tau, "lr": lr,
                                       "steps": steps, "enforce": a.enforce,
                                       "loss": loss}
-            # The headline cell for this loss: the operating point itself. Read
-            # back from the enforce stage when it ran, so the cross-loss table
-            # quotes a measured cell rather than a re-derived number.
-            op = cell_complete(cells,
-                               f"enforce{a.enforce}_tau{a.incumbent_tau:g}"
-                               f"_lr{lr:g}_steps{steps}", loss, a.image)
+            # The headline cell for this loss: the operating point itself,
+            # taken from the memo rather than looked up by tag. Whichever stage
+            # ran it first owns the directory, and after dedup that is not
+            # predictably the enforcement stage.
+            op = seen.get((loss, a.incumbent_tau, lr, steps, a.enforce))
             if op is not None:
-                got = read_cell(op) or {}
-                dec["drop_at_operating_point"] = _mean(got, "drop_remote")
+                dec["drop_at_operating_point"] = _mean(op, "drop_remote")
                 dec["visibility_at_operating_point"] = _mean(
-                    got, "final_visibility")
+                    op, "final_visibility")
+                dec["operating_point_cell"] = op.get("tag")
             per_loss[loss] = dec
             save()
 
