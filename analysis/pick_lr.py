@@ -49,15 +49,54 @@ from statistics import mean
 VISIBILITY_KEYS = ("final_visibility_local", "final_visibility")
 
 
-def load(run_dir: Path):
+def _read(run_dir: Path):
+    r"""
+    (config, records) from any of the THREE layouts that produce tuning runs.
+
+    This existed for overfit_population.py only, and silently skipped every
+    other producer -- the "no summary.json / no records" branch fired on all of
+    them. overfit.py's own docstring says "analysis/pick_lr.py globs for them",
+    which was not true of either of its layouts:
+
+      population    summary.json {config, records}          <- the original
+      overfit n=1   results.json {config, seed, **record}   <- no summary at all
+      overfit n>1   summary.json {n_seeds, per_seed, stats} <- no config key,
+                                                                no records key
+
+    Normalising here rather than at three call sites keeps ONE selection rule.
+    The rule is the whole point of the script: picking at equal perceptual cost
+    rather than argmax, and a second reader would be a second place for that to
+    drift.
+    """
     s = run_dir / "summary.json"
-    if not s.exists():
+    if s.exists():
+        d = json.loads(s.read_text())
+        if d.get("records"):                       # population
+            return d.get("config", {}), d["records"]
+        if d.get("per_seed"):                      # overfit, repeated
+            # The seed rows carry the metrics but no config -- that lives in
+            # each repeat's own results.json, so take it from the first one.
+            cfg = {}
+            for sub in sorted(run_dir.glob("seed*/results.json")):
+                cfg = json.loads(sub.read_text()).get("config", {})
+                break
+            return cfg, d["per_seed"]
         return None
-    d = json.loads(s.read_text())
-    cfg = d.get("config", {})
-    recs = d.get("records", [])
+    r = run_dir / "results.json"                   # overfit, single seed
+    if r.exists():
+        d = json.loads(r.read_text())
+        return d.get("config", {}), [d]
+    return None
+
+
+def load(run_dir: Path):
+    got = _read(run_dir)
+    if got is None:
+        return None
+    cfg, recs = got
     if not recs:
         return None
+    d = {"config": cfg, "records": recs}
 
     vis_key = next((k for k in VISIBILITY_KEYS
                     if any(r.get(k) is not None for r in recs)), None)
@@ -86,7 +125,8 @@ def main():
     for d in a.runs:
         got = load(d)
         if got is None:
-            print(f"  skip {d} (no summary.json / no records)", file=sys.stderr)
+            print(f"  skip {d} (no results.json/summary.json, or no records)",
+                  file=sys.stderr)
             continue
         meta, full = got
         vals = [r[a.metric] for r in full.get("records", [])

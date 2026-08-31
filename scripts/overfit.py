@@ -56,7 +56,13 @@ AGGREGATE_KEYS = ("drop_remote", "drop_all", "best_drop_remote",
                   "final_remote", "final_all",
                   "any_flip_rate", "target_hit_rate",
                   "final_visibility", "final_visibility_local",
-                  "final_resid_rms", "final_frac_at_clip")
+                  "final_resid_rms", "final_frac_at_clip",
+                  # csf reports these instead of frac_at_clip -- it never
+                  # touches the sigmoid. Without them a repeated run could not
+                  # report whether its spectral allocation had frozen, which is
+                  # the one number that distinguishes a converged run from a
+                  # stalled one.
+                  "final_frac_at_bound", "final_spend_mean")
 
 
 def run_one(a, seed: int, model, img, label, device, mean_t, std_t, G,
