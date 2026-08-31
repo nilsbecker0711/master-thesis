@@ -108,6 +108,43 @@ def load(run_dir: Path):
             "n": len(recs), "vis_key": vis_key, "visibility": vis}, d
 
 
+def _write(out, best, rows, eligible, a, *, edge: bool, fell_back: bool):
+    """
+    Persist the decision. No-op without --out, so the stdout contract is
+    unchanged for anything already capturing it.
+
+    The chosen lr otherwise exists ONLY on stdout, which means the number
+    behind a headline result survives as terminal scrollback and nothing else.
+    The candidate table goes in too, so the choice can be audited later without
+    re-running the sweep.
+    """
+    if out is None:
+        return
+    out = Path(out)
+    if out.parent != Path(""):
+        out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(json.dumps({
+        "lr": best["lr"],
+        "metric": a.metric,
+        "ceiling": a.ceiling,
+        "chosen_run": str(best["dir"]),
+        "score": best.get("score"),
+        "visibility": best["visibility"],
+        "visibility_key": best["vis_key"],
+        # True means the grid stopped at the answer, so the answer IS the grid.
+        "at_grid_edge": edge,
+        # True means NOTHING met the ceiling and this is the least-visible run
+        # rather than the best one. A caller that ignores this is quoting a
+        # fallback as if it were a choice.
+        "fell_back_to_least_visible": fell_back,
+        "n_eligible": len(eligible),
+        "candidates": [{"lr": r["lr"], "score": r.get("score"),
+                        "visibility": r["visibility"], "n": r["n"],
+                        "run": r["dir"].name} for r in rows],
+    }, indent=2))
+    print(f"  written: {out}", file=sys.stderr)
+
+
 def main():
     p = argparse.ArgumentParser(description="Pick a learning rate from tuning runs")
     p.add_argument("runs", nargs="+", type=Path)
@@ -116,6 +153,11 @@ def main():
                    help="max acceptable mean realised visibility, in JND. 1.0 "
                         "is the detection threshold. Ignored for modes that "
                         "record no visibility.")
+    p.add_argument("--out", type=Path, default=None,
+                   help="also write the decision to this JSON file: the lr, the "
+                        "ceiling it was judged against, the full candidate "
+                        "table, and whether it landed at a grid edge or fell "
+                        "back. Without this the answer exists only on stdout.")
     p.add_argument("--default", type=float, default=None,
                    help="printed if nothing can be read at all, so an "
                         "overnight script still has a usable value")
@@ -165,6 +207,7 @@ def main():
               f"{best_vis['visibility']:.3f}) — but the right fix is a lower\n"
               f"  --csf_threshold, not a different learning rate.",
               file=sys.stderr)
+        _write(a.out, best_vis, rows, [], a, edge=False, fell_back=True)
         print(best_vis["lr"])
         return 1
 
@@ -173,6 +216,18 @@ def main():
     print(f"\n  chosen: lr={best['lr']:g}  ({a.metric} {best['score']:.2f}, "
           f"visibility {vis})  from {len(eligible)}/{len(rows)} eligible",
           file=sys.stderr)
+
+    # AT AN EDGE OF THE GRID the answer is where the grid stopped, not an
+    # optimum, and the two are indistinguishable from the chosen number alone.
+    # Said here because this is the last place anyone looks before quoting it.
+    edge = len(rows) > 1 and best["lr"] in (rows[0]["lr"], rows[-1]["lr"])
+    if edge:
+        which = "LOWEST" if best["lr"] == rows[0]["lr"] else "HIGHEST"
+        print(f"  WARNING: that is the {which} lr tested, so the sweep is "
+              f"truncated.\n           Extend the grid past {best['lr']:g} and "
+              f"re-run before quoting it as best.", file=sys.stderr)
+
+    _write(a.out, best, rows, eligible, a, edge=edge, fell_back=False)
     print(best["lr"])
     return 0
 
