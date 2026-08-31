@@ -68,6 +68,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import subprocess
 import sys
 import time
@@ -569,10 +570,34 @@ def main():
         a.incumbent_lr = INCUMBENT_LR[a.csf_param]
 
     name = a.name or f"{a.arch}_img{a.image}"
-    root = Path(a.out_root) / name
+    # ABSOLUTE. This process resolves the sweep tree against ITS working
+    # directory, then launches overfit.py with cwd=REPO; a relative --out_root
+    # therefore means two different places whenever the sweep is submitted from
+    # anywhere but the repo root, which on a scheduler is the normal case.
+    # Absolute paths make parent and child agree by construction, and survive
+    # anything that changes the working directory mid-run.
+    root = (Path(a.out_root) / name).resolve()
     cells = root / "cells"
-    cells.mkdir(parents=True, exist_ok=True)
-    (root / "decisions").mkdir(exist_ok=True)
+
+    # FAIL AT SECOND ZERO, NOT AT MINUTE THIRTY. The tree is written to
+    # throughout the sweep but was only first written after the opening cell
+    # had already run, so an unwritable output directory -- a full quota, a
+    # stale mount, a workspace that expired since the last job -- cost a GPU
+    # allocation before it was noticed. One probe file says the same thing
+    # immediately.
+    try:
+        cells.mkdir(parents=True, exist_ok=True)
+        (root / "decisions").mkdir(exist_ok=True)
+        probe = root / ".writable"
+        probe.write_text("ok")
+        probe.unlink()
+    except OSError as e:
+        print(f"  CANNOT WRITE TO {root}", file=sys.stderr)
+        print(f"    {e}", file=sys.stderr)
+        print("  Nothing has run. Check the workspace exists, is mounted on "
+              "this node,", file=sys.stderr)
+        print("  and is within quota.", file=sys.stderr)
+        return 2
 
     stages = [s.strip() for s in a.stages.split(",") if s.strip()]
 
@@ -635,7 +660,27 @@ def main():
            "decisions": prev.get("decisions", {})}
 
     def save():
-        (root / "sweep.json").write_text(json.dumps(man, indent=2))
+        # WRITE-THEN-RENAME, because several jobs may share this directory:
+        # splitting the lr stage across the cluster means N processes with one
+        # --name, each rewriting the manifest as its cell finishes. A
+        # half-written file is survivable -- the CELLS on disk are what resume
+        # actually needs -- but it would discard every decision recorded so
+        # far. os.replace is atomic on POSIX and on Windows.
+        # A MANIFEST FAILURE MUST NOT KILL THE SWEEP. The cells are the
+        # expensive part and they are already on disk; cell_complete() finds
+        # them again without this file. Losing the manifest costs the
+        # decisions, which are cheap to recompute -- losing the run costs GPU
+        # hours. Previously an OSError here propagated out of cell() and ended
+        # the job one cell after a transient filesystem error.
+        try:
+            tmp = root / "sweep.json.tmp"
+            tmp.write_text(json.dumps(man, indent=2))
+            os.replace(tmp, root / "sweep.json")
+        except OSError as e:
+            print(f"  WARNING: could not write the manifest ({e}).",
+                  file=sys.stderr)
+            print(f"           The cells are unaffected and remain readable "
+                  f"from {cells}.", file=sys.stderr)
 
     # THE STAGES OVERLAP, AND WITHOUT THIS THE OVERLAP IS PAID FOR. The star's
     # centre lies on every stage that passes through it -- (tau 0.25, lr*,
@@ -704,10 +749,31 @@ def main():
         # single lr that lr_sweep.sh was written to undo.
         for loss in losses:
             print(f"\n{'*' * 78}\n*  LOSS {loss}\n{'*' * 78}")
-            dec = {}
+            # Reuse this loss's existing block rather than replacing it, so a
+            # stage that ran in an earlier job survives into this one.
+            dec = man["decisions"].get(loss) or {}
             man["decisions"][loss] = dec
             steps = int(parse_grid(a.steps_grid, int)[-1])
             lr = a.incumbent_lr
+
+            # STORED IS NOT THE SAME AS USED. The manifest already carried the
+            # chosen run length and learning rate across invocations, but the
+            # stage loop re-derived both from the incumbent every time -- so a
+            # job launched as --stages tau swept tau at the INCUMBENT lr while
+            # the manifest sat there recording a different one. That surfaces
+            # three stages later, as a curve measured at a learning rate
+            # nothing chose.
+            #
+            # This is what makes the sweep splittable across jobs at all. The
+            # big architectures do not fit one walltime, so --stages steps,
+            # then --stages lr, then --stages tau,grid,enforce has to carry its
+            # answers forward exactly as one long job would.
+            if (dec.get("steps") or {}).get("steps"):
+                steps = dec["steps"]["steps"]
+                print(f"  [resume] steps = {steps} (decided by an earlier job)")
+            if (dec.get("lr") or {}).get("lr") is not None:
+                lr = dec["lr"]["lr"]
+                print(f"  [resume] lr = {lr:g} (decided by an earlier job)")
 
             # ── stage 1: run length ─────────────────────────────────────────────
             if "steps" in stages:

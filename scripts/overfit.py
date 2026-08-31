@@ -257,7 +257,19 @@ def main():
     tag = "_".join(x for x in [a.arch, a.patch_mode, a.loss_fn,
                                f"img{a.image}", tsallis_tag(a),
                                a.tag] if x)
-    out_dir = Path(increment_path(Path(a.out_root) / tag))
+    # ABSOLUTE, and this is not tidiness. The path was relative, and it is
+    # written to from three places separated by a model build: mkdir here,
+    # run.log in tee_output, config.json and results.json inside _run. Anything
+    # that changes the process working directory in between -- and mmcv's
+    # config machinery is entitled to -- silently redirects the later writes,
+    # which surfaces as FileNotFoundError on a directory this function has
+    # already created. Observed on the cluster: run.log opened, then
+    # config.json failed with ENOENT in the same directory.
+    #
+    # It also fixes the child/parent split in sweep_operating_point.py, which
+    # launches this script with cwd=REPO while resolving --out_root against its
+    # own working directory. Absolute paths make the two agree by construction.
+    out_dir = Path(increment_path(Path(a.out_root) / tag)).resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
 
     with tee_output(out_dir / "run.log"):
