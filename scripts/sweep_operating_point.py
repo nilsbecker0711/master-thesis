@@ -532,8 +532,28 @@ def main():
     def save():
         (root / "sweep.json").write_text(json.dumps(man, indent=2))
 
+    # THE STAGES OVERLAP, AND WITHOUT THIS THE OVERLAP IS PAID FOR. The star's
+    # centre lies on every stage that passes through it -- (tau 0.25, lr*,
+    # steps*) is the last rung of the steps ladder, a rung of the lr ladder, a
+    # rung of the tau ladder, the centre of the interaction block AND the
+    # realised arm of the enforcement pair -- and the block's factor-1 column
+    # is contained in the tau ladder outright. Measured on the default grid
+    # that is 14 of 58 cells, 42 of 174 runs.
+    #
+    # Nothing is lost by running each configuration once: the seeds are the
+    # same, so a second run of an identical cell is not an independent repeat
+    # of anything. --seeds is what measures the spread.
+    seen: dict[tuple, dict] = {}
+
     def cell(loss, tag, **kw):
+        key = (loss, kw["tau"], kw["lr"], kw["steps"], kw["enforce"])
+        if key in seen:
+            prev = seen[key]
+            print(f"  [dedup] {loss} {tag}"
+                  f"  ==  {prev['tag']}, not re-run")
+            return prev
         rec = run_cell(a, cells, tag, loss=loss, dry=a.dry_run, **kw)
+        seen[key] = rec
         man["cells"].append(rec)
         save()
         return rec
@@ -683,17 +703,16 @@ def main():
             dec["operating_point"] = {"tau": a.incumbent_tau, "lr": lr,
                                       "steps": steps, "enforce": a.enforce,
                                       "loss": loss}
-            # The headline cell for this loss: the operating point itself. Read
-            # back from the enforce stage when it ran, so the cross-loss table
-            # quotes a measured cell rather than a re-derived number.
-            op = cell_complete(cells,
-                               f"enforce{a.enforce}_tau{a.incumbent_tau:g}"
-                               f"_lr{lr:g}_steps{steps}", loss, a.image)
+            # The headline cell for this loss: the operating point itself,
+            # taken from the memo rather than looked up by tag. Whichever stage
+            # ran it first owns the directory, and after dedup that is not
+            # predictably the enforcement stage.
+            op = seen.get((loss, a.incumbent_tau, lr, steps, a.enforce))
             if op is not None:
-                got = read_cell(op) or {}
-                dec["drop_at_operating_point"] = _mean(got, "drop_remote")
+                dec["drop_at_operating_point"] = _mean(op, "drop_remote")
                 dec["visibility_at_operating_point"] = _mean(
-                    got, "final_visibility")
+                    op, "final_visibility")
+                dec["operating_point_cell"] = op.get("tag")
             per_loss[loss] = dec
             save()
 
