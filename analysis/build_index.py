@@ -26,6 +26,24 @@ from pathlib import Path
 
 import pandas as pd
 
+# Result keys that overfit.py and overfit_population.py write at TOP LEVEL
+# rather than nested under "final". Without these the index silently came out
+# with config columns and almost no results: FLATTEN below was written against
+# train.py's nested shape, and a single-image run has none of those blocks, so
+# every drop, flip rate and visibility column landed empty.
+TOP_LEVEL = ("clean_all", "clean_remote", "final_all", "final_remote",
+             "drop_all", "drop_remote", "best_drop_remote",
+             "degraded_after_peak", "any_flip_rate", "target_hit_rate",
+             # the perceptual cost the drop was bought at -- a drop column
+             # without these invites exactly the comparison pick_lr refuses
+             "final_visibility", "final_visibility_local",
+             "final_resid_rms", "final_resid_absmax",
+             # csf: spectral allocation frozen? raw/lap: sigmoid saturated?
+             "final_frac_at_bound", "final_spend_mean", "final_frac_at_clip",
+             "placement_dist_from_centre", "placement_on_border",
+             "lr_schedule", "backbone_channels", "backbone_active_channels",
+             "silhouette_frac", "wall_clock_s")
+
 # Nested keys worth promoting to top-level columns.
 FLATTEN = {
     "final": ["clean_all", "clean_rem", "adv_all", "adv_rem", "drop_all",
@@ -50,15 +68,52 @@ def flatten_run(run_dir: Path) -> dict | None:
             if k in sub:
                 row[k] = sub[k]
 
-    for k in ("best_drop_remote", "backbone_channels",
-              "backbone_active_channels", "silhouette_frac", "wall_clock_s"):
+    for k in TOP_LEVEL:
         if k in res:
             row[k] = res[k]
 
     hist = res.get("history", [])
     row["n_evals"] = len(hist)
     if hist:
+        # train.py counts epochs, overfit.py counts steps. Record whichever the
+        # run actually has: a `last_step` well below --steps is how a truncated
+        # or crashed single-image run shows up in the index instead of looking
+        # like a converged one.
         row["epochs_completed"] = hist[-1].get("epoch")
+        row["last_step"] = hist[-1].get("step")
+    return row
+
+
+def flatten_seeded(run_dir: Path) -> dict | None:
+    """
+    A --seeds N > 1 overfit run: summary.json holds {n_seeds, per_seed, stats}
+    and the config lives in each repeat's own results.json.
+
+    Reported as ONE row of MEANS, with n_seeds carried so a single-seed row and
+    a five-seed row are never mistaken for equally solid. The sd goes in beside
+    the mean for the headline metric, because this project has already measured
+    a 9.6-point spread across four identical single-image runs -- a mean with no
+    spread beside it overstates what one number establishes.
+    """
+    s_p = run_dir / "summary.json"
+    if not s_p.exists():
+        return None
+    d = json.loads(s_p.read_text())
+    # Guard on `stats`, which is what the means are read from. Guarding on
+    # per_seed instead dropped the row whenever the raw rows were absent but
+    # the aggregate was present -- the run vanished from the index rather than
+    # appearing with the numbers it did have.
+    if not d.get("stats"):
+        return None
+    row = {"run_id": run_dir.name, "path": str(run_dir),
+           "n_seeds": d.get("n_seeds")}
+    for sub in sorted(run_dir.glob("seed*/results.json")):
+        row.update(json.loads(sub.read_text()).get("config", {}))
+        break
+    for k, st in (d.get("stats") or {}).items():
+        row[k] = st.get("mean")
+        if st.get("sd") is not None:
+            row[f"{k}_sd"] = st["sd"]
     return row
 
 
@@ -69,13 +124,15 @@ def main():
     a = ap.parse_args()
 
     rows = [r for d in sorted(Path(a.runs).glob("*")) if d.is_dir()
-            for r in [flatten_run(d)] if r]
+            for r in [flatten_run(d) or flatten_seeded(d)] if r]
     if not rows:
         raise SystemExit(f"no completed runs under {a.runs}")
 
     df = pd.DataFrame(rows)
-    lead = [c for c in ("run_id", "arch", "patch_mode", "loss_fn", "img_h",
-                        "img_w", "drop_remote", "any_flip_rate",
+    lead = [c for c in ("run_id", "arch", "patch_mode", "csf_param", "loss_fn",
+                        "lr", "csf_threshold", "img_h", "img_w",
+                        "drop_remote", "best_drop_remote", "any_flip_rate",
+                        "final_visibility_local", "final_frac_at_bound",
                         "target_hit_rate") if c in df.columns]
     df = df[lead + [c for c in df.columns if c not in lead]]
 
