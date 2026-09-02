@@ -74,10 +74,19 @@ def tee_output(path):
 
     Line-buffered so a run killed by the scheduler still leaves a readable log
     of everything up to the kill.
+
+    APPEND, NEVER TRUNCATE. A sweep directory is written by more than one
+    invocation by design -- the objectives run as separate jobs into one tree,
+    and a job killed at walltime is resumed by another. Opening "w" meant each
+    of those destroyed the log of everything before it: a cospgd sweep that
+    took three hours left nothing behind once the ce job started, and the only
+    surviving record was of the run that happened to go last. The cells keep
+    their own run.log either way; this is the pooled view, and a pooled view
+    that keeps only the most recent writer is worse than none.
     """
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    fh = open(path, "w", encoding="utf-8", buffering=1)
+    fh = open(path, "a", encoding="utf-8", buffering=1)
 
     class _Tee:
         def __init__(self, stream):
