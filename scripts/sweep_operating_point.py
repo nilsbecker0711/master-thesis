@@ -645,8 +645,17 @@ def main():
                       f"unique), or --force to overwrite.", file=sys.stderr)
                 return 2
             if done or prev.get("decisions"):
+                # SETTLED, not merely present. An objective whose every cell
+                # failed still leaves its (empty) decisions entry behind, and
+                # listing those as "decisions for ['cospgd']" made a sweep that
+                # had measured nothing read, on the next resume, as one that
+                # had finished an objective.
+                dd = prev.get("decisions", {}) or {}
+                settled = sorted(k for k, v in dd.items()
+                                 if isinstance(v, dict)
+                                 and "operating_point" in v)
                 print(f"  resuming {sweep_json}: {len(done)} finished cells, "
-                      f"decisions for {sorted(prev.get('decisions', {}))}")
+                      f"settled objectives: {settled or 'none'}")
         except json.JSONDecodeError:
             # A manifest truncated mid-write by the kill. The cells survive on
             # disk regardless, so this costs the decisions and nothing else.
@@ -660,6 +669,11 @@ def main():
            "decisions": prev.get("decisions", {})}
 
     def save():
+        # An objective that decided nothing leaves an empty dict behind. Kept,
+        # it is indistinguishable in the manifest from one that ran; dropped,
+        # a later resume sees the objective as outstanding, which it is.
+        for k in [k for k, v in man["decisions"].items() if v == {}]:
+            del man["decisions"][k]
         # WRITE-THEN-RENAME, because several jobs may share this directory:
         # splitting the lr stage across the cluster means N processes with one
         # --name, each rewriting the manifest as its cell finishes. A
