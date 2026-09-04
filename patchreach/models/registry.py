@@ -96,6 +96,18 @@ REGISTRY = {
         note="ViT-L, 16x16 non-overlapping patch embed. Entry stride 16, the other "
             "extreme from UNet. Stem is information-preserving (768->1024), so a "
             "failure here is architectural rather than information loss."),
+
+    "deeplabv3plus_r50": ArchSpec("deeplabv3plus_r50", "none",
+        cfg=f"{_M}/deeplabv3plus_r50-d8_512x1024_80k_cityscapes.py",
+        weights=f"{_M}/deeplabv3plus_r50-d8_512x1024_80k_cityscapes_20200606_114049-f9fb496d.pth",
+        note="Dilated ResNet-50, no attention. Same head, same entry stride 8 "
+            "as r101 — the DEPTH ablation with geometry held constant."),
+
+    "deeplabv3plus_r18": ArchSpec("deeplabv3plus_r18", "none",
+        cfg=f"{_M}/deeplabv3plus_r18-d8_512x1024_80k_cityscapes.py",
+        weights=f"{_M}/deeplabv3plus_r18-d8_512x1024_80k_cityscapes_20201226_080942-cff257fe.pth",
+        note="Dilated ResNet-18, BasicBlock, 512-channel output — the head "
+            "dims differ from r50/r101, so this is not a pure depth ablation."),
 }
 
     # ── Swin windowed attention ──────────────────────────────────────────────
@@ -128,7 +140,9 @@ REGISTRY["unet"] = REGISTRY["unet_s5d16"]
 # No "ocrnet" alias: OCRNet was dropped from the lineup and its ArchSpec went
 # with it. The alias outlived the entry and raised KeyError at IMPORT time,
 # which took every script down with it — REGISTRY is imported by _common.
-REGISTRY["deeplab"] = REGISTRY["deeplabv3plus_r101"]
+REGISTRY["deeplab_101"] = REGISTRY["deeplabv3plus_r101"]
+REGISTRY["deeplab_50"] = REGISTRY["deeplabv3plus_r50"]
+REGISTRY["deeplab_18"] = REGISTRY["deeplabv3plus_r18"]
 
 
 def resolve(name: str, cfg_override=None, weights_override=None):
