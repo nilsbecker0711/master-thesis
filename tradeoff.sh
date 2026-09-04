@@ -1,7 +1,7 @@
 #!/bin/bash
 #SBATCH -p accelerated
 #SBATCH -n 1
-#SBATCH -t 12:00:00
+#SBATCH -t 08:00:00
 #SBATCH --mem=100000
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=16
@@ -11,9 +11,23 @@
 #  THE ATTACK-SUCCESS / VISIBILITY TRADE-OFF, per architecture.
 # ═══════════════════════════════════════════════════════════════════════════
 #
-#     MODE=pilot  sbatch tradeoff.sh     one image per arch, ~1-2 h
+#     MODE=pilot  sbatch tradeoff.sh     one image per arch
 #     MODE=figure sbatch tradeoff.sh     a population per arch, the deliverable
 #     MODE=pilot  DRY=1 bash tradeoff.sh cost first, run nothing
+#
+# COUNT CELLS, NOT HOURS. The pilot is 19 runs of --steps per architecture at
+# the defaults: 8 lr rungs, 9 tau rungs less the one they share, and 3 raw
+# arms. --dry_run prints the exact plan. Multiply by the per-run time YOUR
+# architecture actually takes -- it spans roughly an order of magnitude across
+# the lineup, and the walltime above is a ceiling, not a forecast.
+#
+# The lr stage is 8 of those 19 and is pure duplication if lr_sweep.sh already
+# covered this architecture. Reuse its answer instead:
+#
+#     python analysis/pick_lr.py results/lr_sweep/setr_pup_* --ceiling 0.25
+#     STAGES=tau INCUMBENT_LR=<that> MODE=pilot bash tradeoff.sh
+#
+# which drops the pilot to 12 runs.
 #
 # THE QUESTION. segformer_b0 is the only transformer the CSF-bounded attack
 # currently moves; b5 and setr_pup fall over under the frequency constraint
@@ -91,6 +105,12 @@ fi
 : "${STEPS:=1000}"
 : "${STEPS_GRID:=$STEPS}"
 : "${STAGES:=lr,tau}"
+# Set this WITH STAGES=tau to skip the lr stage and sweep tau at a learning
+# rate something else already chose (lr_sweep.sh, or an earlier pilot). Left
+# empty, sweep_operating_point.py resolves its own default from --csf_param.
+# It is declared rather than hidden because every number in the tau ladder is
+# conditional on it.
+: "${INCUMBENT_LR:=}"
 # --seeds 1 in the pilot: it is a pilot. Its job is to locate the lr and the
 # knee, and the figure below measures the spread over IMAGES, which is the
 # spread the claim is about. Raise it if a pilot number is going to be quoted.
@@ -124,6 +144,7 @@ if [ "$MODE" = "pilot" ]; then
         --csf_param pgd --enforce realised --lr_schedule cosine \
         --tau_grid "$TAUS" --incumbent_tau 0.25 \
         --seeds "$SEEDS" --ceiling 1.0 \
+        ${INCUMBENT_LR:+--incumbent_lr "$INCUMBENT_LR"} \
         --name "tradeoff_${ARCH}" --out_root "$ROOT" ${DRY:+--dry_run}
 
     # THE CEILING, INTO THE SWEEP'S OWN cells/ DIRECTORY, so one --sweep
