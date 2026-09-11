@@ -344,3 +344,70 @@ def test_summarise_gives_a_verdict_once_the_signal_clears_the_floor():
 def test_summarise_needs_results():
     with pytest.raises(ValueError):
         S.summarise([], 0.25, log=lambda *a, **k: None)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  The range-limited guard, per normalisation mode
+# ─────────────────────────────────────────────────────────────────────────────
+def _rms_rows(rms_values, realised=(70.7, 5.5, 1.5)):
+    """Rows as frequency_sensitivity() emits them under --normalise rms."""
+    return [{"lo": 0.1 * i, "hi": 0.1 * (i + 1), "flip_remote": 2.0,
+             "realised": v, "rms": r}
+            for i, (r, v) in enumerate(zip(rms_values, realised))]
+
+
+def test_range_limited_compares_rms_under_rms_normalisation():
+    r"""
+    THE REGRESSION THIS LOCKS. The guard used to read `realised` against
+    `target` in both modes. Under --normalise rms that compares a visibility
+    in JND (order 1-70) against an RMS (0.02), which is trivially satisfied,
+    so the flag never fired in the one mode where the clamp can silently break
+    the premise: equal-ENERGY rests on every band actually receiving the same
+    energy, and a band that lost some to fit_to_range was measured weaker than
+    its neighbours for a reason that has nothing to do with frequency.
+    """
+    rows = _rms_rows([0.010, 0.020, 0.020])        # band 0 lost half its energy
+    out = S.summarise([rows], 0.02, normalise="rms", log=lambda *a, **k: None)
+
+    assert [b["range_limited"] for b in out["bands"]] == [True, False, False]
+    assert out["any_range_limited"] is True
+    # `attained` is whatever `target` is expressed in, so the two compare.
+    assert out["bands"][0]["attained"] == pytest.approx(0.010, abs=1e-6)
+    assert out["bands"][1]["attained"] == pytest.approx(0.020, abs=1e-6)
+    # The cost column is untouched and still reports visibility.
+    assert out["bands"][0]["realised"] == pytest.approx(70.7, abs=1e-4)
+
+
+def test_no_band_flagged_when_every_band_reached_its_energy():
+    rows = _rms_rows([0.020, 0.020, 0.020])
+    out = S.summarise([rows], 0.02, normalise="rms", log=lambda *a, **k: None)
+    assert out["any_range_limited"] is False
+    assert not any(b["range_limited"] for b in out["bands"])
+
+
+def test_visibility_mode_needs_no_rms_column():
+    r"""
+    A visibility run compares `realised` against `target` -- both JND -- and
+    must not require an rms column it has no use for. Guards against a fix to
+    the rms path making the visibility path depend on a field its own callers
+    never produce.
+    """
+    rows = _rows([1.0, 2.0, 3.0])                  # no "rms" key at all
+    rows[2]["realised"] = 0.05                     # never reached tau = 0.25
+    out = S.summarise([rows], 0.25, log=lambda *a, **k: None)
+
+    assert [b["range_limited"] for b in out["bands"]] == [False, False, True]
+    assert out["bands"][2]["attained"] == pytest.approx(0.05)
+
+
+def test_inconclusive_runs_carry_the_same_band_schema():
+    """A caller must not have to special-case which verdict it is reading."""
+    rows = _rms_rows([0.004, 0.020, 0.020])
+    for r in rows:
+        r["flip_remote"] = 0.01                    # far below the 0.5% floor
+    out = S.summarise([rows], 0.02, normalise="rms", log=lambda *a, **k: None)
+
+    assert out["verdict"] == "inconclusive"
+    assert out["any_range_limited"] is True
+    for b in out["bands"]:
+        assert {"attained", "range_limited", "realised"} <= set(b)

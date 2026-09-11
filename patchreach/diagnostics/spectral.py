@@ -366,7 +366,19 @@ def frequency_sensitivity(model, imgs: torch.Tensor, patch, mean_t, std_t,
                "rms": float(torch.tensor(rmss).mean()),
                "probes": flips_rem}
         out.append(row)
-        short = "" if row["realised"] >= 0.9 * target else "  <- range-limited"
+        # COMPARE LIKE WITH LIKE. `target` is a visibility in JND under
+        # normalise='visibility' but an RMS in [0,1] pixel units under 'rms',
+        # while `realised` is ALWAYS a visibility. Comparing the two under
+        # 'rms' asked whether a number of order 1-70 clears 0.018, which is
+        # trivially true -- so this flag never fired in the ONE mode where the
+        # clamp can silently break the premise. Equal-energy rests on every
+        # band actually RECEIVING the same energy, and a band that lost some
+        # to fit_to_range was measured weaker than its neighbours for a reason
+        # that has nothing to do with frequency.
+        row["attained"] = (row["realised"] if normalise == "visibility"
+                           else row["rms"])
+        row["range_limited"] = bool(row["attained"] < 0.9 * target)
+        short = "  <- range-limited" if row["range_limited"] else ""
         log(f"           {lo:.2f}-{hi:<11.2f}{row['flip_all']:9.2f}%"
             f"{row['flip_remote']:9.2f}%{row['realised']:10.3f}"
             f"{row['rms']:9.4f}{short}")
@@ -419,6 +431,20 @@ def summarise(per_image: Sequence[Sequence[Dict]], target: float,
     realised = torch.tensor([[img[b]["realised"] for b in range(n_bands)]
                              for img in per_image]).mean(dim=0)
 
+    # ATTAINED is whatever `target` is expressed in, so the two are always
+    # comparable: a visibility under normalise='visibility', an RMS under
+    # 'rms'. Reported as its own column rather than left implicit, because
+    # "did this band actually receive what it was asked for" is a different
+    # question from "what did it cost", and only the first can invalidate the
+    # band comparison. Read from the rows only in the mode that needs it -- a
+    # visibility run has no reason to carry an rms column.
+    if normalise == "rms":
+        attained = torch.tensor([[img[b]["rms"] for b in range(n_bands)]
+                                 for img in per_image]).mean(dim=0)
+    else:
+        attained = realised
+    limited = [bool(attained[b] < 0.9 * target) for b in range(n_bands)]
+
     conclusive = float(mean.max()) >= min_signal
 
     log(f"\n{'=' * 72}")
@@ -427,7 +453,7 @@ def summarise(per_image: Sequence[Sequence[Dict]], target: float,
     log(f"    {'band (cyc/px)':<16s}{'flip_remote':>13s}{'+/-':>8s}"
         f"{'CV':>8s}{'realised':>11s}")
     for b, (lo, hi) in enumerate(bands):
-        flag = "" if realised[b] >= 0.9 * target else "  range-limited"
+        flag = "  range-limited" if limited[b] else ""
         cvs = f"{cv[b]:8.2f}" if mean[b] >= min_signal else f"{'-':>8s}"
         bar = "#" * int(mean[b])
         log(f"    {lo:.2f}-{hi:<11.2f}{mean[b]:12.2f}%{std[b]:8.2f}"
@@ -449,7 +475,9 @@ def summarise(per_image: Sequence[Sequence[Dict]], target: float,
         return {"bands": [{"lo": lo, "hi": hi,
                            "flip_remote": float(mean[b]),
                            "std": float(std[b]), "cv": float(cv[b]),
-                           "realised": float(realised[b])}
+                           "realised": float(realised[b]),
+                           "attained": float(attained[b]),
+                           "range_limited": limited[b]}
                           for b, (lo, hi) in enumerate(bands)],
                 "peak_band_per_image": peaks,
                 "modal_peak": None,
@@ -458,6 +486,7 @@ def summarise(per_image: Sequence[Sequence[Dict]], target: float,
                 "band_stability": "inconclusive",
                 "verdict": "inconclusive",
                 "max_flip_remote": float(mean.max()),
+                "any_range_limited": any(limited),
                 "min_signal": min_signal}
 
     log(f"\n  peak band per image : {peaks}")
@@ -492,7 +521,9 @@ def summarise(per_image: Sequence[Sequence[Dict]], target: float,
     return {"bands": [{"lo": lo, "hi": hi,
                        "flip_remote": float(mean[b]),
                        "std": float(std[b]), "cv": float(cv[b]),
-                       "realised": float(realised[b])}
+                       "realised": float(realised[b]),
+                       "attained": float(attained[b]),
+                       "range_limited": limited[b]}
                       for b, (lo, hi) in enumerate(bands)],
             "peak_band_per_image": peaks,
             "modal_peak": modal,
@@ -505,6 +536,7 @@ def summarise(per_image: Sequence[Sequence[Dict]], target: float,
             "efficiency_ratio": (float(realised[lo_band])
                                  / max(float(realised[hi_band]), 1e-9)),
             "max_flip_remote": float(mean.max()),
+            "any_range_limited": any(limited),
             "min_signal": min_signal}
 
 

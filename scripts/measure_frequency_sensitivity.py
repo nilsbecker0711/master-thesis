@@ -154,8 +154,15 @@ def main():
 
     summary = spectral.summarise(per_image, target, a.normalise, a.min_signal)
 
+    # THE TARGET BELONGS IN THE PATH. It is the one run parameter a ladder
+    # varies while everything else is held, and it was the one parameter the
+    # directory name did not carry -- so an rms or tau ladder written into a
+    # single --out_dir overwrote itself rung by rung and left only the last.
+    # Same failure the csf_model addition fixed for footprint_luminance, where
+    # the sso control silently clobbered the headline barten run.
     out_dir = (Path(a.out_dir)
-               / f"{a.arch}_{a.img_h}x{a.img_w}_{a.region}_{a.normalise}")
+               / f"{a.arch}_{a.img_h}x{a.img_w}_{a.region}_{a.normalise}"
+                 f"_t{target:g}")
     out_dir.mkdir(parents=True, exist_ok=True)
     spectral.plot_bands(summary, out_dir / "frequency_sensitivity.png",
                         title=f"{a.arch} ({spec.bracket} attention)",
