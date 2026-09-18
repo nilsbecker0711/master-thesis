@@ -34,6 +34,7 @@ from typing import Optional
 
 import torch
 
+from .. import optim as optim_mod
 from ..data.cityscapes import upsample_to
 from ..losses import adversarial
 from ..metrics.miou import (SegMetric, single_image_miou, attack_rates,
@@ -98,6 +99,7 @@ def attack_image(model, img, label, patch, *,
                  target_class: int = 8,
                  steps: int = 300,
                  lr: float = 0.01,
+                 optimiser: str = "adam",
                  num_classes: int = 19,
                  exclude_footprint: bool = True,
                  log_every: int = 20,
@@ -132,6 +134,14 @@ def attack_image(model, img, label, patch, *,
     bug that made a 150-epoch run report drop_remote = -3.63. The record carries
     the union figures too, so runs from before that fix stay comparable and any
     divergence stays visible rather than silent.
+
+    `optimiser` selects the step rule — 'adam' (every run to date) or
+    'sign', the update PGD takes. See patchreach/optim.py for why the
+    two are matched at EQUAL lr rather than at equal gradient norm. It
+    composes with PatchConfig.pixel_param, which selects the other half
+    of PGD's recipe: 'sign' + pixel_param='direct' is a PGD step with a
+    projection onto the feasible pixel box, which is as close to PGD as
+    a patch threat model reaches (there is no epsilon-ball).
 
     `lr_schedule` anneals the step size to zero across the run, and 'cosine'
     is the answer to a MEASURED failure rather than a tidiness preference. Four
@@ -189,8 +199,13 @@ def attack_image(model, img, label, patch, *,
             tsallis_total_steps=steps)
         if verbose:
             log(f"[loss ] {objective!r}")
-    opt = torch.optim.Adam([patch.param], lr=lr, betas=(0.9, 0.999),
-                           amsgrad=True)
+    # betas PASSED EXPLICITLY, not defaulted: this loop has always used
+    # (0.9, 0.999) and train.py (0.5, 0.999), and routing both through
+    # one builder must not quietly move either.
+    opt = optim_mod.build(optimiser, [patch.param], lr,
+                          betas=(0.9, 0.999))
+    if verbose and optimiser != "adam":
+        log(f"[optim] {optimiser} — step is exactly lr per coordinate")
     if lr_schedule not in ("none", "cosine"):
         raise ValueError(f"lr_schedule must be 'none' or 'cosine', "
                          f"got {lr_schedule!r}")
@@ -342,6 +357,11 @@ def attack_image(model, img, label, patch, *,
             "class_set_moved": bool(cmp_rem["n_classes_clean_union"]
                                     != cmp_rem["n_classes_adv_union"]),
             "lr_schedule": lr_schedule,
+            # Recorded on EVERY run, including the default, so a row in
+            # the index that predates the flag is distinguishable from
+            # one that chose adam rather than silently merged with it.
+            "optimiser": optimiser,
+            "pixel_param": patch.cfg.pixel_param,
             # tsallis ONLY, so the record schema for every other loss_fn is
             # byte-for-byte what it was and downstream parsers do not move.
             **({"tsallis_q": objective.q} if loss_fn == "tsallis" else {}),

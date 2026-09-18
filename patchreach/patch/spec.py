@@ -92,6 +92,32 @@ class PatchConfig:
     latent_clip: float = 2.0
     logit_clip: float = 6.0        # pixel modes; 0 disables
 
+    # HOW A PIXEL-MODE PARAMETER BECOMES A PIXEL. This is the SECOND of
+    # PGD's three ingredients -- optim.py carries the first (the step
+    # rule), and the third (an epsilon-ball around the clean image) does
+    # not exist under a patch threat model at all.
+    #
+    # sigmoid : pixel = sigmoid(param). Every run to date, and the choice
+    #           the module docstring above argues for: the map is bounded,
+    #           so [0,1] needs no enforcement and no gradient is ever
+    #           killed by a bound.
+    # direct  : the parameter IS the pixel, projected back into [0,1] by
+    #           project() after every step. That is what PGD does, and
+    #           what this repository's own pre-unification single-image
+    #           script did.
+    #
+    # WHY IT IS A FLAG. The module docstring states, as THE reason for the
+    # sigmoid, that "a hard clamp zeroes the gradient for any pixel
+    # sitting on the bound, which is exactly where an adversarial patch
+    # wants to live". That claim is also what the write-up leans on when
+    # it declines to describe this attack as PGD, and it had never been
+    # measured: the saturation measurement in residual() tested
+    # forward-clamp against post-step projection on the SPECTRUM, under
+    # Adam, which is a different axis. 'direct' exists so the claim can be
+    # tested on pixels rather than asserted. frac_at_clip in stats() is
+    # the number it turns on.
+    pixel_param: str = "sigmoid"   # sigmoid | direct
+
     # ── perceptual constraint (csf.py), mode='csf' only ──────────────────────
     csf_threshold: float = 0.25
     csf_model: str = "barten"
@@ -197,6 +223,20 @@ class PatchConfig:
     def validate(self):
         if self.mode not in MODES:
             raise ValueError(f"mode must be one of {MODES}, got {self.mode!r}")
+        if self.pixel_param not in ("sigmoid", "direct"):
+            raise ValueError("pixel_param must be sigmoid|direct, got "
+                             f"{self.pixel_param!r}")
+        if self.pixel_param == "direct" and self.mode != "raw":
+            # lap seeds through lap.logit_seed() and raw_ganinit through a
+            # BigGAN sample in logit space; csf/universal_csf parameterise
+            # a spectral residual and gan a latent. NONE of them has a
+            # pixel parameter to make direct, so accepting the flag there
+            # would run a different mode from the one the flag names. raw
+            # is the mode the ablation is defined on and the only one
+            # where both branches mean the same thing.
+            raise ValueError("pixel_param='direct' supports "
+                             "--patch_mode raw only, got "
+                             f"mode={self.mode!r}")
         if self.mode == "lap" and not self.reference and not self.init_from:
             raise ValueError("mode='lap' needs `reference` (or `init_from`)")
         if self.mode in ("csf", "universal_csf"):
@@ -417,6 +457,14 @@ class Patch:
             return torch.randn(3, c.size, c.size,
                                device=self.device).requires_grad_(True)
 
+        if c.pixel_param == "direct":
+            # 0.5 DIRECTLY. Both parameterisations must start from the
+            # SAME IMAGE -- uniform mid grey -- or the ablation compares
+            # two runs that began at different patches and attributes the
+            # difference to the step rule. sigmoid(0) = 0.5 is what the
+            # branch below relies on for exactly the same reason.
+            return torch.full((3, c.size, c.size), 0.5,
+                              device=self.device).requires_grad_(True)
         # raw: zeros -> sigmoid -> uniform 0.5 grey
         return torch.zeros(3, c.size, c.size,
                            device=self.device).requires_grad_(True)
@@ -500,7 +548,20 @@ class Patch:
                     c.csf_beta, mask=self.shape_mask)
             return (base + d[0]).clamp(0.0, 1.0)
 
-        p = torch.sigmoid(self.param)
+        if c.pixel_param == "direct":
+            # NO CLAMP HERE, and that is the point. project() holds the
+            # parameter in [0,1] after every step and the constructor
+            # starts it there, so the forward pass never sees an
+            # out-of-range pixel and never needs to flatten one. Clamping
+            # here instead would put the bound INSIDE the graph and make
+            # saturation an absorbing state -- the failure residual()
+            # measured on the spectrum, where frac_at_bound sat at 0.989
+            # for 200 steps. The whole content of 'direct' is that the
+            # bound is a PROJECTION, applied after the step, exactly as
+            # PGD applies it.
+            p = self.param
+        else:
+            p = torch.sigmoid(self.param)
         if c.mode == "lap" and c.lap_freeze_edges and self.edges is not None:
             # Pin the reference's strong edges so the outline survives — the
             # Grad term of Tan et al. Eq 5. Interior pixels stay free.
@@ -731,6 +792,12 @@ class Patch:
                 # from clamping in the forward pass, and it is what keeps the
                 # spectral allocation a free variable instead of a constant.
                 self._project_spectrum()
+            elif self.cfg.pixel_param == "direct":
+                # THE PROJECTION STEP PGD TAKES: an unconstrained step,
+                # then back into the feasible box. Under this branch
+                # logit_clip is meaningless (there is no logit) and is
+                # ignored.
+                self.param.data.clamp_(0.0, 1.0)
             elif self.cfg.logit_clip > 0:
                 self.param.data.clamp_(-self.cfg.logit_clip,
                                        self.cfg.logit_clip)
@@ -912,6 +979,25 @@ class Patch:
                     # mode='csf' was missing while it froze.
                     "frac_at_bound": frac_at_bound,
                     "spend_mean": spend_mean}
+        if self.cfg.pixel_param == "direct":
+            px = self.param
+            # frac_at_clip MEANS SOMETHING DIFFERENT HERE, and it is the
+            # measurement the ablation turns on. Under the sigmoid it
+            # counts pixels whose LOGIT has run to the clip, where the
+            # gradient is small but non-zero and recovery is possible.
+            # Under 'direct' it counts pixels sitting ON the [0,1] bound,
+            # where the clamp in project() has zeroed the gradient
+            # outright. The module docstring claims a patch wants to live
+            # exactly there; this is the number that says whether it does,
+            # and whether being there costs it.
+            return {"pixel_std": px.std().item(),
+                    "frac_at_clip": ((px <= 0.0) | (px >= 1.0)
+                                     ).float().mean().item(),
+                    # NOT logit_absmax: there is no logit under this
+                    # branch, and reporting the pixel range under that
+                    # name would put two different quantities in one
+                    # column of the index CSV.
+                    "param_absmax": px.abs().max().item()}
         px = torch.sigmoid(self.param)
         lim = self.cfg.logit_clip if self.cfg.logit_clip > 0 else 12.0
         return {"pixel_std": px.std().item(),
@@ -929,6 +1015,8 @@ class Patch:
         torch.save({"param": self.param.detach().cpu(),
                     "config": asdict(self.cfg),
                     "parameterisation": ("latent" if self.cfg.mode == "gan"
+                                         else "pixel" if
+                                         self.cfg.pixel_param == "direct"
                                          else "sigmoid"),
                     "placement": self.placement}, path)
 

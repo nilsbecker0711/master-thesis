@@ -109,6 +109,16 @@ def build_parser():
 
     p.add_argument("--steps", type=int, default=300)
     p.add_argument("--lr", type=float, default=0.01)
+    p.add_argument("--optimiser", default="adam",
+                   choices=["adam", "sign"],
+                   help="step rule. 'adam' is every run to date; 'sign' "
+                        "is PGD's update, matched at equal lr. THIS is "
+                        "the script the optimiser ablation should use: a "
+                        "single image cannot settle it, because four "
+                        "identical single-image invocations already span "
+                        "9.6 points of remote drop (see "
+                        "attack_image's lr_schedule note). Pair with "
+                        "--pixel_param direct for the full PGD recipe.")
     # Same default as overfit.py, deliberately. optimise.py's header states the
     # rule: anything that changes the attack changes BOTH callers or neither,
     # or the population numbers stop matching the single-image numbers and
@@ -180,7 +190,14 @@ def main():
     if a.out_dir:
         out_dir = Path(a.out_dir)
     else:
-        tag = "_".join(x for x in [a.arch, a.patch_mode, a.loss_fn,
+        # Non-default arms only, so directories written before these flags
+        # existed keep their names and results/population does not fork
+        # into two conventions.
+        arm = "_".join(x for x in
+                       ["" if a.optimiser == "adam" else a.optimiser,
+                        "" if a.pixel_param == "sigmoid"
+                        else a.pixel_param] if x)
+        tag = "_".join(x for x in [a.arch, a.patch_mode, a.loss_fn, arm,
                                    f"n{len(idxs)}", tsallis_tag(a),
                                    a.tag] if x)
         out_dir = Path(increment_path(Path(a.out_root) / tag))
@@ -259,7 +276,7 @@ def main():
         rec = optimise.attack_image(
             model, img, label, patch,
             loss_fn=a.loss_fn, target_class=a.target_class, steps=a.steps,
-            lr=a.lr, num_classes=a.num_classes,
+            lr=a.lr, optimiser=a.optimiser, num_classes=a.num_classes,
             exclude_footprint=a.exclude_footprint, log_every=a.log_every,
             lr_schedule=a.lr_schedule, classes=a.classes,
             clean_logits=clean_logits, out_dir=patch_dir / f"img{i:04d}",
