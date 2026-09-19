@@ -82,6 +82,23 @@ def main():
     if use_slide:
         print(f"[eval] slide crop={tuple(tc['crop_size'])} "
               f"stride={tuple(tc['stride'])}")
+        print("[eval] NOT the clean reference for any attack run. Under slide "
+              "each window
+"
+              "       is an independent forward, so a patch cannot influence "
+              "pixels outside
+"
+              "       the windows containing it — at 1024x2048 that caps "
+              "setr_pup's reach at
+"
+              "       448/704px L/R while segformer and deeplab stay at 960, "
+              "an ARCH-DEPENDENT
+"
+              "       ceiling on the very quantity the thesis measures. Attack "
+              "paths use whole;
+"
+              "       compare a slide number only against the published zoo "
+              "value.")
 
     ds = CityscapesSeg(a.cityscapes_root, "val", a.img_h, a.img_w)
     loader = DataLoader(Subset(ds, list(range(min(a.n_images, len(ds))))),
