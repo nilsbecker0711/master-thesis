@@ -42,6 +42,15 @@ from patchreach.metrics.miou import SegMetric
 from patchreach.models.wrapper import slide_logits
 from patchreach.utils import get_device, seed_everything
 
+SLIDE_WARNING = """[eval] A SLIDE NUMBER IS NOT THE CLEAN REFERENCE FOR AN ATTACK RUN.
+       Under slide each window is an independent forward, so a patch cannot
+       influence pixels outside the windows containing it. At 1024x2048 with a
+       centred 128px patch that caps reach at 448/704px L/R for setr_pup, while
+       segformer and deeplab reach 960 — an ARCHITECTURE-DEPENDENT ceiling on
+       the quantity aggregate.py bins out to 1200px. Every attack path uses
+       whole-image forward. Compare this number to the published zoo value and
+       to nothing else."""
+
 
 def main():
     p = add_model_args(argparse.ArgumentParser())
@@ -82,23 +91,7 @@ def main():
     if use_slide:
         print(f"[eval] slide crop={tuple(tc['crop_size'])} "
               f"stride={tuple(tc['stride'])}")
-        print("[eval] NOT the clean reference for any attack run. Under slide "
-              "each window
-"
-              "       is an independent forward, so a patch cannot influence "
-              "pixels outside
-"
-              "       the windows containing it — at 1024x2048 that caps "
-              "setr_pup's reach at
-"
-              "       448/704px L/R while segformer and deeplab stay at 960, "
-              "an ARCH-DEPENDENT
-"
-              "       ceiling on the very quantity the thesis measures. Attack "
-              "paths use whole;
-"
-              "       compare a slide number only against the published zoo "
-              "value.")
+        print(SLIDE_WARNING)
 
     ds = CityscapesSeg(a.cityscapes_root, "val", a.img_h, a.img_w)
     loader = DataLoader(Subset(ds, list(range(min(a.n_images, len(ds))))),
