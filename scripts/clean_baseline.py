@@ -56,7 +56,12 @@ def main():
                         "whole for deeplab/unet — use this to reproduce "
                         "published numbers. slide: force it.")
     a = p.parse_args()
-    a.out= f'{a.out}_{a.tag}.json' if a.tag else a.out
+    # The tag is folded in ONCE, here. It used to be applied again where the
+    # file is written, which produced 'clean_baselines_x.json_x' — tag twice,
+    # and the .json buried mid-name. Strip any .json the caller passed so
+    # --out foo.json --tag x lands on foo_x.json rather than foo.json_x.json.
+    _stem = a.out[:-5] if a.out.endswith(".json") else a.out
+    a.out = f"{_stem}_{a.tag}.json" if a.tag else f"{_stem}.json"
     seed_everything(a.seed)
     device = get_device()
     model, n_ch, n_act, spec = setup_model(a)
@@ -121,7 +126,7 @@ def main():
            "per_class_iou": {class_name(c): (None if torch.isnan(iou[c])
                                              else float(iou[c]))
                              for c in range(min(a.num_classes, 19))}}
-    out = Path(f"{a.out}_{a.tag}" if a.tag else a.out)
+    out = Path(a.out)
     out.parent.mkdir(parents=True, exist_ok=True)
     all_rec = json.loads(out.read_text()) if out.exists() else []
     all_rec.append(rec)
