@@ -17,6 +17,15 @@ per-image mIoU averages over only the classes present in that image, so a rare
 class covering a few hundred pixels scores near zero and drags the mean down —
 50 per-image is normal for a model that scores 76 on the dataset. Do not
 compare the two.
+
+WHOLE vs SLIDE INFERENCE — the other half of reproducing a published number.
+DeepLab and UNet declare test_cfg=dict(mode='whole'), so a single forward IS
+their published procedure. SegFormer and SETR declare mode='slide', and their
+published Cityscapes numbers come from overlapping crops; a whole forward reads
+several points low for them. --inference auto honours whatever the config
+declares, which is what you want when checking a checkpoint against the zoo.
+The default stays 'whole' so every other script's behaviour is unchanged, and
+the attack path never uses slide at all.
 """
 from __future__ import annotations
 
@@ -30,6 +39,7 @@ from torch.utils.data import DataLoader, Subset
 from _common import add_model_args, setup_model
 from patchreach.data.cityscapes import CityscapesSeg, class_name, upsample_to
 from patchreach.metrics.miou import SegMetric
+from patchreach.models.wrapper import slide_logits
 from patchreach.utils import get_device, seed_everything
 
 
@@ -38,11 +48,35 @@ def main():
     p.add_argument("--n_images", type=int, default=20)
     p.add_argument("--out", default=f"results/clean_baselines")
     p.add_argument("--tag", type=str, default=None)
+    p.add_argument("--inference", choices=["whole", "slide", "auto"],
+                   default="whole",
+                   help="whole: one forward (default, matches every other "
+                        "script and the attack path). auto: honour the "
+                        "config's test_cfg, i.e. slide for segformer/setr and "
+                        "whole for deeplab/unet — use this to reproduce "
+                        "published numbers. slide: force it.")
     a = p.parse_args()
     a.out= f'{a.out}_{a.tag}.json' if a.tag else a.out
     seed_everything(a.seed)
     device = get_device()
     model, n_ch, n_act, spec = setup_model(a)
+
+    # test_cfg rides on cfg.model, which build_segmentor attaches to the
+    # segmentor — so the crop/stride come from the checkpoint's own config and
+    # nothing is hard-coded per architecture.
+    tc = getattr(model.model, "test_cfg", None) or {}
+    use_slide = (a.inference == "slide"
+                 or (a.inference == "auto" and tc.get("mode") == "slide"))
+    if use_slide and not (tc.get("crop_size") and tc.get("stride")):
+        raise SystemExit(
+            f"--inference {a.inference} needs crop_size and stride in the "
+            f"config's test_cfg, but {a.arch} declares mode="
+            f"{tc.get('mode')!r}. Nothing to slide with — use "
+            f"--inference whole.")
+    mode = "slide" if use_slide else "whole"
+    if use_slide:
+        print(f"[eval] slide crop={tuple(tc['crop_size'])} "
+              f"stride={tuple(tc['stride'])}")
 
     ds = CityscapesSeg(a.cityscapes_root, "val", a.img_h, a.img_w)
     loader = DataLoader(Subset(ds, list(range(min(a.n_images, len(ds))))),
@@ -53,7 +87,10 @@ def main():
     with torch.no_grad():
         for i, (img, lbl) in enumerate(loader):
             img, lbl = img.to(device), lbl.to(device)
-            pred = upsample_to(model(img), lbl.shape[-2:]).argmax(1)
+            logits = (slide_logits(model, img, tuple(tc["crop_size"]),
+                                   tuple(tc["stride"]), a.num_classes)
+                      if use_slide else model(img))
+            pred = upsample_to(logits, lbl.shape[-2:]).argmax(1)
             m.update(pred, lbl)
             one = SegMetric(a.num_classes, device=device)
             one.update(pred, lbl)
@@ -63,7 +100,8 @@ def main():
     dataset_miou = m.compute()
 
     print(f"\n{'='*66}")
-    print(f" {a.arch} @ {a.img_h}x{a.img_w} over {len(per_image)} val images")
+    print(f" {a.arch} @ {a.img_h}x{a.img_w} ({mode}) over "
+          f"{len(per_image)} val images")
     print(f"{'='*66}")
     print(f"  DATASET mIoU  : {dataset_miou:.2f}   <- compare to published")
     pim = torch.tensor(per_image)
@@ -76,6 +114,7 @@ def main():
             print(f"    {c:2d} {class_name(c):10s}: {iou[c]:6.2f}")
 
     rec = {"arch": a.arch, "img_h": a.img_h, "img_w": a.img_w,
+           "inference": mode,
            "n_images": len(per_image), "dataset_miou": dataset_miou,
            "per_image_mean": float(pim.mean()), "per_image_std": float(pim.std()),
            "backbone_channels": n_ch, "backbone_active": n_act,
