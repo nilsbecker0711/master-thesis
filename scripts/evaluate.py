@@ -29,6 +29,7 @@ from pathlib import Path
 import torch
 
 from _common import (add_model_args, setup_model, image_indices, FIXED10)
+from _common import make_dataset
 from patchreach.data.cityscapes import (CityscapesSeg, class_name,
                                         norm_tensors, upsample_to)
 from patchreach.diagnostics import report
@@ -107,7 +108,7 @@ def main():
     print(f"\n[patch] loaded {a.checkpoint}")
     patch.describe(a.img_h, a.img_w)
 
-    ds = CityscapesSeg(a.cityscapes_root, "val", a.img_h, a.img_w)
+    ds = make_dataset(a, "val")
     idxs = image_indices(a.images, len(ds))
 
     tag = "_".join(x for x in [Path(a.checkpoint).parent.name,

@@ -33,6 +33,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 # came from updating one copy and not the other.
 from _common import (add_model_args, add_patch_args, setup_model,
                      build_patch, tsallis_kwargs, tsallis_tag)
+from _common import make_dataset
 from patchreach.data.cityscapes import CityscapesSeg, norm_tensors, upsample_to
 from patchreach.diagnostics import report
 from patchreach.losses import adversarial, reach as reach_mod
@@ -222,8 +223,8 @@ def main():
               f"{args.num_classes}; trainIds 0..18 are used, the rest are inert")
 
     mean_t, std_t = norm_tensors(device)
-    train_ds = CityscapesSeg(args.cityscapes_root, "train", args.img_h, args.img_w)
-    val_full = CityscapesSeg(args.cityscapes_root, "val", args.img_h, args.img_w)
+    train_ds = make_dataset(args, "train")
+    val_full = make_dataset(args, "val")
     train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True,
                               num_workers=args.num_workers, pin_memory=True)
     val_loader = DataLoader(

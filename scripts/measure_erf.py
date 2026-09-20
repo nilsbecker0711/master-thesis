@@ -28,6 +28,7 @@ from pathlib import Path
 import torch
 
 from _common import add_model_args, add_patch_args, setup_model, build_patch
+from _common import make_dataset
 from patchreach.data.cityscapes import CityscapesSeg, norm_tensors
 from patchreach.diagnostics import geometric
 from patchreach.utils import get_device, seed_everything
@@ -47,7 +48,7 @@ def main():
     model, n_ch, n_act, spec = setup_model(a)
     mean_t, std_t = norm_tensors(device)
 
-    ds = CityscapesSeg(a.cityscapes_root, "val", a.img_h, a.img_w)
+    ds = make_dataset(a, "val")
     patch = build_patch(a, device, mean_t, std_t)
 
     out_dir = Path(a.out_dir) / f"{a.arch}_{a.img_h}x{a.img_w}"

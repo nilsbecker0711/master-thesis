@@ -37,9 +37,9 @@ import torch
 from torch.utils.data import DataLoader, Subset
 
 from _common import add_model_args, setup_model
+from _common import make_dataset
 from patchreach.data.cityscapes import CityscapesSeg, class_name, upsample_to
 from patchreach.metrics.miou import SegMetric
-from patchreach.models.wrapper import slide_logits
 from patchreach.utils import get_device, seed_everything
 
 SLIDE_WARNING = """[eval] A SLIDE NUMBER IS NOT THE CLEAN REFERENCE FOR AN ATTACK RUN.
@@ -57,13 +57,6 @@ def main():
     p.add_argument("--n_images", type=int, default=20)
     p.add_argument("--out", default=f"results/clean_baselines")
     p.add_argument("--tag", type=str, default=None)
-    p.add_argument("--inference", choices=["whole", "slide", "auto"],
-                   default="whole",
-                   help="whole: one forward (default, matches every other "
-                        "script and the attack path). auto: honour the "
-                        "config's test_cfg, i.e. slide for segformer/setr and "
-                        "whole for deeplab/unet — use this to reproduce "
-                        "published numbers. slide: force it.")
     a = p.parse_args()
     # The tag is folded in ONCE, here. It used to be applied again where the
     # file is written, which produced 'clean_baselines_x.json_x' — tag twice,
@@ -75,25 +68,14 @@ def main():
     device = get_device()
     model, n_ch, n_act, spec = setup_model(a)
 
-    # test_cfg rides on cfg.model, which build_segmentor attaches to the
-    # segmentor — so the crop/stride come from the checkpoint's own config and
-    # nothing is hard-coded per architecture.
-    tc = getattr(model.model, "test_cfg", None) or {}
-    use_slide = (a.inference == "slide"
-                 or (a.inference == "auto" and tc.get("mode") == "slide"))
-    if use_slide and not (tc.get("crop_size") and tc.get("stride")):
-        raise SystemExit(
-            f"--inference {a.inference} needs crop_size and stride in the "
-            f"config's test_cfg, but {a.arch} declares mode="
-            f"{tc.get('mode')!r}. Nothing to slide with — use "
-            f"--inference whole.")
-    mode = "slide" if use_slide else "whole"
-    if use_slide:
-        print(f"[eval] slide crop={tuple(tc['crop_size'])} "
-              f"stride={tuple(tc['stride'])}")
+    # setup_model already wrapped the model for --inference, so model(img)
+    # slides or not by construction; only the warning and the record need to
+    # know which happened.
+    mode = getattr(model, "mode", "whole")
+    if mode == "slide":
         print(SLIDE_WARNING)
 
-    ds = CityscapesSeg(a.cityscapes_root, "val", a.img_h, a.img_w)
+    ds = make_dataset(a, "val")
     loader = DataLoader(Subset(ds, list(range(min(a.n_images, len(ds))))),
                         batch_size=1, num_workers=2)
 
@@ -102,10 +84,7 @@ def main():
     with torch.no_grad():
         for i, (img, lbl) in enumerate(loader):
             img, lbl = img.to(device), lbl.to(device)
-            logits = (slide_logits(model, img, tuple(tc["crop_size"]),
-                                   tuple(tc["stride"]), a.num_classes)
-                      if use_slide else model(img))
-            pred = upsample_to(logits, lbl.shape[-2:]).argmax(1)
+            pred = upsample_to(model(img), lbl.shape[-2:]).argmax(1)
             m.update(pred, lbl)
             one = SegMetric(a.num_classes, device=device)
             one.update(pred, lbl)
@@ -129,7 +108,7 @@ def main():
             print(f"    {c:2d} {class_name(c):10s}: {iou[c]:6.2f}")
 
     rec = {"arch": a.arch, "img_h": a.img_h, "img_w": a.img_w,
-           "inference": mode,
+           "inference": mode, "scale": getattr(a, "scale", "resize"),
            "n_images": len(per_image), "dataset_miou": dataset_miou,
            "per_image_mean": float(pim.mean()), "per_image_std": float(pim.std()),
            "backbone_channels": n_ch, "backbone_active": n_act,

@@ -49,6 +49,7 @@ from pathlib import Path
 import torch
 
 from _common import add_model_args, setup_model
+from _common import make_dataset
 from patchreach.data.cityscapes import CityscapesSeg, norm_tensors, upsample_to
 from patchreach.metrics.miou import single_image_miou, attack_rates
 from patchreach.patch.spec import Patch
@@ -170,7 +171,7 @@ def main():
     print(f"[matrix] white-box diagonal read from overfit results.json: "
           f"{len(diag)}/{len(a.losses) * len(a.archs)} found")
 
-    ds = CityscapesSeg(a.cityscapes_root, "val", a.img_h, a.img_w)
+    ds = make_dataset(a, "val")
     imgs = {}
     for idx in {a.train_image, a.transfer_image}:
         im, lb = ds[idx]

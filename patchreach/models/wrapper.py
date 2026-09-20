@@ -1,8 +1,10 @@
-"""Gradient-preserving wrapper around an mmseg EncoderDecoder."""
+"""Gradient-preserving wrappers around an mmseg EncoderDecoder."""
 from __future__ import annotations
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
+import torch.utils.checkpoint as cp
 
 
 class WrappedSegModel(nn.Module):
@@ -16,6 +18,8 @@ class WrappedSegModel(nn.Module):
     encode_decode is defined on EncoderDecoder, so this works identically for
     InternImage, SegFormer and Swin with no per-arch branching.
     """
+
+    mode = "whole"
 
     def __init__(self, model: nn.Module):
         super().__init__()
@@ -35,38 +39,85 @@ class WrappedSegModel(nn.Module):
         return self.model.encode_decode(x, self._metas(B, H, W))
 
 
-@torch.no_grad()
-def slide_logits(model, img, crop, stride, num_classes):
-    r"""
-    mmseg's slide_inference, reproduced. Overlapping crops, logits accumulated
-    and divided by the per-pixel window count.
-
-    WHY THIS EXISTS AND WHY forward() IS NOT IT. WrappedSegModel.forward is one
-    whole-image encode_decode, which is what patch optimisation needs: a single
-    differentiable pass. But SegFormer's and SETR's PUBLISHED Cityscapes numbers
-    come from sliding-window inference — their configs carry
-    test_cfg=dict(mode='slide', crop_size=..., stride=...), mmseg's inference()
-    honours it, and encode_decode does not. A whole forward reads several points
-    low against those numbers, and that is the PROCEDURE differing, not the
-    checkpoint being wrong. DeepLab and UNet declare mode='whole', so for them
-    the published procedure IS forward() and this function is never needed.
-
-    NOT FOR ATTACKS. Three overlapping forwards with averaged logits smear the
-    patch gradient across windows and triple the cost. The attack path stays on
-    forward(); this is for clean baselines only.
+def slide_windows(H: int, W: int, crop, stride):
     """
-    B, _, H, W = img.shape
+    Yield (y1, y2, x1, x2) per window — mmseg's slide_inference grid.
+
+    The max()/min() clamping is mmseg's and is load-bearing: a frame SMALLER
+    than the crop yields exactly one window covering the whole frame rather
+    than an out-of-range slice, so a slide model still works when probed at a
+    small resolution (channel_probe does exactly that).
+    """
     ch, cw = crop
     sh, sw = stride
     h_grids = max(H - ch + sh - 1, 0) // sh + 1
     w_grids = max(W - cw + sw - 1, 0) // sw + 1
-    preds = img.new_zeros((B, num_classes, H, W))
-    count = img.new_zeros((B, 1, H, W))
     for hi in range(h_grids):
         for wi in range(w_grids):
             y1, x1 = hi * sh, wi * sw
             y2, x2 = min(y1 + ch, H), min(x1 + cw, W)
-            y1, x1 = max(y2 - ch, 0), max(x2 - cw, 0)
-            preds[:, :, y1:y2, x1:x2] += model(img[:, :, y1:y2, x1:x2])
+            yield max(y2 - ch, 0), y2, max(x2 - cw, 0), x2
+
+
+class SlidingWindowSegModel(nn.Module):
+    r"""
+    mmseg's slide_inference, DIFFERENTIABLE. Same contract as WrappedSegModel —
+    [B,3,H,W] -> logits [B,K,H,W] — so every existing call site keeps working
+    and the attack path needs no per-forward branching.
+
+    WHY A MODULE AND NOT A FLAG. There are ~30 `model(x)` forwards across
+    scripts/, patchreach/patch/ and patchreach/diagnostics/. Threading an
+    inference mode through all of them would be invasive and easy to get
+    half-right; wrapping the model instead means the mode is chosen once in
+    setup_model and is honoured everywhere by construction.
+
+    WHEN TO USE IT. Only to match a checkpoint's PUBLISHED inference procedure
+    (SegFormer and SETR declare test_cfg mode='slide'; DeepLab and UNet declare
+    'whole'). It is NOT the right mode for the reach measurement: each window is
+    an independent forward, so a patch cannot influence pixels outside the
+    windows containing it. At 1024x2048 with a centred 128px patch that caps
+    reach at 448/704px L/R for setr_pup while segformer and deeplab reach 960 —
+    an architecture-dependent ceiling on the quantity aggregate.py bins out to
+    1200px. Cross-architecture comparisons stay on whole.
+
+    MEMORY. The loss is computed on the STITCHED logits, so the graphs of all
+    windows are live at backward — roughly n_windows times one window's
+    activations. checkpoint=True trades that for one window's worth by
+    recomputing each window during backward, at the cost of a second forward.
+    """
+
+    mode = "slide"
+
+    def __init__(self, model: nn.Module, crop, stride, num_classes: int,
+                 checkpoint: bool = False):
+        super().__init__()
+        self.model = model
+        self.crop = tuple(int(v) for v in crop)
+        self.stride = tuple(int(v) for v in stride)
+        self.num_classes = int(num_classes)
+        self.checkpoint = bool(checkpoint)
+        self.eval()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        B, _, H, W = x.shape
+        # Accumulated OUT OF PLACE via F.pad, as mmseg does. An in-place
+        # slice-add into a tensor carrying grad history is autograd-legal but
+        # fragile; this form is unambiguous and costs one full-size buffer per
+        # window, which is small next to the activations.
+        preds = x.new_zeros((B, self.num_classes, H, W))
+        count = x.new_zeros((1, 1, H, W))          # never needs grad
+        for y1, y2, x1, x2 in slide_windows(H, W, self.crop, self.stride):
+            win = x[:, :, y1:y2, x1:x2]
+            if self.checkpoint and torch.is_grad_enabled():
+                logit = cp.checkpoint(self.model, win, use_reentrant=False)
+            else:
+                logit = self.model(win)
+            preds = preds + F.pad(logit, (x1, W - x2, y1, H - y2))
             count[:, :, y1:y2, x1:x2] += 1
-    return preds / count
+        return preds / count
+
+
+@torch.no_grad()
+def slide_logits(model, img, crop, stride, num_classes):
+    """Inference-only slide. Kept for callers that want it without a wrapper."""
+    return SlidingWindowSegModel(model, crop, stride, num_classes)(img)

@@ -11,7 +11,7 @@ import torch
 
 from patchreach.data.cityscapes import CityscapesSeg, norm_tensors
 from patchreach.models.registry import REGISTRY, resolve, load_segmentor
-from patchreach.models.wrapper import WrappedSegModel
+from patchreach.models.wrapper import SlidingWindowSegModel, WrappedSegModel
 from patchreach.utils import get_device, seed_everything, channel_probe
 
 # Ten fixed val images. EVERY number in the thesis is reported on these, so
@@ -33,6 +33,28 @@ def add_model_args(p):
                         "where a script supports one — validated in setup_model().")
     p.add_argument("--img_h", type=int, default=512)
     p.add_argument("--img_w", type=int, default=1024)
+    p.add_argument("--scale", choices=["resize", "crop"], default="resize",
+                   help="resize (default): squeeze the whole 2048x1024 frame "
+                        "into img_h x img_w — tensor shape matches the mmseg "
+                        "training crop, pixel density does not. crop: cut that "
+                        "window out of the NATIVE frame, so density is what "
+                        "every published number is measured at. See "
+                        "CityscapesSeg.")
+    p.add_argument("--inference", choices=["whole", "slide", "auto"],
+                   default="whole",
+                   help="whole (default): one forward, what every attack and "
+                        "reach measurement uses. auto: honour the checkpoint's "
+                        "test_cfg — slide for segformer/setr, whole for "
+                        "deeplab/unet — to reproduce published numbers. slide: "
+                        "force it. NOTE slide makes each window an independent "
+                        "forward, capping patch reach per architecture; do not "
+                        "use it for cross-architecture comparisons.")
+    p.add_argument("--slide_checkpoint", action="store_true",
+                   help="--inference slide only: recompute each window during "
+                        "backward instead of holding every window's graph. "
+                        "One window's activations instead of n_windows', at "
+                        "the cost of a second forward. Use when the attack "
+                        "OOMs at native resolution.")
     p.add_argument("--num_classes", type=int, default=19)
     p.add_argument("--seed", type=int, default=42)
     return p
@@ -406,10 +428,49 @@ def setup_model(a):
     print(f"[ckpt] {weights}")
     device = get_device()
     model = WrappedSegModel(load_segmentor(cfg, weights)[0]).to(device)
+
+    # Inference mode is decided ONCE, here, by wrapping the model — so the ~30
+    # `model(x)` forwards across scripts/ and patchreach/ honour it without any
+    # per-call branching. test_cfg rides on cfg.model, which build_segmentor
+    # attaches to the segmentor, so crop and stride come from the checkpoint's
+    # own config and nothing is hard-coded per architecture.
+    tc = getattr(model.model, "test_cfg", None) or {}
+    want = getattr(a, "inference", "whole")
+    if want == "slide" or (want == "auto" and tc.get("mode") == "slide"):
+        if not (tc.get("crop_size") and tc.get("stride")):
+            raise SystemExit(
+                f"--inference {want} needs crop_size and stride in the config's "
+                f"test_cfg, but {a.arch} declares mode={tc.get('mode')!r}. "
+                f"Nothing to slide with — use --inference whole.")
+        crop, stride = tuple(tc["crop_size"]), tuple(tc["stride"])
+        model = SlidingWindowSegModel(
+            model, crop, stride, a.num_classes,
+            checkpoint=getattr(a, "slide_checkpoint", False)).to(device)
+        print(f"[infer] slide crop={crop} stride={stride}"
+              f"{' (checkpointed)' if model.checkpoint else ''}")
+    else:
+        print("[infer] whole")
+
     n_ch, n_act = channel_probe(model, device, min(a.img_h, 512),
                                 min(a.img_w, 1024))
     print(f"[head] {n_ch} channels ({n_act} numerically active)")
     return model, n_ch, n_act, spec
+
+
+def make_dataset(a, split, random_crop=None):
+    """
+    CityscapesSeg honouring --img_h/--img_w and --scale.
+
+    Single construction point so `--scale crop` cannot be silently ignored by
+    one script while another honours it. random_crop defaults to True on the
+    train split under scale='crop' (a fixed centre crop every epoch would give
+    universal-patch training no scene diversity) and False everywhere else.
+    """
+    if random_crop is None:
+        random_crop = (split == "train")
+    return CityscapesSeg(a.cityscapes_root, split, a.img_h, a.img_w,
+                         scale=getattr(a, "scale", "resize"),
+                         random_crop=random_crop)
 
 
 def image_indices(arg, n_val):
