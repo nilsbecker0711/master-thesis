@@ -77,6 +77,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from _common import (add_model_args, add_patch_args, setup_model, build_patch,
                      image_indices, tsallis_kwargs, tsallis_tag)
+from _common import make_dataset
 from patchreach.data.cityscapes import CityscapesSeg, norm_tensors, upsample_to
 from patchreach.diagnostics import aggregate, report
 from patchreach.metrics import population as pop_mod
@@ -184,7 +185,7 @@ def main():
     model, n_ch, n_act, spec = setup_model(a)
     mean_t, std_t = norm_tensors(device)
 
-    ds = CityscapesSeg(a.cityscapes_root, "val", a.img_h, a.img_w)
+    ds = make_dataset(a, "val")
     idxs = resolve_images(a, len(ds))
 
     if a.out_dir:

@@ -5,6 +5,7 @@ import torch
 import torch.nn.functional as F
 from torchvision import transforms
 from torchvision.datasets import Cityscapes
+from torchvision.transforms import functional as TF
 
 # ImageNet normalisation on the [0,1] scale. Arithmetically identical to
 # mmseg's img_norm_cfg mean=[123.675,116.28,103.53] std=[58.395,57.12,57.375]
@@ -67,25 +68,60 @@ def norm_tensors(device):
 
 
 class CityscapesSeg(torch.utils.data.Dataset):
-    def __init__(self, root, split="train", img_h=512, img_w=1024):
+    r"""
+    scale='resize'  DEFAULT, and what every run before 2026-09 used. Squeeze the
+                    whole 2048x1024 frame into (img_h, img_w). At 512x1024 the
+                    tensor SHAPE matches the mmseg training crop but the pixel
+                    DENSITY does not: every object is 2x smaller than anything
+                    the model saw, which costs deeplab_18 ~5 mIoU and hits thin
+                    classes (pole, fence, rider) hardest.
+
+    scale='crop'    Cut an (img_h, img_w) window out of the NATIVE frame. Pixel
+                    density is native — what ratio_range=(0.5,2.0) is centred on
+                    and what every published number is measured at. The scene is
+                    partial; that is the trade. At 512x1024 this is exactly the
+                    three DeepLabs' training condition, at 1024x1024 SegFormer's,
+                    at 768x768 SETR's.
+
+    random_crop     Only meaningful with scale='crop'. Use it for the TRAIN split
+                    (a centre crop gives the identical window every epoch, which
+                    kills augmentation diversity for universal patches) and leave
+                    it off for val so runs stay comparable.
+    """
+
+    def __init__(self, root, split="train", img_h=512, img_w=1024,
+                 scale="resize", random_crop=False):
+        if scale not in ("resize", "crop"):
+            raise ValueError(f"scale must be 'resize' or 'crop', got {scale!r}")
         self.ds = Cityscapes(root, split=split, mode="fine",
                              target_type="semantic")
-        self.img_tf = transforms.Compose([
-            transforms.Resize((img_h, img_w)),
-            transforms.ToTensor(),
-            transforms.Normalize(IMG_MEAN, IMG_STD)])
-        self.lbl_tf = transforms.Compose([
-            transforms.Resize(
-                (img_h, img_w),
-                interpolation=transforms.InterpolationMode.NEAREST),
-            transforms.PILToTensor()])
+        self.hw = (int(img_h), int(img_w))
+        self.scale = scale
+        self.random_crop = bool(random_crop) and scale == "crop"
+        self.post_img = transforms.Compose([
+            transforms.ToTensor(), transforms.Normalize(IMG_MEAN, IMG_STD)])
 
     def __len__(self):
         return len(self.ds)
 
     def __getitem__(self, idx):
         img, lbl = self.ds[idx]
-        return self.img_tf(img), remap_labels(self.lbl_tf(lbl).squeeze(0).long())
+        if self.scale == "resize":
+            img = TF.resize(img, list(self.hw))
+            lbl = TF.resize(lbl, list(self.hw),
+                            interpolation=transforms.InterpolationMode.NEAREST)
+        elif self.random_crop:
+            # Params drawn ONCE and applied to both. Two independent RandomCrop
+            # transforms would draw different offsets for image and label and
+            # misalign them silently — invisible in the loss, visible only as a
+            # mIoU that will not rise.
+            i, j, h, w = transforms.RandomCrop.get_params(img, self.hw)
+            img, lbl = TF.crop(img, i, j, h, w), TF.crop(lbl, i, j, h, w)
+        else:
+            img = TF.center_crop(img, list(self.hw))
+            lbl = TF.center_crop(lbl, list(self.hw))
+        return self.post_img(img), remap_labels(
+            TF.pil_to_tensor(lbl).squeeze(0).long())
 
 
 def upsample_to(logits: torch.Tensor, hw) -> torch.Tensor:

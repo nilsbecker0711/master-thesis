@@ -61,6 +61,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from _common import (add_model_args, add_generator_args, build_generator_config,
                      setup_model, tsallis_kwargs, tsallis_tag)
+from _common import make_dataset
 from patchreach.data.cityscapes import CityscapesSeg, norm_tensors, upsample_to
 from patchreach.diagnostics import conditional as cviz, report
 from patchreach.losses import adversarial
@@ -413,8 +414,8 @@ def main():
               f"trainIds 0..18 are used, the rest are inert")
 
     mean_t, std_t = norm_tensors(device)
-    train_full = CityscapesSeg(a.cityscapes_root, "train", a.img_h, a.img_w)
-    val_full = CityscapesSeg(a.cityscapes_root, "val", a.img_h, a.img_w)
+    train_full = make_dataset(a, "train")
+    val_full = make_dataset(a, "val")
     train_ds = (Subset(train_full, list(range(min(a.train_images,
                                                   len(train_full)))))
                 if a.train_images else train_full)

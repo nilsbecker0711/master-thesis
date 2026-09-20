@@ -41,6 +41,7 @@ from torchvision.utils import save_image
 
 from _common import (add_model_args, add_patch_args, setup_model,
                      build_patch, tsallis_kwargs, tsallis_tag)
+from _common import make_dataset
 from patchreach.data.cityscapes import CityscapesSeg, norm_tensors, upsample_to
 from patchreach.diagnostics import report
 from patchreach.patch import optimise, segmentation_cam
@@ -306,7 +307,7 @@ def _run(a, out_dir: Path):
     model, n_ch, n_act, spec = setup_model(a)
     mean_t, std_t = norm_tensors(device)
 
-    ds = CityscapesSeg(a.cityscapes_root, "val", a.img_h, a.img_w)
+    ds = make_dataset(a, "val")
     img, label = ds[a.image]
     img, label = img.unsqueeze(0).to(device), label.unsqueeze(0).to(device)
     print(f"[data] image {a.image}, classes present "

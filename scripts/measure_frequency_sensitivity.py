@@ -47,6 +47,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from _common import (add_model_args, add_patch_args, setup_model, build_patch,
                      image_indices)
+from _common import make_dataset
 from patchreach.data.cityscapes import CityscapesSeg, norm_tensors, upsample_to
 from patchreach.diagnostics import spectral
 from patchreach.patch import csf as csf_mod
@@ -106,7 +107,7 @@ def main():
     model, n_ch, n_act, spec = setup_model(a)
     mean_t, std_t = norm_tensors(device)
 
-    ds = CityscapesSeg(a.cityscapes_root, "val", a.img_h, a.img_w)
+    ds = make_dataset(a, "val")
     patch = build_patch(a, device, mean_t, std_t)
 
     if a.n_bands > 0:

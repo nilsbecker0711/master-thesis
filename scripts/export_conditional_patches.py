@@ -59,6 +59,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from _common import (add_model_args, setup_model, image_indices,
                      tsallis_kwargs)
+from _common import make_dataset
 from patchreach.data.cityscapes import (CityscapesSeg, class_name,
                                         norm_tensors, upsample_to)
 from patchreach.diagnostics import conditional as cviz
@@ -208,7 +209,7 @@ def main():
               f"generator is seeing a reference distribution it was not "
               f"trained on — report this as a transfer measurement.")
 
-    ds = CityscapesSeg(a.cityscapes_root, a.split, a.img_h, a.img_w)
+    ds = make_dataset(a, a.split)
     idxs = image_indices(a.images, len(ds))
     print(f"[data] {a.split} split, {len(idxs)} image(s) "
           f"@ {a.img_h}x{a.img_w}, patch {cg.patch_side(a.img_h, scale)}px")
