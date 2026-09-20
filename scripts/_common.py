@@ -78,6 +78,15 @@ def add_patch_args(p):
     p.add_argument("--logit_clip", type=float, default=6.0,
                    help="bound on |param| for pixel modes. Stops the\n"
                         "sigmoid saturating into a dead-gradient state. 0 disables.")
+    p.add_argument("--pixel_param", default="sigmoid",
+                   choices=["sigmoid", "direct"],
+                   help="raw mode only. 'sigmoid' (default) is every "
+                        "run to date: pixel = sigmoid(param), a "
+                        "bounded map with no gradient ever killed by "
+                        "a bound. 'direct' makes the parameter the "
+                        "pixel and projects it back into [0,1] after "
+                        "each step, which is what PGD does. Pair with "
+                        "--optimiser sign for the full PGD recipe.")
     p.add_argument("--shape", default="square",
                    choices=["square", "alpha", "chroma", "auto"],
                    help="silhouette source — the Bg() term of Tan et al. Eq 5. "
@@ -491,6 +500,7 @@ def build_patch(a, device, mean_t, std_t, generator=None,
         placement_class=a.placement_class, reference=a.reference,
         placement_xy=tuple(a.placement_xy),
         placement_margin=getattr(a, "placement_margin", 0),
+        pixel_param=getattr(a, "pixel_param", "sigmoid"),
         reference_fit=a.reference_fit, logit_clip=a.logit_clip, shape_bg=a.shape_bg, shape_thresh=a.shape_thresh,
         lap_alpha=a.lap_alpha, lap_beta=a.lap_beta, lap_gamma=a.lap_gamma,
         lap_edge_thresh=a.lap_edge_thresh,

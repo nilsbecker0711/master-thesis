@@ -34,6 +34,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from _common import (add_model_args, add_patch_args, setup_model,
                      build_patch, tsallis_kwargs, tsallis_tag)
 from _common import make_dataset
+from patchreach import optim as optim_mod
 from patchreach.data.cityscapes import CityscapesSeg, norm_tensors, upsample_to
 from patchreach.diagnostics import report
 from patchreach.losses import adversarial, reach as reach_mod
@@ -69,6 +70,15 @@ def build_parser():
 
     p.add_argument("--epochs", type=int, default=100)
     p.add_argument("--lr", type=float, default=0.005)
+    p.add_argument("--optimiser", default="adam",
+                   choices=["adam", "sign"],
+                   help="step rule. DEFAULT 'adam' reproduces every "
+                        "run recorded so far. 'sign' is PGD's update, "
+                        "matched at equal lr — see "
+                        "patchreach/optim.py. Declared here as well "
+                        "as in overfit.py for the reason --lr_schedule "
+                        "was: a knob that exists in one loop and not "
+                        "the other is how the two drift apart.")
     p.add_argument("--lr_schedule", default="plateau",
                    choices=["plateau", "cosine", "none"],
                    help="DEFAULT 'plateau' reproduces every run recorded so "
@@ -304,8 +314,14 @@ def main():
         args.target_class if args.loss_fn == "ipatch_cospgd" else 8)
     tgt = args.target_class if args.loss_fn == "ipatch_cospgd" else None
 
-    opt = torch.optim.Adam([patch.param], lr=args.lr, betas=(0.5, 0.999),
-                           amsgrad=True)
+    # betas (0.5, 0.999) PASSED EXPLICITLY — this loop has always used
+    # them and optimise.py (0.9, 0.999); routing both through one
+    # builder must not quietly move either.
+    opt = optim_mod.build(args.optimiser, [patch.param], args.lr,
+                          betas=(0.5, 0.999))
+    if args.optimiser != "adam":
+        print(f"[optim] {args.optimiser} — step is exactly lr per "
+              f"coordinate")
     # T_max is TOTAL OPTIMISER STEPS, not epochs. Annealing per epoch would
     # decay ~len(loader) times too slowly and leave the tail exactly as hot as
     # the flat schedule this exists to replace.

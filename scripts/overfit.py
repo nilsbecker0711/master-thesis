@@ -112,7 +112,7 @@ def run_one(a, seed: int, model, img, label, device, mean_t, std_t, G,
     res = optimise.attack_image(
         model, img, label, patch,
         loss_fn=a.loss_fn, target_class=a.target_class, steps=a.steps,
-        lr=a.lr, num_classes=a.num_classes,
+        lr=a.lr, optimiser=a.optimiser, num_classes=a.num_classes,
         exclude_footprint=a.exclude_footprint, log_every=a.log_every,
         lr_schedule=a.lr_schedule,
         clean_logits=clean_logits, out_dir=out_dir,
@@ -231,6 +231,13 @@ def main():
     p.add_argument("--image", type=int, default=2)
     p.add_argument("--steps", type=int, default=300)
     p.add_argument("--lr", type=float, default=0.01)
+    p.add_argument("--optimiser", default="adam",
+                   choices=["adam", "sign"],
+                   help="step rule. 'adam' is every run to date. "
+                        "'sign' is PGD's update, p -= lr*sign(grad), "
+                        "matched to adam at EQUAL lr because both "
+                        "displace a coordinate by ~lr per step — see "
+                        "patchreach/optim.py.")
     p.add_argument("--lr_schedule", default="cosine",
                    choices=["none", "cosine"],
                    help="Anneal lr to zero over the run. 'none' restores the "
@@ -255,8 +262,16 @@ def main():
     # image, the CSF budget table -- rather than only the part after the first
     # attack step. The directory name depends on the ARGUMENTS alone, so
     # nothing here needs the model or the dataset.
+    # The optimiser and parameterisation enter the directory name ONLY
+    # when they are non-default, so every path produced before this
+    # flag existed is still the path it was and results/overfit does
+    # not fork into two naming conventions.
+    arm = "_".join(x for x in
+                   ["" if a.optimiser == "adam" else a.optimiser,
+                    "" if a.pixel_param == "sigmoid" else a.pixel_param]
+                   if x)
     tag = "_".join(x for x in [a.arch, a.patch_mode, a.loss_fn,
-                               f"img{a.image}", tsallis_tag(a),
+                               f"img{a.image}", arm, tsallis_tag(a),
                                a.tag] if x)
     # ABSOLUTE, and this is not tidiness. The path was relative, and it is
     # written to from three places separated by a model build: mkdir here,
