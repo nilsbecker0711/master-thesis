@@ -284,7 +284,7 @@ def frequency_sensitivity(model, imgs: torch.Tensor, patch, mean_t, std_t,
     img01 = denormalise_batch(imgs, mean_t, std_t)
 
     if region == "patch":
-        p = int(H * patch.cfg.scale)
+        p = patch.side(H, W)
         S = patch.cfg.size
         top, left = (patch.placement if patch.placement is not None
                      else ((H - p) // 2, (W - p) // 2))

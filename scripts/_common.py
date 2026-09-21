@@ -75,6 +75,17 @@ def add_patch_args(p):
                         "is meaningless on a single image, where it IS csf.")
     p.add_argument("--patch_size", type=int, default=128)
     p.add_argument("--patch_scale", type=float, default=0.25)
+    p.add_argument("--patch_scale_ref", choices=["height", "area"],
+                   default="height",
+                   help="what --patch_scale is a fraction of. height "
+                        "(default, every run to date): side = scale*H, so "
+                        "aspect ratio decides frame coverage — 0.25 covers "
+                        "3.1%% of 512x1024 but 6.25%% of 1024x1024. area: "
+                        "side = scale*sqrt(H*W), so the patch covers scale**2 "
+                        "of the frame at ANY input shape (6.25%% at 0.25). "
+                        "Use area when inputs differ in shape. Neither holds "
+                        "the PHYSICAL size constant when the field of view "
+                        "changes — see placement.footprint_side.")
     p.add_argument("--logit_clip", type=float, default=6.0,
                    help="bound on |param| for pixel modes. Stops the\n"
                         "sigmoid saturating into a dead-gradient state. 0 disables.")
@@ -496,6 +507,7 @@ def build_patch(a, device, mean_t, std_t, generator=None,
     from patchreach.patch.spec import PatchConfig, Patch
     cfg = PatchConfig(
         mode=a.patch_mode, size=a.patch_size, scale=a.patch_scale,
+        scale_ref=getattr(a, "patch_scale_ref", "height"),
         shape=a.shape, placement=a.placement,
         placement_class=a.placement_class, reference=a.reference,
         placement_xy=tuple(a.placement_xy),

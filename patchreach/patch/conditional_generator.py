@@ -334,9 +334,22 @@ def denormalise_batch(imgs: torch.Tensor, mean_t, std_t) -> torch.Tensor:
     return (imgs * std_t + mean_t).clamp(0.0, 1.0)
 
 
-def patch_side(H: int, scale: float) -> int:
-    """p = int(H * scale) — the SAME rule Patch.apply() uses. Do not change."""
-    return int(H * scale)
+def patch_side(H: int, scale: float, W: Optional[int] = None,
+               ref: str = "height") -> int:
+    """
+    Delegates to placement.footprint_side — the SAME rule Patch.apply() uses,
+    now in one place so the two cannot drift.
+
+    The generator pipeline is height-scaled only: train_conditional_generator
+    and export_conditional_patches build their parser from add_generator_args,
+    not add_patch_args, so --patch_scale_ref never reaches them and argparse
+    REJECTS it there rather than ignoring it. W and ref exist so a future
+    area-scaled generator has a door, not so this path uses it today.
+    """
+    if ref != "height" and W is None:
+        raise ValueError(f"scale_ref={ref!r} needs W")
+    return placement_mod.footprint_side(H, W if W is not None else H,
+                                        scale, ref)
 
 
 def center_crop_reference(imgs01: torch.Tensor, p: int, size: int
