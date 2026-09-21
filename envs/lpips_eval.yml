@@ -1,0 +1,32 @@
+# Evaluation-only environment for scripts/lpips_eval.py.
+#
+# SEPARATE FROM THE ATTACK ENV ON PURPOSE. The attack env is pinned to
+# torch 1.11 + mmcv 1.x + mmseg 0.x and lpips does not install cleanly into it.
+# lpips_eval.py needs no segmentor, so nothing from the mmseg stack goes here.
+#
+#   conda env create -f envs/lpips_eval.yml
+#   conda activate lpips_eval
+#   pip install -e . --no-deps
+#
+# torch/torchvision come from the cu118 wheel index to match `module load
+# cuda/11.8` on the cluster; the wheels bundle their own CUDA runtime, so the
+# module is not strictly needed. CPU is fine too: LPIPS on a few hundred
+# crops takes minutes.
+name: lpips_eval
+channels:
+  - conda-forge
+dependencies:
+  - python=3.10
+  - pip
+  - numpy<2
+  - scipy          # lpips imports scipy.ndimage at top level
+  - tqdm           # lpips imports tqdm at top level
+  - pillow
+  - matplotlib
+  - pandas
+  - pyyaml
+  - pip:
+      - --extra-index-url https://download.pytorch.org/whl/cu118
+      - torch==2.4.1
+      - torchvision==0.19.1
+      - lpips==0.1.4
