@@ -158,6 +158,19 @@ class SlidingWindowSegModel(nn.Module):
     windows are live at backward — roughly n_windows times one window's
     activations. checkpoint=True trades that for one window's worth by
     recomputing each window during backward, at the cost of a second forward.
+
+    REENTRANT, and only when the window needs a gradient. torch 1.11's
+    non-reentrant checkpoint (use_reentrant=False) stashes every recomputed
+    activation in a closure list that is never cleared, so all windows end up
+    live at once — no saving at all — and the list sits in a reference cycle
+    with the recomputed graph, so it can outlive the step. A b0 slide attack
+    OOMed an 80 GB card at step 2 that way. The reentrant form recomputes and
+    back-propagates one window inside its own backward and frees it before
+    the next. Its one requirement is an input that requires grad (else the
+    output silently carries none), hence the guard; without one there is
+    nothing to back-propagate and the plain forward is used. It does not
+    support autograd.grad() through the window, which only Grad-CAM
+    placement does — do not combine that with --slide_checkpoint.
     """
 
     mode = "slide"
@@ -182,8 +195,8 @@ class SlidingWindowSegModel(nn.Module):
         count = x.new_zeros((1, 1, H, W))          # never needs grad
         for y1, y2, x1, x2 in slide_windows(H, W, self.crop, self.stride):
             win = x[:, :, y1:y2, x1:x2]
-            if self.checkpoint and torch.is_grad_enabled():
-                logit = cp.checkpoint(self.model, win, use_reentrant=False)
+            if self.checkpoint and torch.is_grad_enabled() and win.requires_grad:
+                logit = cp.checkpoint(self.model, win, use_reentrant=True)
             else:
                 logit = self.model(win)
             preds = preds + F.pad(logit, (x1, W - x2, y1, H - y2))
