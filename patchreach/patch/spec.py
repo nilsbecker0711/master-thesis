@@ -59,7 +59,12 @@ class PatchConfig:
     """Everything that defines a patch, independent of the model or data."""
     mode: str = "raw"
     size: int = 128                       # parameter resolution
-    scale: float = 0.25                   # side as a fraction of image HEIGHT
+    scale: float = 0.25                   # side as a fraction of scale_ref
+    # What `scale` is a fraction of. 'height' (default, every run to date):
+    # p = int(H*scale), so aspect ratio decides frame coverage. 'area':
+    # p = int(scale*sqrt(H*W)), so the patch covers scale**2 of the frame at
+    # any input shape. See placement.footprint_side.
+    scale_ref: str = "height"
 
     # ── shape (shape.py) ─────────────────────────────────────────────────────
     shape: str = "square"                 # square | alpha | chroma | auto
@@ -223,6 +228,9 @@ class PatchConfig:
     def validate(self):
         if self.mode not in MODES:
             raise ValueError(f"mode must be one of {MODES}, got {self.mode!r}")
+        if self.scale_ref not in placement_mod.SCALE_REFS:
+            raise ValueError(f"scale_ref must be one of "
+                             f"{placement_mod.SCALE_REFS}, got {self.scale_ref!r}")
         if self.pixel_param not in ("sigmoid", "direct"):
             raise ValueError("pixel_param must be sigmoid|direct, got "
                              f"{self.pixel_param!r}")
@@ -570,6 +578,12 @@ class Patch:
 
     # ── placement ────────────────────────────────────────────────────────────
 
+    def side(self, H: int, W: int) -> int:
+        """Pasted side in px at an H x W input. The one rule; see
+        placement.footprint_side for what scale_ref changes."""
+        return placement_mod.footprint_side(H, W, self.cfg.scale,
+                                            self.cfg.scale_ref)
+
     def resolve_placement(self, H: int, W: int,
                           clean_pred: Optional[torch.Tensor] = None,
                           score_map: Optional[torch.Tensor] = None):
@@ -584,7 +598,7 @@ class Patch:
         score_map : [H,W] float, required for placement='gradcam'. Missing, it
         raises rather than centring silently — see placement.resolve().
         """
-        p = int(H * self.cfg.scale)
+        p = self.side(H, W)
         self.placement = placement_mod.resolve(
             self.cfg.placement, H, W, p, clean_pred,
             self.cfg.placement_class, self.cfg.placement_xy,
@@ -611,7 +625,7 @@ class Patch:
         excluding the whole square.
         """
         B, _, H, W = imgs.shape
-        p = int(H * self.cfg.scale)
+        p = self.side(H, W)
 
         if self.cfg.mode == "universal_csf":
             return self._apply_residual(imgs, p)
@@ -680,10 +694,14 @@ class Patch:
             # Resampling a residual RESAMPLES ITS SPECTRUM, so the budget the
             # bins were projected onto no longer describes the pasted signal.
             # Refuse rather than silently invalidate tau.
+            # The suggested --patch_scale inverts whichever rule is active, so
+            # it is right under scale_ref='area' too, not just 'height'.
+            ref_len = H if self.cfg.scale_ref == "height" else (H * W) ** 0.5
             raise ValueError(
                 f"universal_csf needs the parameter grid to equal the pasted "
-                f"footprint: size={self.cfg.size} but int(H*scale)={p}. "
-                f"Set --patch_size {p} (or --patch_scale {self.cfg.size/H:g}).")
+                f"footprint: size={self.cfg.size} but the {self.cfg.scale_ref} "
+                f"rule gives p={p} at {H}x{W}. Set --patch_size {p} "
+                f"(or --patch_scale {self.cfg.size / ref_len:g}).")
 
         img01 = (imgs * self._std + self._mean).clamp(0.0, 1.0)
         win = img01[:, :, top:top + p, left:left + p]
@@ -735,7 +753,7 @@ class Patch:
         CSF-bounded residual is added on top.
         """
         B, _, H, W = imgs.shape
-        p = int(H * self.cfg.scale)
+        p = self.side(H, W)
         top, left = (self.placement if self.placement is not None
                      else ((H - p) // 2, (W - p) // 2))
         top = max(0, min(int(top), H - p))
@@ -1033,6 +1051,10 @@ class Patch:
         # was trained to.
         if saved.get("mode") == "csf" and "csf_param" not in saved:
             saved["csf_param"] = "squash"
+        # scale_ref needs no such shim, and that is deliberate: every checkpoint
+        # written before the field existed WAS height-scaled, and 'height' is
+        # the dataclass default. Written out so nobody "fixes" it to 'area'.
+        saved.setdefault("scale_ref", "height")
         cfg = PatchConfig(**saved)
         cfg.init_from = None                     # param comes from the file
         obj = cls(cfg, device, mean_t, std_t, generator)
@@ -1042,12 +1064,13 @@ class Patch:
 
     def describe(self, H: int, W: int, log=print):
         c = self.cfg
-        p = int(H * c.scale)
+        p = self.side(H, W)
         n = c.size ** 2 * 3 if c.mode != "gan" else (
             self.G.dim_z if self.G else "?")
         log(f"[patch] mode      : {c.mode}  ({n} free parameters)")
         log(f"[patch] size      : {c.size}px param -> {p}px rendered "
-            f"(scale {c.scale})")
+            f"(scale {c.scale} of {c.scale_ref}; "
+            f"{100 * p * p / (H * W):.2f}% of the {H}x{W} frame)")
         if self.shape_mask is not None:
             frac = self.shape_mask.float().mean().item()
             log(f"[patch] silhouette: {int(self.shape_mask.sum()):,} px "

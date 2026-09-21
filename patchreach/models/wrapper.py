@@ -7,6 +7,55 @@ import torch.nn.functional as F
 import torch.utils.checkpoint as cp
 
 
+def _bf16_kernels_ok(device: str) -> bool:
+    """
+    Does this torch build have bf16 kernels for the ops the heads use?
+
+    Hardware support is not enough. On the cluster's torch 1.11 an Ampere GPU
+    reports is_bf16_supported(), yet the CUDA bilinear upsample (every
+    decode head's resize) is dispatched for fp32/fp16 only and raises
+    "upsample_bilinear2d_out_frame not implemented for 'BFloat16'". Probe
+    that op, forward and backward, instead of trusting the capability flag.
+    """
+    try:
+        x = torch.zeros(1, 1, 4, 4, device=device, dtype=torch.bfloat16,
+                        requires_grad=True)
+        # autograd.grad rather than a backward call: test_tsallis finds
+        # optimisation loops by scanning source for one, and this is not one.
+        y = F.interpolate(x, scale_factor=2, mode="bilinear",
+                          align_corners=False).sum()
+        torch.autograd.grad(y, x)
+        return True
+    except RuntimeError:
+        return False
+
+
+def low_precision_dtype() -> torch.dtype:
+    """
+    What --low_pr runs in: bf16 where this torch build can run it, else fp16
+    (with the gradient scaling in WrappedSegModel). CPU autocast only supports
+    bf16, so a CPU run gets bf16 regardless.
+    """
+    if not torch.cuda.is_available():
+        return torch.bfloat16
+    if torch.cuda.is_bf16_supported() and _bf16_kernels_ok("cuda"):
+        return torch.bfloat16
+    return torch.float16
+
+
+class _GradScale(torch.autograd.Function):
+    """Identity forward; backward multiplies the incoming gradient by `scale`."""
+
+    @staticmethod
+    def forward(ctx, x, scale):
+        ctx.scale = scale
+        return x.view_as(x)
+
+    @staticmethod
+    def backward(ctx, g):
+        return g * ctx.scale, None
+
+
 class WrappedSegModel(nn.Module):
     """
     encode_decode path: [B,C,H,W] -> logits [B,num_classes,H_out,W_out].
@@ -17,13 +66,31 @@ class WrappedSegModel(nn.Module):
 
     encode_decode is defined on EncoderDecoder, so this works identically for
     InternImage, SegFormer and Swin with no per-arch branching.
+
+    LOW PRECISION (amp_dtype set, i.e. --low_pr). The forward runs under
+    autocast: weights stay fp32, matmuls/convs run and store activations in
+    16 bit, softmax/LayerNorm stay fp32 (autocast's own op lists). Logits come
+    back as fp32 so stitching, losses, metrics and the CSF budget are
+    untouched. Living here rather than in the slide wrapper means whole and
+    slide both get it, and a checkpointed window recomputes under the same
+    autocast because the context is inside the checkpointed call.
+
+    fp16 ONLY: the attack gradient is a per-pixel MEAN over ~1e6 pixels, so
+    per-logit gradients sit around 1e-6 — below fp16's normal range, where
+    they flush to zero and the patch silently stops moving. The gradient is
+    therefore multiplied by GRAD_SCALE on entry to the 16-bit graph and divided
+    back out at the input, so callers see exactly the fp32-scaled gradient and
+    no optimisation loop needs to know. bf16 has fp32's exponent range and
+    needs none of this.
     """
 
     mode = "whole"
+    GRAD_SCALE = 2.0 ** 10
 
-    def __init__(self, model: nn.Module):
+    def __init__(self, model: nn.Module, amp_dtype: torch.dtype | None = None):
         super().__init__()
         self.model = model
+        self.amp_dtype = amp_dtype
         self.eval()
         for p in self.parameters():
             p.requires_grad_(False)
@@ -36,7 +103,17 @@ class WrappedSegModel(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         B, _, H, W = x.shape
-        return self.model.encode_decode(x, self._metas(B, H, W))
+        if self.amp_dtype is None:
+            return self.model.encode_decode(x, self._metas(B, H, W))
+        scale = self.GRAD_SCALE if self.amp_dtype == torch.float16 else 1.0
+        if scale != 1.0 and torch.is_grad_enabled():
+            x = _GradScale.apply(x, 1.0 / scale)       # undo at the input
+        with torch.autocast(x.device.type, dtype=self.amp_dtype):
+            out = self.model.encode_decode(x, self._metas(B, H, W))
+        out = out.float()
+        if scale != 1.0 and torch.is_grad_enabled():
+            out = _GradScale.apply(out, scale)          # lift into fp16 range
+        return out
 
 
 def slide_windows(H: int, W: int, crop, stride):
@@ -84,6 +161,19 @@ class SlidingWindowSegModel(nn.Module):
     windows are live at backward — roughly n_windows times one window's
     activations. checkpoint=True trades that for one window's worth by
     recomputing each window during backward, at the cost of a second forward.
+
+    REENTRANT, and only when the window needs a gradient. torch 1.11's
+    non-reentrant checkpoint (use_reentrant=False) stashes every recomputed
+    activation in a closure list that is never cleared, so all windows end up
+    live at once — no saving at all — and the list sits in a reference cycle
+    with the recomputed graph, so it can outlive the step. A b0 slide attack
+    OOMed an 80 GB card at step 2 that way. The reentrant form recomputes and
+    back-propagates one window inside its own backward and frees it before
+    the next. Its one requirement is an input that requires grad (else the
+    output silently carries none), hence the guard; without one there is
+    nothing to back-propagate and the plain forward is used. It does not
+    support autograd.grad() through the window, which only Grad-CAM
+    placement does — do not combine that with --slide_checkpoint.
     """
 
     mode = "slide"
@@ -108,8 +198,8 @@ class SlidingWindowSegModel(nn.Module):
         count = x.new_zeros((1, 1, H, W))          # never needs grad
         for y1, y2, x1, x2 in slide_windows(H, W, self.crop, self.stride):
             win = x[:, :, y1:y2, x1:x2]
-            if self.checkpoint and torch.is_grad_enabled():
-                logit = cp.checkpoint(self.model, win, use_reentrant=False)
+            if self.checkpoint and torch.is_grad_enabled() and win.requires_grad:
+                logit = cp.checkpoint(self.model, win, use_reentrant=True)
             else:
                 logit = self.model(win)
             preds = preds + F.pad(logit, (x1, W - x2, y1, H - y2))

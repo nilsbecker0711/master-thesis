@@ -57,6 +57,28 @@ def test_box_matches_apply_footprint():
     assert torch.equal(fp[0], mask)
 
 
+@pytest.mark.parametrize("ref", ["height", "area"])
+def test_box_matches_apply_footprint_under_both_scale_rules(ref):
+    """
+    Under --patch_scale_ref area, apply() pastes at int(scale*sqrt(H*W)). A box
+    cut by the height rule would score the wrong region with no error — on this
+    2:1 input that is 32px against a 45px patch.
+    """
+    patch = Patch(PatchConfig(mode="raw", size=16, scale=0.5, scale_ref=ref),
+                  DEV, MEAN, STD)
+    patch.resolve_placement(H, W)
+    _, fp = patch.apply(_img())
+    top, left, p = le.footprint_box(patch.placement, H, W, 0.5,
+                                    patch.cfg.scale_ref)
+    mask = torch.zeros(H, W, dtype=torch.bool)
+    mask[top:top + p, left:left + p] = True
+    assert torch.equal(fp[0], mask)
+    assert p == {"height": 32, "area": 45}[ref]
+    if ref == "area":                       # the bug this guards against
+        _, _, p_old = le.footprint_box(patch.placement, H, W, 0.5)
+        assert p_old != p
+
+
 def test_residual_is_scored_and_outside_is_untouched():
     patch = _csf_patch(32)
     img = _img()

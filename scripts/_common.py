@@ -11,7 +11,8 @@ import torch
 
 from patchreach.data.cityscapes import CityscapesSeg, norm_tensors
 from patchreach.models.registry import REGISTRY, resolve, load_segmentor
-from patchreach.models.wrapper import SlidingWindowSegModel, WrappedSegModel
+from patchreach.models.wrapper import (SlidingWindowSegModel, WrappedSegModel,
+                                       low_precision_dtype)
 from patchreach.utils import get_device, seed_everything, channel_probe
 
 # Ten fixed val images. EVERY number in the thesis is reported on these, so
@@ -55,6 +56,13 @@ def add_model_args(p):
                         "One window's activations instead of n_windows', at "
                         "the cost of a second forward. Use when the attack "
                         "OOMs at native resolution.")
+    p.add_argument("--low_pr", action="store_true",
+                   help="run the segmentor forward in 16 bit (autocast): bf16 "
+                        "on Ampere+, else fp16 with internal gradient scaling. "
+                        "Roughly halves activation memory; stacks with "
+                        "--slide_checkpoint. Logits shift slightly, so compare "
+                        "only against a clean baseline run with the same flag. "
+                        "Unset: fp32, unchanged.")
     p.add_argument("--num_classes", type=int, default=19)
     p.add_argument("--seed", type=int, default=42)
     return p
@@ -75,6 +83,17 @@ def add_patch_args(p):
                         "is meaningless on a single image, where it IS csf.")
     p.add_argument("--patch_size", type=int, default=128)
     p.add_argument("--patch_scale", type=float, default=0.25)
+    p.add_argument("--patch_scale_ref", choices=["height", "area"],
+                   default="height",
+                   help="what --patch_scale is a fraction of. height "
+                        "(default, every run to date): side = scale*H, so "
+                        "aspect ratio decides frame coverage — 0.25 covers "
+                        "3.1%% of 512x1024 but 6.25%% of 1024x1024. area: "
+                        "side = scale*sqrt(H*W), so the patch covers scale**2 "
+                        "of the frame at ANY input shape (6.25%% at 0.25). "
+                        "Use area when inputs differ in shape. Neither holds "
+                        "the PHYSICAL size constant when the field of view "
+                        "changes — see placement.footprint_side.")
     p.add_argument("--logit_clip", type=float, default=6.0,
                    help="bound on |param| for pixel modes. Stops the\n"
                         "sigmoid saturating into a dead-gradient state. 0 disables.")
@@ -436,7 +455,12 @@ def setup_model(a):
     print(f"[cfg ] {cfg}")
     print(f"[ckpt] {weights}")
     device = get_device()
-    model = WrappedSegModel(load_segmentor(cfg, weights)[0]).to(device)
+    amp_dtype = low_precision_dtype() if getattr(a, "low_pr", False) else None
+    model = WrappedSegModel(load_segmentor(cfg, weights)[0],
+                            amp_dtype=amp_dtype).to(device)
+    print({None: "[prec] fp32",
+           torch.bfloat16: "[prec] bf16 (autocast)",
+           torch.float16: "[prec] fp16 (autocast, grad-scaled)"}[amp_dtype])
 
     # Inference mode is decided ONCE, here, by wrapping the model — so the ~30
     # `model(x)` forwards across scripts/ and patchreach/ honour it without any
@@ -496,6 +520,7 @@ def build_patch(a, device, mean_t, std_t, generator=None,
     from patchreach.patch.spec import PatchConfig, Patch
     cfg = PatchConfig(
         mode=a.patch_mode, size=a.patch_size, scale=a.patch_scale,
+        scale_ref=getattr(a, "patch_scale_ref", "height"),
         shape=a.shape, placement=a.placement,
         placement_class=a.placement_class, reference=a.reference,
         placement_xy=tuple(a.placement_xy),
