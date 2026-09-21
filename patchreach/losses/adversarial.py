@@ -10,8 +10,13 @@ Adversarial objectives.
                 gradient weight p^(1-q), with q optionally scheduled across
                 the run. Defined in tsallis.py because it is stateful; build()
                 below dispatches it. (Matyasko et al., IJCNN 2026)
+  margin        untargeted w.r.t. the CLEAN PREDICTION, CW hinge
+                relu(z_ref - max_{k!=ref} z_k + kappa), minimised. The
+                differentiable count of any_flip_rate: a pixel flipped by kappa
+                contributes exactly zero gradient, so effort moves to the
+                pixels that have not flipped yet. (Carlini & Wagner, S&P 2017)
 
-All four take an optional `support` mask restricting which pixels are scored.
+All five take an optional `support` mask restricting which pixels are scored.
 That is where patch-footprint exclusion and reach-restriction compose: the
 caller intersects them and passes one mask, rather than each loss knowing about
 both.
@@ -137,10 +142,62 @@ def ipatch_cospgd_loss(logits, target_class: int,
     return _reduce(weight * ce, valid)
 
 
+def margin_loss(logits, ref, support: Optional[torch.Tensor] = None,
+                kappa: float = 5.0):
+    r"""
+    CW margin against the CLEAN PREDICTION:
+
+        L = mean_i relu( z_ref(i) - max_{k != ref(i)} z_k + kappa )
+
+    `ref` is the clean argmax, NOT the ground truth, because any_flip_rate
+    measures change against the clean prediction. Scoring against GT would
+    leave pixels the model already gets wrong nearly unscored while the metric
+    still counts them.
+
+    WHY NOT COSPGD FOR FLIP RATE: CosPGD's weight p_y/||p|| only APPROACHES
+    zero, and the CE gradient it multiplies GROWS as a pixel flips, so flipped
+    pixels keep most of the gradient. After an untargeted run collapses onto
+    one class, that majority keeps pushing the collapse class up everywhere —
+    exactly what the pixels already predicting that class need reversed. Here a
+    pixel flipped by kappa contributes EXACTLY zero, and every unflipped pixel
+    gets a unit-size gradient however confident it is, so the holdouts own the
+    whole gradient.
+
+    kappa is in LOGIT units. It demands a real margin so flips survive small
+    patch updates; too large and flipped pixels keep drawing effort, which is
+    the CE behaviour this exists to avoid.
+
+    ref == 255 marks void (set by the caller from the label), excluded exactly
+    as any_flip_rate excludes it. Minimise.
+    """
+    if logits.shape[1] < 2:
+        raise ValueError("margin loss needs at least two classes")
+    valid = ref != 255
+    if support is not None:
+        valid = valid & support
+
+    safe = ref.clone()
+    safe[~valid] = 0                      # dummy index, zeroed by `valid`
+    idx = safe.unsqueeze(1)
+    z_ref = logits.gather(1, idx).squeeze(1)
+    z_other = logits.scatter(1, idx, float("-inf")).amax(1)
+    return _reduce(F.relu(z_ref - z_other + kappa), valid)
+
+
+def _margin_unbound(*_):
+    raise ValueError(
+        "loss_fn='margin' needs the clean prediction bound at build time — "
+        "build('margin', margin_ref=clean_argmax). It is wired through "
+        "patch/optimise.attack_image only; placement=gradcam with "
+        "--cam_objective attack cannot use it.")
+
+
 def build(loss_fn: str, target_class: int = 8,
           tsallis_q: float = 0.0, tsallis_schedule: str = "const",
           tsallis_q_start: float = -2.0, tsallis_q_end: float = 1.0,
-          tsallis_total_steps: int = 1):
+          tsallis_total_steps: int = 1,
+          margin_ref: Optional[torch.Tensor] = None,
+          margin_kappa: float = 5.0):
     """
     Returns f(logits, labels, footprint, support) -> scalar.
 
@@ -150,7 +207,19 @@ def build(loss_fn: str, target_class: int = 8,
     The tsallis_* arguments are read by the 'tsallis' branch ONLY. They carry
     defaults so every existing two-argument call site is unchanged, and no
     other branch reads them.
+
+    The margin_* arguments are read by the 'margin' branch ONLY, on the same
+    terms. margin_ref is the clean argmax with void set to 255; the returned
+    callable IGNORES the `labels` slot and scores against margin_ref instead.
+    Built without margin_ref it returns a callable that raises on use, so a
+    call site that cannot supply the clean prediction fails loudly rather than
+    silently scoring against GT.
     """
+    if loss_fn == "margin":
+        if margin_ref is None:
+            return _margin_unbound
+        ref = margin_ref
+        return lambda lg, lb, fp, sp: margin_loss(lg, ref, sp, margin_kappa)
     if loss_fn == "tsallis":
         from .tsallis import TsallisCELoss
         return TsallisCELoss(q=tsallis_q, schedule=tsallis_schedule,

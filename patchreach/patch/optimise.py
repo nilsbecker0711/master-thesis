@@ -105,6 +105,7 @@ def attack_image(model, img, label, patch, *,
                  log_every: int = 20,
                  lr_schedule: str = "none",
                  classes: str = "gt",
+                 margin_kappa: float = 5.0,
                  clean_logits: Optional[torch.Tensor] = None,
                  out_dir: Optional[Path] = None,
                  save_step_images: bool = False,
@@ -199,6 +200,16 @@ def attack_image(model, img, label, patch, *,
             tsallis_total_steps=steps)
         if verbose:
             log(f"[loss ] {objective!r}")
+    # margin scores against the CLEAN PREDICTION, which only exists here.
+    # Rebound on this branch alone, exactly like tsallis above; void is set to
+    # 255 so the loss excludes the same pixels any_flip_rate excludes.
+    if loss_fn == "margin":
+        ref = upsample_to(clean_logits, hw).argmax(1)
+        ref[label == 255] = 255
+        objective = adversarial.build(loss_fn, margin_ref=ref,
+                                      margin_kappa=margin_kappa)
+        if verbose:
+            log(f"[loss ] margin vs clean prediction, kappa={margin_kappa:g}")
     # betas PASSED EXPLICITLY, not defaulted: this loop has always used
     # (0.9, 0.999) and train.py (0.5, 0.999), and routing both through
     # one builder must not quietly move either.
