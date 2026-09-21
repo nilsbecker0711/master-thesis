@@ -183,3 +183,78 @@ accepted ICLR 2026. <https://arxiv.org/abs/2603.20777>
 `[s]` Abstract only. A universal patch generalising across images and across ViT and
 CNN architectures without target-parameter access; adjacent to the transfer matrix.
 Read before finalising the contribution statement.
+
+## 2026-09-21: slide-inference memory at native resolution (torch 1.11 checkpoint bug)
+
+**Symptom.** Patch attacks under `--inference slide` (SegFormer, native 1024x2048,
+crop 1024 / stride 768 = 3 windows) ran out of memory. Adding `--slide_checkpoint`
+did not help, and neither did `--low_pr` on top of it: `segformer_b0`, csf, image
+420, fp16 died on an 80 GB A100 (77.2 GB allocated) in the backward of step 2,
+inside the checkpoint's recompute (`torch/utils/checkpoint.py(368): unpack`). Step 1
+completed. A b0 window should need a few GB, so 77 GB could not be activations alone.
+
+**Cause, two layers.**
+
+1. *By design, without checkpointing:* the loss is computed on the STITCHED logits,
+   so the graphs of all windows are live at backward, roughly n_windows x one
+   window's activations. That was the original OOM.
+2. *The bug, with checkpointing:* `SlidingWindowSegModel` called
+   `checkpoint(..., use_reentrant=False)`. In torch 1.11 (the cluster pin) that
+   implementation recomputes a window on first unpack and appends every saved
+   activation to a closure list `storage` that is **never popped or cleared**
+   (read at the v1.11.0 source). All three recomputed windows therefore stay live
+   during backward, so checkpointing saved nothing. Later torch versions release
+   entries as they are consumed, which is why the code looked right.
+   - Inferred, not reproduced: the stored tensors reference the recomputed graph,
+     whose saved-tensor hooks reference the closure holding `storage`. That is a
+     reference cycle through C++ autograd nodes that Python's GC cannot collect,
+     so step 1's activations most likely outlived step 1. This matches the log
+     (step 1 fine, OOM in the next backward's recompute).
+
+**Fix (PR #40).** `use_reentrant=True`: each window's forward runs without a graph
+and saves only its input. Backward recomputes that one window, backprops it and
+frees it before the next, so peak is about one 1024x1024 window's forward+backward.
+Guarded on `win.requires_grad` (reentrant silently returns no gradient otherwise).
+Gradients are bit-identical to the un-checkpointed path in fp32/bf16/fp16 (CPU
+stand-in model). Cost: every window's forward runs twice per step. Not compatible
+with `--placement gradcam` (it calls `autograd.grad` through the window).
+
+**Why b5 fits now.** The config name `segformer_mit-b5_8x1_1024x1024_160k` means 1
+image per GPU at a 1024x1024 crop in *training*, which also holds weight gradients
+and optimiser state. One frozen-model attack window is strictly cheaper than one of
+those training steps. b5 slide runs were reported to complete after the fix; no b5
+numbers are recorded here yet.
+
+**First run after the fix** (fp32, `--scale crop` 1024x2048, `--inference auto`,
+`--slide_checkpoint`; `segformer_b0`, raw, cospgd, image 420, 600 steps, cosine lr
+0.1, tag `sliding_window_to_fail`):
+
+- clean all / remote: 63.18 / 61.46. final 0.02 / 0.02. **drop remote +61.44**,
+  any_flip_rate 100%. About 93% of flipped pixels go to `fence`. Reach stays about
+  100% out to about 800 px (84.7-95.2% at 906-1097 px).
+- The 63.18 is per-image mIoU over the 14 GT classes of image 420, not a pipeline
+  fault. Wall and fence are present in GT but score 0.00 clean, and each weighs as
+  much as road. The other 12 average 73.7. Not comparable to the pooled ~76% dataset
+  mIoU (mmseg: 76.54); see CmIoU vs NmIoU under Halmosi et al. above. `clean_baseline.py
+  --images 420` (PR #41) reproduces the single-image number.
+
+**Precision (`--low_pr`, PRs #38/#39).** Autocast in the segmentor forward only;
+logits, losses, metrics and the CSF budget stay fp32. On torch 1.11 the CUDA
+bilinear upsample has no bf16 kernel, so the cluster falls back to **fp16** with a
+fixed 2^10 gradient scale; without scaling, 15% of input gradients underflowed to
+zero in a CPU check. Unset, the path is bit-identical to before. With the
+checkpoint fix, `--low_pr` should be unnecessary for SegFormer; **prefer fp32** so
+precision is not a confound, and never mix precisions in one table.
+
+**Consequences for the text.**
+
+- TODO: the "Native-resolution patch attacks" section above argues that native
+  resolution with heavy transformers is not possible and calls this "a GPU fact
+  rather than a preference". That no longer holds for **slide** inference: b0 and
+  b5 attacks now run at native 1024x2048 on one 80 GB card. The argument still
+  stands for *whole*-frame native (untested) and for the reach truncation of slide
+  (see "Tiling truncates patch reach"). Restate it as "whole-frame at native is
+  memory-bound; slide at native is feasible but truncates reach", or measure
+  whole-frame native memory before claiming it.
+- Any slide result from before PR #40 that finished did so in spite of the bug.
+  The bug affected memory only, never gradients, so those numbers stand.
