@@ -305,11 +305,72 @@ def test_out_csv_never_overwrites_a_foreign_file(tmp_path):
     assert le.check_outputs(le.parse_args(["x", "--out_csv", str(ours)]))
 
 
-@pytest.mark.parametrize("argv,png", [
-    ([], True),                                   # auto/auto: PNGs if present
-    (["--checkpoint", "best"], False),            # the PNGs are the FINAL patch
-    (["--checkpoint", "final"], False),
-    (["--source", "png"], True),
-    (["--source", "checkpoint"], False)])
-def test_explicit_checkpoint_is_never_silently_replaced_by_pngs(argv, png):
-    assert le.wants_png(le.parse_args(["run", *argv])) is png
+def _run_with_pngs(tmp_path, png_from: str):
+    """overfit.py layout with distinct best.pt / final.pt; PNGs from one."""
+    from torchvision.utils import save_image
+    from patchreach.data.cityscapes import denormalise
+
+    img = _img(7)
+    run = tmp_path / "run"
+    panels = run / "diagnostics" / "panels"
+    panels.mkdir(parents=True)
+    pats = {}
+    for seed, name in ((1, "best"), (2, "final")):
+        pats[name] = _csf_patch(16, seed=seed)
+        pats[name].set_reference_from_image(img, MEAN, STD)
+        pats[name].save(run / f"{name}.pt")
+    with torch.no_grad():
+        patched, _ = pats[png_from].apply(img)
+    save_image(denormalise(img, MEAN, STD), panels / "a_clean.png")
+    save_image(denormalise(patched, MEAN, STD), panels / "c_patched.png")
+    cfg = {"image": 420, "patch_mode": "csf", "from_image": True,
+           "patch_size": 16, "patch_scale": 0.5, "placement": "center"}
+    (run / "config.json").write_text(json.dumps(cfg))
+    return run, cfg
+
+
+@pytest.mark.parametrize("png_from", ["best", "final"])
+def test_png_provenance_is_detected_not_assumed(tmp_path, png_from):
+    """
+    overfit.py diagnostics showed the FINAL patch before 2aee5ef and show
+    best.pt since. The script must tell which, from the pixels.
+    """
+    run, cfg = _run_with_pngs(tmp_path, png_from)
+    job = le.discover_pngs(run, cfg)[0]
+    shows = le.png_shows(job, cfg, le.load_png(job.clean, DEV),
+                         le.load_png(job.patched, DEV), MEAN, STD)
+    assert shows == png_from
+
+
+def test_png_provenance_unknown_without_checkpoint(tmp_path):
+    run, cfg = _run_with_pngs(tmp_path, "best")
+    for n in ("best.pt", "final.pt"):
+        (run / n).unlink()
+    job = le.discover_pngs(run, cfg)[0]
+    assert le.png_shows(job, cfg, le.load_png(job.clean, DEV),
+                        le.load_png(job.patched, DEV), MEAN, STD) == "unknown"
+
+
+@pytest.mark.parametrize("argv,shows,png", [
+    ([], ["final"], True),                          # auto/auto: PNGs as they are
+    (["--checkpoint", "best"], ["best"], True),     # new runs: PNGs ARE best
+    (["--checkpoint", "best"], ["final"], False),   # old runs: fall back
+    (["--checkpoint", "final"], ["best"], False),
+    (["--checkpoint", "best"], ["unknown"], True),  # nothing to compare with
+    (["--checkpoint", "best"], ["best=final"], True),
+    (["--source", "png", "--checkpoint", "best"], ["final"], True),
+    (["--source", "checkpoint"], ["best"], False)])
+def test_explicit_checkpoint_is_never_silently_mislabelled(argv, shows, png):
+    assert le.choose_png(le.parse_args(["run", *argv]), shows) is png
+
+
+def test_main_scores_best_pngs_when_best_is_asked_for(tmp_path, monkeypatch):
+    monkeypatch.setattr(le, "build_metrics", lambda nets, device,
+                        spatial=False: {n: (_SpatialMAD() if spatial
+                                            else MAD()) for n in nets})
+    run, _ = _run_with_pngs(tmp_path, "best")
+    le.main([str(run), "--checkpoint", "best", "--tag", "b", "--panels", "0",
+             "--device", "cpu"])
+    import csv
+    row = next(csv.DictReader(open(run / "lpips_b" / "per_image.csv")))
+    assert (row["source"], row["png_shows"]) == ("png", "best")

@@ -25,6 +25,13 @@ TWO SOURCES (--source, default auto = png where the run has them):
 
 Both feed the same scoring, and a test holds them equal on the same patch.
 
+WHICH PATCH THE PNGs SHOW is checked, not assumed: overfit.py wrote the final
+patch into its diagnostics before 2aee5ef and best.pt since. Each checkpoint
+is re-rendered onto a_clean.png and compared with c_patched.png; the result
+is the png_shows column (best / final / best=final / unknown). Under --source
+auto, an explicit --checkpoint best|final the PNGs do not show switches that
+run to the checkpoint source.
+
 WHAT THE CHECKPOINT SOURCE READS — every layout the attack scripts write:
 
     overfit.py            <run>/config.json + <run>/{final,best}.pt
@@ -397,6 +404,7 @@ class PngJob:
     image: int
     label: str
     ckpt: Optional[Path]      # only for the footprint position
+    home: Optional[Path] = None   # dir holding best.pt / final.pt, if any
 
 
 def _image_from_path(rel: Path) -> Optional[int]:
@@ -432,7 +440,8 @@ def discover_pngs(run: Path, cfg: dict) -> List[PngJob]:
         homes.append(run)
         ckpt = next((c for h in homes for c in (h / "final.pt", h / "best.pt")
                      if c.exists()), None)
-        jobs.append(PngJob(clean, patched, int(image), label, ckpt))
+        jobs.append(PngJob(clean, patched, int(image), label, ckpt,
+                           ckpt.parent if ckpt is not None else None))
     return jobs
 
 
@@ -476,8 +485,45 @@ def png_box(job: PngJob, cfg: dict, clean, patched):
             "diff")
 
 
+def png_shows(job: PngJob, cfg: dict, clean, patched, mean_t, std_t) -> str:
+    r"""
+    Which patch c_patched.png actually shows: 'best', 'final', 'best=final'
+    (identical parameters), or 'unknown'.
+
+    NOT KNOWABLE FROM THE FILE NAME. overfit.py wrote the FINAL patch into
+    its diagnostics until 2aee5ef and writes best.pt since; population always
+    used best.pt. Rather than trust dates, re-render each checkpoint onto
+    a_clean.png -- which IS the val image, so --from_image bases come out
+    identical -- and see which one reproduces c_patched.png. Needs no
+    dataset. Tolerance is one code value: save_image rounds half up,
+    quantize8 half to even.
+    """
+    if job.home is None:
+        return "unknown"
+    from patchreach.patch.spec import Patch
+    img_norm = (clean - mean_t) / std_t
+    hits = []
+    for name in ("best", "final"):
+        ck = job.home / f"{name}.pt"
+        if not ck.exists():
+            continue
+        try:
+            patch = Patch.load(ck, clean.device, mean_t, std_t)
+            if patch.cfg.mode == "gan":
+                return "unknown"
+            if patch.cfg.mode == "csf" and cfg.get("from_image"):
+                patch.set_reference_from_image(img_norm, mean_t, std_t)
+            redo = composite(patch, img_norm, mean_t, std_t, True)
+        except Exception as e:                  # provenance must never kill
+            print(f"  [png ] could not re-render {ck.name}: {e}")
+            continue
+        if float((redo - patched).abs().max()) <= 1.0 / 255 + 1e-6:
+            hits.append(name)
+    return "=".join(hits) if hits else "unknown"
+
+
 def evaluate_png(job: PngJob, cfg: dict, metrics, context: float,
-                 quantize: bool, anchors, device):
+                 quantize: bool, anchors, device, shows: str = "unknown"):
     clean = load_png(job.clean, device)
     patched = load_png(job.patched, device)
     box, box_from = png_box(job, cfg, clean, patched)
@@ -487,6 +533,7 @@ def evaluate_png(job: PngJob, cfg: dict, metrics, context: float,
     row, views = score_frames(clean, patched, base, box, metrics, context,
                               quantize, anchors, job.image)
     row["box_from"] = box_from
+    row["png_shows"] = shows
     return row, views
 
 
@@ -656,8 +703,8 @@ def parse_args(argv=None):
                         "checkpoint = rebuild the frames from final/best.pt "
                         "(adds the CSF visibility columns); auto = png where "
                         "the run has them, else checkpoint -- unless "
-                        "--checkpoint best/final is given, since the PNGs "
-                        "always show the FINAL patch")
+                        "--checkpoint best/final names a patch the PNGs are "
+                        "verified NOT to show (column png_shows)")
     p.add_argument("--checkpoint", default="auto",
                    choices=["auto", "final", "best"],
                    help="auto = final.pt, else best.pt")
@@ -696,24 +743,26 @@ def parse_args(argv=None):
     return p.parse_args(argv)
 
 
-def wants_png(a) -> bool:
+def choose_png(a, shows: List[str]) -> bool:
     """
-    Whether this invocation should use the PNG source.
+    Use the PNG source for a run whose PNGs show `shows` (one per image)?
 
-    THE PNGs SHOW THE FINAL PATCH. attack_image() writes best.pt whenever the
-    drop improves but never restores it, so report.run() -- which writes
-    a_clean/c_patched -- renders the last-step patch. An explicit
-    --checkpoint best under --source auto must therefore mean the checkpoint
-    source: silently scoring the final PNGs would label a final-patch number
-    as the best patch's.
+    --source png  : always; a mismatch with --checkpoint is only warned about.
+    --source auto : yes, unless --checkpoint best/final names a patch the
+                    PNGs are VERIFIED not to show -- then the checkpoint
+                    source, so a number is never labelled with the wrong
+                    patch. 'unknown' (no checkpoint to compare) keeps PNGs:
+                    there is nothing else to score, and the column says so.
     """
+    want = a.checkpoint
+    wrong = [x for x in shows
+             if want != "auto" and x != "unknown" and want not in x.split("=")]
     if a.source == "png":
-        if a.checkpoint == "best":
-            print("[lpips] note: --source png scores the diagnostic PNGs, "
-                  "which show the FINAL patch; --checkpoint best only "
-                  "affects where the footprint position is read from.")
+        if wrong:
+            print(f"  [png ] note: --checkpoint {want}, but the PNGs show "
+                  f"{sorted(set(wrong))}; scoring the PNGs as asked.")
         return True
-    return a.source == "auto" and a.checkpoint == "auto"
+    return a.source == "auto" and not wrong
 
 
 # Directories the attack scripts own inside a run. Writing into one of them
@@ -784,7 +833,18 @@ def main(argv=None):
             continue
         cfg = json.loads((run / "config.json").read_text())
 
-        png_jobs = (discover_pngs(run, cfg) if wants_png(a) else [])
+        png_jobs = (discover_pngs(run, cfg) if a.source != "checkpoint"
+                    else [])
+        shows = {}
+        for job in png_jobs:
+            shows[id(job)] = png_shows(job, cfg, load_png(job.clean, device),
+                                       load_png(job.patched, device),
+                                       mean_t, std_t)
+        if png_jobs and not choose_png(a, list(shows.values())):
+            print(f"[run ] {run}: PNGs show "
+                  f"{sorted(set(shows.values()))}, not --checkpoint "
+                  f"{a.checkpoint}; using the checkpoint instead")
+            png_jobs = []
         source = "png" if png_jobs else "checkpoint"
         if a.source == "png" and not png_jobs:
             print(f"[skip] {run}: no a_clean.png / c_patched.png pairs")
@@ -804,7 +864,7 @@ def main(argv=None):
             if source == "png":
                 row, views = evaluate_png(
                     job, cfg, metrics, a.context, not a.no_quantize,
-                    anchors, device)
+                    anchors, device, shows[id(job)])
                 mode, ck_name = cfg.get("patch_mode"), None
             else:
                 patch = Patch.load(job.ckpt, device, mean_t, std_t)
