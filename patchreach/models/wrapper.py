@@ -7,10 +7,35 @@ import torch.nn.functional as F
 import torch.utils.checkpoint as cp
 
 
+def _bf16_kernels_ok(device: str) -> bool:
+    """
+    Does this torch build have bf16 kernels for the ops the heads use?
+
+    Hardware support is not enough. On the cluster's torch 1.11 an Ampere GPU
+    reports is_bf16_supported(), yet the CUDA bilinear upsample (every
+    decode head's resize) is dispatched for fp32/fp16 only and raises
+    "upsample_bilinear2d_out_frame not implemented for 'BFloat16'". Probe
+    that op, forward and backward, instead of trusting the capability flag.
+    """
+    try:
+        x = torch.zeros(1, 1, 4, 4, device=device, dtype=torch.bfloat16,
+                        requires_grad=True)
+        F.interpolate(x, scale_factor=2, mode="bilinear",
+                      align_corners=False).sum().backward()
+        return True
+    except RuntimeError:
+        return False
+
+
 def low_precision_dtype() -> torch.dtype:
-    """bf16 where the GPU has it (Ampere+), else fp16 — what --low_pr runs in.
-    CPU autocast only supports bf16, so a CPU run gets bf16 too."""
-    if not torch.cuda.is_available() or torch.cuda.is_bf16_supported():
+    """
+    What --low_pr runs in: bf16 where this torch build can run it, else fp16
+    (with the gradient scaling in WrappedSegModel). CPU autocast only supports
+    bf16, so a CPU run gets bf16 regardless.
+    """
+    if not torch.cuda.is_available():
+        return torch.bfloat16
+    if torch.cuda.is_bf16_supported() and _bf16_kernels_ok("cuda"):
         return torch.bfloat16
     return torch.float16
 
