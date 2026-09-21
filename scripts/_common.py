@@ -11,7 +11,8 @@ import torch
 
 from patchreach.data.cityscapes import CityscapesSeg, norm_tensors
 from patchreach.models.registry import REGISTRY, resolve, load_segmentor
-from patchreach.models.wrapper import SlidingWindowSegModel, WrappedSegModel
+from patchreach.models.wrapper import (SlidingWindowSegModel, WrappedSegModel,
+                                       low_precision_dtype)
 from patchreach.utils import get_device, seed_everything, channel_probe
 
 # Ten fixed val images. EVERY number in the thesis is reported on these, so
@@ -55,6 +56,13 @@ def add_model_args(p):
                         "One window's activations instead of n_windows', at "
                         "the cost of a second forward. Use when the attack "
                         "OOMs at native resolution.")
+    p.add_argument("--low_pr", action="store_true",
+                   help="run the segmentor forward in 16 bit (autocast): bf16 "
+                        "on Ampere+, else fp16 with internal gradient scaling. "
+                        "Roughly halves activation memory; stacks with "
+                        "--slide_checkpoint. Logits shift slightly, so compare "
+                        "only against a clean baseline run with the same flag. "
+                        "Unset: fp32, unchanged.")
     p.add_argument("--num_classes", type=int, default=19)
     p.add_argument("--seed", type=int, default=42)
     return p
@@ -447,7 +455,12 @@ def setup_model(a):
     print(f"[cfg ] {cfg}")
     print(f"[ckpt] {weights}")
     device = get_device()
-    model = WrappedSegModel(load_segmentor(cfg, weights)[0]).to(device)
+    amp_dtype = low_precision_dtype() if getattr(a, "low_pr", False) else None
+    model = WrappedSegModel(load_segmentor(cfg, weights)[0],
+                            amp_dtype=amp_dtype).to(device)
+    print({None: "[prec] fp32",
+           torch.bfloat16: "[prec] bf16 (autocast)",
+           torch.float16: "[prec] fp16 (autocast, grad-scaled)"}[amp_dtype])
 
     # Inference mode is decided ONCE, here, by wrapping the model — so the ~30
     # `model(x)` forwards across scripts/ and patchreach/ honour it without any
