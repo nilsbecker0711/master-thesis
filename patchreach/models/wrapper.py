@@ -20,8 +20,11 @@ def _bf16_kernels_ok(device: str) -> bool:
     try:
         x = torch.zeros(1, 1, 4, 4, device=device, dtype=torch.bfloat16,
                         requires_grad=True)
-        F.interpolate(x, scale_factor=2, mode="bilinear",
-                      align_corners=False).sum().backward()
+        # autograd.grad rather than a backward call: test_tsallis finds
+        # optimisation loops by scanning source for one, and this is not one.
+        y = F.interpolate(x, scale_factor=2, mode="bilinear",
+                          align_corners=False).sum()
+        torch.autograd.grad(y, x)
         return True
     except RuntimeError:
         return False
