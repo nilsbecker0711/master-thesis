@@ -303,3 +303,13 @@ def test_out_csv_never_overwrites_a_foreign_file(tmp_path):
     ours = tmp_path / "lpips.csv"
     ours.write_text("run,lpips_full_alex\n")
     assert le.check_outputs(le.parse_args(["x", "--out_csv", str(ours)]))
+
+
+@pytest.mark.parametrize("argv,png", [
+    ([], True),                                   # auto/auto: PNGs if present
+    (["--checkpoint", "best"], False),            # the PNGs are the FINAL patch
+    (["--checkpoint", "final"], False),
+    (["--source", "png"], True),
+    (["--source", "checkpoint"], False)])
+def test_explicit_checkpoint_is_never_silently_replaced_by_pngs(argv, png):
+    assert le.wants_png(le.parse_args(["run", *argv])) is png

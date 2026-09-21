@@ -655,7 +655,9 @@ def parse_args(argv=None):
                         "already wrote (no checkpoint, no dataset); "
                         "checkpoint = rebuild the frames from final/best.pt "
                         "(adds the CSF visibility columns); auto = png where "
-                        "the run has them, else checkpoint")
+                        "the run has them, else checkpoint -- unless "
+                        "--checkpoint best/final is given, since the PNGs "
+                        "always show the FINAL patch")
     p.add_argument("--checkpoint", default="auto",
                    choices=["auto", "final", "best"],
                    help="auto = final.pt, else best.pt")
@@ -692,6 +694,26 @@ def parse_args(argv=None):
                    help="one combined CSV over every run, for the tables")
     p.add_argument("--device", default=None)
     return p.parse_args(argv)
+
+
+def wants_png(a) -> bool:
+    """
+    Whether this invocation should use the PNG source.
+
+    THE PNGs SHOW THE FINAL PATCH. attack_image() writes best.pt whenever the
+    drop improves but never restores it, so report.run() -- which writes
+    a_clean/c_patched -- renders the last-step patch. An explicit
+    --checkpoint best under --source auto must therefore mean the checkpoint
+    source: silently scoring the final PNGs would label a final-patch number
+    as the best patch's.
+    """
+    if a.source == "png":
+        if a.checkpoint == "best":
+            print("[lpips] note: --source png scores the diagnostic PNGs, "
+                  "which show the FINAL patch; --checkpoint best only "
+                  "affects where the footprint position is read from.")
+        return True
+    return a.source == "auto" and a.checkpoint == "auto"
 
 
 # Directories the attack scripts own inside a run. Writing into one of them
@@ -762,8 +784,7 @@ def main(argv=None):
             continue
         cfg = json.loads((run / "config.json").read_text())
 
-        png_jobs = ([] if a.source == "checkpoint"
-                    else discover_pngs(run, cfg))
+        png_jobs = (discover_pngs(run, cfg) if wants_png(a) else [])
         source = "png" if png_jobs else "checkpoint"
         if a.source == "png" and not png_jobs:
             print(f"[skip] {run}: no a_clean.png / c_patched.png pairs")
