@@ -37,7 +37,7 @@ import torch
 from torch.utils.data import DataLoader, Subset
 
 from _common import add_model_args, setup_model
-from _common import make_dataset
+from _common import make_dataset, image_indices
 from patchreach.data.cityscapes import CityscapesSeg, class_name, upsample_to
 from patchreach.metrics.miou import SegMetric
 from patchreach.utils import get_device, seed_everything
@@ -54,7 +54,13 @@ SLIDE_WARNING = """[eval] A SLIDE NUMBER IS NOT THE CLEAN REFERENCE FOR AN ATTAC
 
 def main():
     p = add_model_args(argparse.ArgumentParser())
-    p.add_argument("--n_images", type=int, default=20)
+    p.add_argument("--n_images", type=int, default=20,
+                   help="evaluate the first N val images (ignored if --images)")
+    p.add_argument("--images", default=None,
+                   help="specific val indices instead of the first --n_images: "
+                        "'420' | '2 45 420' | 'fixed10' | 'all'. Same indices "
+                        "as overfit.py --image, so a single-image clean "
+                        "number here matches that run's [clean] line.")
     p.add_argument("--out", default=f"results/clean_baselines")
     p.add_argument("--tag", type=str, default=None)
     a = p.parse_args()
@@ -76,8 +82,9 @@ def main():
         print(SLIDE_WARNING)
 
     ds = make_dataset(a, "val")
-    loader = DataLoader(Subset(ds, list(range(min(a.n_images, len(ds))))),
-                        batch_size=1, num_workers=2)
+    idxs = (image_indices(a.images, len(ds)) if a.images is not None
+            else list(range(min(a.n_images, len(ds)))))
+    loader = DataLoader(Subset(ds, idxs), batch_size=1, num_workers=2)
 
     m = SegMetric(a.num_classes, device=device)
     per_image = []
@@ -99,9 +106,15 @@ def main():
     print(f"{'='*66}")
     print(f"  DATASET mIoU  : {dataset_miou:.2f}   <- compare to published")
     pim = torch.tensor(per_image)
-    print(f"  per-image mIoU: {pim.mean():.2f} +/- {pim.std():.2f} "
+    # std of one value is NaN (and a torch warning); a single image has none.
+    std = float(pim.std()) if len(pim) > 1 else 0.0
+    print(f"  per-image mIoU: {pim.mean():.2f} +/- {std:.2f} "
           f"(range {pim.min():.2f}-{pim.max():.2f})")
     print(f"                  NOT comparable to published numbers")
+    if a.images is not None and len(idxs) <= 20:
+        print("\n  per-image mIoU (gt classes, = overfit.py's [clean] all):")
+        for i, v in zip(idxs, per_image):
+            print(f"    img {i:4d}: {v:6.2f}")
     print("\n  per-class IoU:")
     for c in range(min(a.num_classes, 19)):
         if not torch.isnan(iou[c]):
@@ -110,7 +123,9 @@ def main():
     rec = {"arch": a.arch, "img_h": a.img_h, "img_w": a.img_w,
            "inference": mode, "scale": getattr(a, "scale", "resize"),
            "n_images": len(per_image), "dataset_miou": dataset_miou,
-           "per_image_mean": float(pim.mean()), "per_image_std": float(pim.std()),
+           "images": idxs,
+           "per_image_miou": dict(zip(map(str, idxs), map(float, per_image))),
+           "per_image_mean": float(pim.mean()), "per_image_std": std,
            "backbone_channels": n_ch, "backbone_active": n_act,
            "per_class_iou": {class_name(c): (None if torch.isnan(iou[c])
                                              else float(iou[c]))
