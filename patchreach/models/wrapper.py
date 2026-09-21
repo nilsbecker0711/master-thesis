@@ -7,6 +7,27 @@ import torch.nn.functional as F
 import torch.utils.checkpoint as cp
 
 
+def low_precision_dtype() -> torch.dtype:
+    """bf16 where the GPU has it (Ampere+), else fp16 — what --low_pr runs in.
+    CPU autocast only supports bf16, so a CPU run gets bf16 too."""
+    if not torch.cuda.is_available() or torch.cuda.is_bf16_supported():
+        return torch.bfloat16
+    return torch.float16
+
+
+class _GradScale(torch.autograd.Function):
+    """Identity forward; backward multiplies the incoming gradient by `scale`."""
+
+    @staticmethod
+    def forward(ctx, x, scale):
+        ctx.scale = scale
+        return x.view_as(x)
+
+    @staticmethod
+    def backward(ctx, g):
+        return g * ctx.scale, None
+
+
 class WrappedSegModel(nn.Module):
     """
     encode_decode path: [B,C,H,W] -> logits [B,num_classes,H_out,W_out].
@@ -17,13 +38,31 @@ class WrappedSegModel(nn.Module):
 
     encode_decode is defined on EncoderDecoder, so this works identically for
     InternImage, SegFormer and Swin with no per-arch branching.
+
+    LOW PRECISION (amp_dtype set, i.e. --low_pr). The forward runs under
+    autocast: weights stay fp32, matmuls/convs run and store activations in
+    16 bit, softmax/LayerNorm stay fp32 (autocast's own op lists). Logits come
+    back as fp32 so stitching, losses, metrics and the CSF budget are
+    untouched. Living here rather than in the slide wrapper means whole and
+    slide both get it, and a checkpointed window recomputes under the same
+    autocast because the context is inside the checkpointed call.
+
+    fp16 ONLY: the attack gradient is a per-pixel MEAN over ~1e6 pixels, so
+    per-logit gradients sit around 1e-6 — below fp16's normal range, where
+    they flush to zero and the patch silently stops moving. The gradient is
+    therefore multiplied by GRAD_SCALE on entry to the 16-bit graph and divided
+    back out at the input, so callers see exactly the fp32-scaled gradient and
+    no optimisation loop needs to know. bf16 has fp32's exponent range and
+    needs none of this.
     """
 
     mode = "whole"
+    GRAD_SCALE = 2.0 ** 10
 
-    def __init__(self, model: nn.Module):
+    def __init__(self, model: nn.Module, amp_dtype: torch.dtype | None = None):
         super().__init__()
         self.model = model
+        self.amp_dtype = amp_dtype
         self.eval()
         for p in self.parameters():
             p.requires_grad_(False)
@@ -36,7 +75,17 @@ class WrappedSegModel(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         B, _, H, W = x.shape
-        return self.model.encode_decode(x, self._metas(B, H, W))
+        if self.amp_dtype is None:
+            return self.model.encode_decode(x, self._metas(B, H, W))
+        scale = self.GRAD_SCALE if self.amp_dtype == torch.float16 else 1.0
+        if scale != 1.0 and torch.is_grad_enabled():
+            x = _GradScale.apply(x, 1.0 / scale)       # undo at the input
+        with torch.autocast(x.device.type, dtype=self.amp_dtype):
+            out = self.model.encode_decode(x, self._metas(B, H, W))
+        out = out.float()
+        if scale != 1.0 and torch.is_grad_enabled():
+            out = _GradScale.apply(out, scale)          # lift into fp16 range
+        return out
 
 
 def slide_windows(H: int, W: int, crop, stride):
