@@ -76,6 +76,7 @@ import torch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from patchreach.data.cityscapes import CityscapesSeg, norm_tensors
+from patchreach.patch.placement import footprint_side
 
 # Kept in sync with scripts/_common.py by hand. _common is not imported
 # because it pulls in the model registry, and with it mmseg — which is the
@@ -155,12 +156,18 @@ def parse_images(arg: str, n_images: int) -> List[int]:
 
 # ── geometry ─────────────────────────────────────────────────────────────────
 
-def footprint_box(placement, H: int, W: int, scale: float):
+def footprint_box(placement, H: int, W: int, scale: float,
+                  ref: str = "height"):
     """
     (top, left, p) exactly as Patch.apply() resolves it: centred when no
     placement was stored, then clamped inside the frame.
+
+    p comes from placement.footprint_side, the rule Patch.apply() itself uses.
+    A private int(H*scale) here would crop the height-rule box around a patch
+    pasted at the area-rule size (--patch_scale_ref area), so LPIPS would score
+    the wrong region on every non-square input without any error.
     """
-    p = int(H * scale)
+    p = footprint_side(H, W, scale, ref)
     top, left = (placement if placement is not None
                  else ((H - p) // 2, (W - p) // 2))
     top = max(0, min(int(top), H - p))
@@ -228,7 +235,8 @@ def evaluate_image(patch, img_norm, mean_t, std_t, metrics, cfg: dict,
         patch.set_reference_from_image(img_norm, mean_t, std_t)
     patched = composite(patch, img_norm, mean_t, std_t, quantize)
 
-    top, left, p = footprint_box(patch.placement, H, W, patch.cfg.scale)
+    top, left, p = footprint_box(patch.placement, H, W, patch.cfg.scale,
+                                 patch.cfg.scale_ref)
     crop = (slice(None), slice(None), slice(top, top + p),
             slice(left, left + p))
     t, b, l, r = expand_box(top, left, p, int(round(context * p)), H, W)

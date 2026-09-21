@@ -327,7 +327,7 @@ def attack_image(model, img, label, patch, *,
     # measured at a near-field hotspot are not the same measurement, and the
     # distance from centre is what separates them.
     H, W = hw
-    p_side = int(H * patch.cfg.scale)
+    p_side = patch.side(H, W)
     top, left = (patch.placement if patch.placement is not None
                  else ((H - p_side) // 2, (W - p_side) // 2))
     ctop, cleft = (H - p_side) // 2, (W - p_side) // 2

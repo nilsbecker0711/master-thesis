@@ -450,7 +450,7 @@ def run(model, img, label, patch, out_dir, loss_fn: str, K: int = 19,
 
     L("=" * 66)
     L(f"  DIAGNOSTICS — loss_fn={loss_fn}  patch_mode={patch.cfg.mode}  "
-      f"scale={patch.cfg.scale}")
+      f"scale={patch.cfg.scale} of {patch.cfg.scale_ref}")
     L("=" * 66)
 
     res = {"loss_fn": loss_fn, "target_class": target_class}

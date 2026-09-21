@@ -214,7 +214,7 @@ def scale_sweep(model, imgs, patch, scales=(0.15, 0.25, 0.35, 0.50),
             if ring.sum():
                 row.append(((lo + hi) // 2, reach[ring].mean().item() * 100))
         out[s] = row
-        log(f"    scale {s:.2f} (p={int(H*s)}px): "
+        log(f"    scale {s:.2f} (p={patch.side(H, W)}px): "
             + "  ".join(f"{d}px={r:.1f}%" for d, r in row))
 
     patch.cfg.scale, patch.param.data = original_scale, original_param

@@ -17,10 +17,47 @@ still work at B". Placement TRANSFER is untested in the literature.
 """
 from __future__ import annotations
 
+import math
 from typing import Optional, Tuple
 
 import torch
 import torch.nn.functional as F
+
+SCALE_REFS = ("height", "area")
+
+
+def footprint_side(H: int, W: int, scale: float, ref: str = "height") -> int:
+    r"""
+    Side in px of the square the patch is pasted as. THE single rule — every
+    renderer, placement, footprint and diagnostic calls this, so they cannot
+    drift apart. It lives here because placement.py is a leaf module that both
+    spec.py and conditional_generator.py already import.
+
+    ref='height'  p = int(H * scale). DEFAULT, and every run before 2026-09.
+                  Scale is a fraction of image HEIGHT, so ASPECT RATIO decides
+                  how much of the frame the patch covers: at scale 0.25 it is
+                  3.125% of a 512x1024 frame but 6.25% of a 1024x1024 one.
+                  Width never enters.
+
+    ref='area'    p = int(scale * sqrt(H * W)). The patch covers scale**2 of the
+                  frame at ANY size and aspect ratio — 6.25% at 0.25, whether
+                  the input is 512x1024, 768x768 or 1024x2048. Use this when
+                  inputs differ in shape and "0.25" must mean the same thing.
+                  Identical to 'height' on square inputs.
+
+    What NEITHER rule holds constant is the PHYSICAL size in the scene: under
+    scale='crop' tensor pixels are native pixels, so equal frame coverage on a
+    smaller crop is a smaller object. When field of view changes, coverage and
+    physical size cannot both be held — pick the one the comparison needs.
+
+    int() floors in both branches, matching the historical rule exactly, so
+    'height' is bit-identical to what every existing checkpoint was trained at.
+    """
+    if ref == "height":
+        return int(H * scale)
+    if ref == "area":
+        return int(scale * math.sqrt(H * W))
+    raise ValueError(f"scale_ref must be one of {SCALE_REFS}, got {ref!r}")
 
 
 @torch.no_grad()
