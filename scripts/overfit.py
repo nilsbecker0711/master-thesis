@@ -161,6 +161,24 @@ def run_one(a, seed: int, model, img, label, device, mean_t, std_t, G,
     with open(out_dir / "results.json", "w") as f:
         json.dump(out, f, indent=2)
 
+    # FIGURES SHOW best.pt, NOT THE FINAL STATE. results.json and final.pt above
+    # stay the final patch; everything below is the qualitative picture, and a
+    # run that degraded after its peak would otherwise illustrate the patch it
+    # lost rather than the one it reported as best_drop_remote. Same choice as
+    # overfit_population.py. The parameter is swapped IN PLACE rather than via
+    # Patch.load(), because load() does not restore the reference (--from_image,
+    # lap) and render() would silently fall back to grey. Placement is fixed
+    # for the whole run, so the param is the only thing that differs.
+    best_ck = out_dir / "best.pt"
+    if best_ck.exists():
+        with torch.no_grad():
+            patch.param.copy_(torch.load(best_ck, map_location="cpu")["param"]
+                              .to(patch.param.device))
+            patched, fp = patch.apply(img)
+            adv_logits = upsample_to(model(patched), label.shape[-2:])
+    else:
+        print("  [diagnostics] no best.pt; figures use the final patch")
+
     report.per_class_iou_figure(
         clean_logits, adv_logits, label, a.num_classes,
         out_dir / "per_class_iou.png",
