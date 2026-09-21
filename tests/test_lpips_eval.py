@@ -86,10 +86,24 @@ def test_residual_is_scored_and_outside_is_untouched():
                                     {"from_image": True}, 0.25, True)
     assert row["lpips_crop_alex"] > 0
     # size == p, so the zero-residual composite is the clean crop exactly
-    assert row["lpips_floor_alex"] == pytest.approx(0.0, abs=1e-6)
+    assert row["lpips_floor_crop_alex"] == pytest.approx(0.0, abs=1e-6)
+    assert row["lpips_floor_full_alex"] == pytest.approx(0.0, abs=1e-6)
     # dilution: the full frame averages the same change over 4x the area
     assert row["lpips_full_alex"] < row["lpips_crop_alex"]
+    # no blur, so the residual-only composite IS the patched frame
+    assert row["lpips_resid_full_alex"] == pytest.approx(
+        row["lpips_full_alex"], abs=1e-6)
     assert "visibility" in row
+
+
+def test_anchors_grow_with_epsilon_and_dilute_when_local():
+    row, _ = le.evaluate_image(_csf_patch(32), _img(), MEAN, STD, METRICS,
+                               {"from_image": True, "image": 420}, 0.25,
+                               True, anchors=(4.0, 8.0))
+    g4 = row["anchor_linf4_global_full_alex"]
+    g8 = row["anchor_linf8_global_full_alex"]
+    assert 0 < g4 < g8
+    assert row["anchor_linf8_patch_full_alex"] < g8
 
 
 def test_floor_is_nonzero_when_the_base_is_resampled():
@@ -97,7 +111,8 @@ def test_floor_is_nonzero_when_the_base_is_resampled():
     patch = _csf_patch(16)
     row, _ = le.evaluate_image(patch, _img(), MEAN, STD, METRICS,
                                {"from_image": True}, 0.25, True)
-    assert row["lpips_floor_alex"] > 0
+    assert row["lpips_floor_crop_alex"] > 0
+    assert row["lpips_floor_full_alex"] > 0
 
 
 def test_base_only_restores_render():
@@ -153,3 +168,41 @@ def test_parse_images():
     assert le.parse_images("fixed10", 3) == le.FIXED10[:3]
     assert le.parse_images("first5", 0) == [0, 1, 2, 3, 4]
     assert le.parse_images("4, 9 11", 0) == [4, 9, 11]
+
+
+@pytest.mark.parametrize("size", [32, 16])      # 16: resampled base, floor > 0
+def test_png_source_matches_checkpoint_source(tmp_path, size):
+    """
+    The PNGs report.py writes and the frames rebuilt from the checkpoint are
+    the same image, so every shared column must agree -- including the blur
+    control, which the PNG path rebuilds from geometry alone.
+    """
+    from torchvision.utils import save_image
+    from patchreach.data.cityscapes import denormalise
+
+    patch = _csf_patch(size)
+    img = _img(3)
+    cfg = {"image": 420, "patch_mode": "csf", "from_image": True,
+           "patch_size": size, "patch_scale": 0.5, "placement": "center"}
+    ck_row, _ = le.evaluate_image(patch, img, MEAN, STD, METRICS, cfg,
+                                  0.25, True)
+
+    run = tmp_path / "run"
+    panels = run / "diagnostics" / "panels"
+    panels.mkdir(parents=True)
+    with torch.no_grad():
+        patched, _ = patch.apply(img)
+    save_image(denormalise(img, MEAN, STD), panels / "a_clean.png")
+    save_image(denormalise(patched, MEAN, STD), panels / "c_patched.png")
+    patch.save(run / "final.pt")
+    (run / "config.json").write_text(json.dumps(cfg))
+
+    jobs = le.discover_pngs(run, cfg)
+    assert [(j.image, j.label) for j in jobs] == [(420, "run")]
+    png_row, _ = le.evaluate_png(jobs[0], cfg, METRICS, 0.25, True, (), DEV)
+    assert png_row["box_from"] == "checkpoint"
+
+    shared = [k for k in ck_row if k.startswith("lpips_")]
+    assert any(k.startswith("lpips_floor_") for k in shared)
+    for k in shared:
+        assert png_row[k] == pytest.approx(ck_row[k], abs=2e-4), k

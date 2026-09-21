@@ -13,9 +13,21 @@ touches a segmentor. It imports only the model-free half of patchreach
 rebuilds the clean and the patched frame from what the attack scripts already
 saved, and scores the pair. No model, no mmseg, no GPU required.
 
-WHAT IT READS — every layout the attack scripts write:
+TWO SOURCES (--source, default auto = png where the run has them):
 
-    overfit.py             <run>/config.json + <run>/{final,best}.pt
+    png         the a_clean.png / c_patched.png the attack scripts already
+                wrote (diagnostics/panels/, panels/img*/). Exactly the frames
+                the segmentor saw, lossless 8-bit. No checkpoint, no dataset,
+                no --cityscapes_root. Only images the run wrote diagnostics
+                for, and no CSF visibility columns.
+    checkpoint  rebuild the frames from final/best.pt + the val image (below).
+                Every image, plus the visibility columns from Patch.stats().
+
+Both feed the same scoring, and a test holds them equal on the same patch.
+
+WHAT THE CHECKPOINT SOURCE READS — every layout the attack scripts write:
+
+    overfit.py            <run>/config.json + <run>/{final,best}.pt
                            <run>/seed*/{final,best}.pt     (--seeds > 1)
     overfit_population.py  <run>/config.json + <run>/patches/img%04d/best.pt
     train.py               <run>/config.json + <run>/{final,best}.pt
@@ -36,14 +48,34 @@ THREE LPIPS NUMBERS PER IMAGE, because one of them alone misleads:
                  in a 512x1024 frame is diluted ~32x. Reported for
                  completeness; do not quote it as the naturalness number.
 
-and one control, csf modes only:
+and two controls, csf modes only, each on crop / ctx / full:
 
-    lpips_floor  clean vs the ZERO-RESIDUAL composite: the base alone,
-                 downsampled to --patch_size and pasted back up to p. Nonzero
-                 whenever patch_size != int(img_h * patch_scale), and then part
-                 of lpips_crop is resampling blur rather than the residual.
-                 If floor is a large fraction of crop, the number is about the
-                 pipeline, not the attack.
+    lpips_floor_*  clean vs the ZERO-RESIDUAL composite: the image's own crop
+                   pasted back as the patch, zero optimisation -- the base
+                   downsampled to --patch_size and resized back up to p.
+                   Nonzero whenever patch_size != int(img_h * patch_scale),
+                   and then part of lpips_* is resampling blur rather than the
+                   residual. If floor is a large fraction of the patched
+                   number, that number is about the pipeline, not the attack.
+
+                   NOT the same as an overfit.py run with --steps 0: csf
+                   initialises the residual AT the tau budget (randn * 10,
+                   projected), so step 0 is random noise at tau, not the crop.
+
+    lpips_resid_*  clean vs clean + (patched - base): the residual exactly as
+                   pasted, on the SHARP original. Removes the blur without
+                   rerunning the attack -- what the CSF residual alone costs.
+
+ANCHORS (--anchors). LPIPS has no absolute threshold, so the script can score
+known reference perturbations on the same frame with the same nets:
+
+    anchor_linf{e}_global_full_*  random +-e/255 sign noise on the whole
+                   frame. e = 8 is the conventional "imperceptible" L_inf
+                   budget, and Laidlaw et al. (ICLR 2021) measured human
+                   perceptibility of L_inf 8/255 attacks directly; this puts
+                   that budget on YOUR LPIPS scale, for YOUR image.
+    anchor_linf{e}_patch_full_*   the same noise confined to the footprint:
+                   the local counterpart, diluted exactly like the patch is.
 
 QUANTISATION. The patched frame is rounded to 8 bit before scoring (turn off
 with --no_quantize). That is what a display shows and what a saved PNG holds —
@@ -65,6 +97,7 @@ import argparse
 import csv
 import json
 import math
+import re
 import statistics
 import sys
 from dataclasses import dataclass
@@ -72,6 +105,7 @@ from pathlib import Path
 from typing import Dict, List, Optional
 
 import torch
+import torch.nn.functional as F
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -219,49 +253,68 @@ def score_pair(metrics: Dict[str, "torch.nn.Module"], a: torch.Tensor,
     return out
 
 
-def evaluate_image(patch, img_norm, mean_t, std_t, metrics, cfg: dict,
-                   context: float, quantize: bool):
+def resampled_base(clean: torch.Tensor, box, size: int,
+                   quantize: bool) -> torch.Tensor:
+    r"""
+    The zero-residual composite, from the clean frame alone.
+
+    Exactly the round trip mode='csf' --from_image puts the base through:
+    set_reference_from_image() resizes the p x p crop to size x size, apply()
+    resizes the render back to p x p. Both bilinear, align_corners=False.
+    No checkpoint needed -- only the geometry.
     """
-    Every number for one (patch, image) pair, plus the crops for a panel.
+    top, left, p = box
+    crop = clean[:, :, top:top + p, left:left + p]
+    ref = F.interpolate(crop, size=(size, size), mode="bilinear",
+                        align_corners=False)
+    back = F.interpolate(ref, size=(p, p), mode="bilinear",
+                         align_corners=False).clamp(0, 1)
+    base = clean.clone()
+    base[:, :, top:top + p, left:left + p] = back
+    return quantize8(base) if quantize else base
 
-    Returns (row, views). row is flat {column: value} for the CSV; views
-    holds the full [3,H,W] frames on CPU (clean, patched, and the
-    zero-residual base where one exists) plus the footprint box, for
-    save_visuals().
+
+def score_frames(clean, patched, base, box, metrics, context: float,
+                 quantize: bool, anchors=(), image: Optional[int] = None):
     """
-    H, W = img_norm.shape[-2:]
-    mode = patch.cfg.mode
-    from_image = bool(cfg.get("from_image", False))
+    Every LPIPS / pixel number for one clean-patched pair.
 
-    clean = quantize8((img_norm * std_t + mean_t).clamp(0, 1))
-    if mode == "csf" and from_image:
-        patch.set_reference_from_image(img_norm, mean_t, std_t)
-    patched = composite(patch, img_norm, mean_t, std_t, quantize)
+    clean, patched, base : [1,3,H,W] in [0,1]; base is the zero-residual
+    composite or None where the mode has no base (opaque patches). Shared by
+    the checkpoint and the PNG source, so both produce identical columns.
 
+    Returns (row, views): row is flat {column: value} for the CSV; views holds
+    the frames on CPU and the footprint box, for save_visuals().
+    """
+    H, W = clean.shape[-2:]
+    top, left, p = box
     top, left, p = footprint_box(patch.placement, H, W, patch.cfg.scale,
                                  patch.cfg.scale_ref)
     crop = (slice(None), slice(None), slice(top, top + p),
             slice(left, left + p))
     t, b, l, r = expand_box(top, left, p, int(round(context * p)), H, W)
     ctx = (slice(None), slice(None), slice(t, b), slice(l, r))
+    whole = (slice(None),) * 4
+    regions = (("crop", crop), ("ctx", ctx), ("full", whole))
 
     row = {}
-    for net, v in score_pair(metrics, clean[crop], patched[crop]).items():
-        row[f"lpips_crop_{net}"] = v
-    for net, v in score_pair(metrics, clean[ctx], patched[ctx]).items():
-        row[f"lpips_ctx_{net}"] = v
-    for net, v in score_pair(metrics, clean, patched).items():
-        row[f"lpips_full_{net}"] = v
+    for region, sl in regions:
+        for net, v in score_pair(metrics, clean[sl], patched[sl]).items():
+            row[f"lpips_{region}_{net}"] = v
 
     # The control only exists where there is a base to remove the residual
     # from. universal_csf composites onto the clean window at full resolution,
     # so its floor is zero by construction; opaque modes have no base at all.
-    base = None
-    if mode == "csf" and patch.reference is not None:
-        base = composite(patch, img_norm, mean_t, std_t, quantize,
-                         base_only=True)
-        for net, v in score_pair(metrics, clean[crop], base[crop]).items():
-            row[f"lpips_floor_{net}"] = v
+    if base is not None:
+        # clean + (patched - base): the pasted residual on the sharp original.
+        # Quantised again because the sum is a new displayed image.
+        resid = clean + (patched - base)
+        resid = quantize8(resid) if quantize else resid.clamp(0, 1)
+        for name, other in (("floor", base), ("resid", resid)):
+            for region, sl in regions:
+                for net, v in score_pair(metrics, clean[sl],
+                                         other[sl]).items():
+                    row[f"lpips_{name}_{region}_{net}"] = v
 
     diff = patched[crop] - clean[crop]
     mse = float(diff.pow(2).mean())
@@ -271,15 +324,163 @@ def evaluate_image(patch, img_norm, mean_t, std_t, metrics, cfg: dict,
     row["frac_px_changed"] = float((diff.abs().amax(1) > 0.5 / 255).float()
                                    .mean())
 
+    if anchors:
+        # Seeded per image, so every run scored on this image sees the same
+        # anchor noise and the anchor columns are comparable across runs.
+        g = torch.Generator().manual_seed(1234 + int(image or 0))
+        sign = (torch.randint(0, 2, clean.shape, generator=g).float() * 2 - 1
+                ).to(clean.device)
+        inside = torch.zeros_like(clean)
+        inside[crop] = 1.0
+        for e in anchors:
+            for where, m in (("global", 1.0), ("patch", inside)):
+                noisy = quantize8(clean + sign * m * e / 255.0)
+                for net, v in score_pair(metrics, clean, noisy).items():
+                    row[f"anchor_linf{e:g}_{where}_full_{net}"] = v
+
+    views = {"clean": clean[0].cpu(), "patched": patched[0].cpu(),
+             "base": None if base is None else base[0].cpu(),
+             "box": (top, left, p)}
+    return row, views
+
+
+def evaluate_image(patch, img_norm, mean_t, std_t, metrics, cfg: dict,
+                   context: float, quantize: bool, anchors=(),
+                   image: Optional[int] = None):
+    """
+    CHECKPOINT source: rebuild the frames from a saved Patch, then score.
+
+    Adds the CSF visibility columns from Patch.stats(), which only a
+    checkpoint can provide.
+    """
+    H, W = img_norm.shape[-2:]
+    mode = patch.cfg.mode
+    clean = quantize8((img_norm * std_t + mean_t).clamp(0, 1))
+    if mode == "csf" and cfg.get("from_image", False):
+        patch.set_reference_from_image(img_norm, mean_t, std_t)
+    patched = composite(patch, img_norm, mean_t, std_t, quantize)
+    base = (composite(patch, img_norm, mean_t, std_t, quantize,
+                      base_only=True)
+            if mode == "csf" and patch.reference is not None else None)
+    box = footprint_box(patch.placement, H, W, patch.cfg.scale)
+
+    row, views = score_frames(
+        clean, patched, base, box, metrics, context, quantize, anchors,
+        image if image is not None else cfg.get("image"))
     if mode in ("csf", "universal_csf"):
         with torch.no_grad():
             st = patch.stats()
         for k in VIS_KEYS:
             if k in st:
                 row[k] = float(st[k])
-    views = {"clean": clean[0].cpu(), "patched": patched[0].cpu(),
-             "base": None if base is None else base[0].cpu(),
-             "box": (top, left, p)}
+    return row, views
+
+
+# ── PNG source ───────────────────────────────────────────────────────────────
+#
+# The attack scripts already write the exact frames the segmentor saw, via
+# torchvision save_image -- lossless 8-bit PNG, the same rounding quantize8()
+# applies. Scoring those needs no checkpoint, no dataset and no Patch
+# reconstruction:
+#
+#   overfit.py             <run>[/seed*]/diagnostics/panels/{a_clean,c_patched}.png
+#   overfit_population.py  <run>/diagnostics/img%04d/panels/...
+#   train.py               <run>/panels/img%d/...
+#
+# Only images the run wrote diagnostics for are available (--no_diagnostics
+# writes none), and there are no visibility columns: those need the residual
+# on the patch grid, which only the checkpoint holds.
+
+@dataclass
+class PngJob:
+    clean: Path
+    patched: Path
+    image: int
+    label: str
+    ckpt: Optional[Path]      # only for the footprint position
+
+
+def _image_from_path(rel: Path) -> Optional[int]:
+    for part in rel.parts:
+        m = re.fullmatch(r"img(\d+)", part)
+        if m:
+            return int(m.group(1))
+    return None
+
+
+def discover_pngs(run: Path, cfg: dict) -> List[PngJob]:
+    run = run.resolve()
+    jobs = []
+    for patched in sorted(run.rglob("c_patched.png")):
+        clean = patched.with_name("a_clean.png")
+        if not clean.exists():
+            continue
+        rel = patched.parent.relative_to(run)
+        image = _image_from_path(rel)
+        if image is None:
+            image = cfg.get("image")
+        if image is None:
+            print(f"  [skip] {rel}: cannot tell which val image this is")
+            continue
+        keep = [x for x in rel.parts if x not in ("diagnostics", "panels")]
+        label = "-".join(keep) or "run"
+
+        # The checkpoint that belongs to these frames, read ONLY for its
+        # placement: overfit's seed dir or run dir, population's per-image
+        # patch dir, train's run dir.
+        homes = [run / "patches" / f"img{image:04d}"]
+        homes += [run / x for x in keep if x.startswith("seed")]
+        homes.append(run)
+        ckpt = next((c for h in homes for c in (h / "final.pt", h / "best.pt")
+                     if c.exists()), None)
+        jobs.append(PngJob(clean, patched, int(image), label, ckpt))
+    return jobs
+
+
+def load_png(path: Path, device) -> torch.Tensor:
+    from PIL import Image
+    import numpy as np
+    arr = np.asarray(Image.open(path).convert("RGB"), dtype=np.float32)
+    return torch.from_numpy(arr / 255.0).permute(2, 0, 1)[None].to(device)
+
+
+def png_box(job: PngJob, cfg: dict, clean, patched):
+    """
+    Footprint (top, left, p) and where it came from.
+
+    The PNGs do not record the patch position, so in order of reliability:
+    the checkpoint's stored placement; centre, when the run was centre
+    placed; else the bounding box of the pixels that changed (square-ified
+    to p). The last can come out a few pixels small where the residual left
+    border pixels unchanged -- `box_from` says which one was used.
+    """
+    H, W = clean.shape[-2:]
+    scale = cfg.get("patch_scale", 0.25)
+    if job.ckpt is not None:
+        ck = torch.load(job.ckpt, map_location="cpu")
+        return (footprint_box(ck.get("placement"), H, W,
+                              ck["config"].get("scale", scale)), "checkpoint")
+    if cfg.get("placement", "center") == "center":
+        return footprint_box(None, H, W, scale), "center"
+    changed = (patched - clean).abs().amax(1)[0] > 0.5 / 255
+    ys, xs = torch.nonzero(changed, as_tuple=True)
+    if len(ys) == 0:
+        return footprint_box(None, H, W, scale), "center"
+    return (footprint_box((int(ys.min()), int(xs.min())), H, W, scale),
+            "diff")
+
+
+def evaluate_png(job: PngJob, cfg: dict, metrics, context: float,
+                 quantize: bool, anchors, device):
+    clean = load_png(job.clean, device)
+    patched = load_png(job.patched, device)
+    box, box_from = png_box(job, cfg, clean, patched)
+    base = (resampled_base(clean, box, int(cfg["patch_size"]), quantize)
+            if cfg.get("patch_mode") == "csf" and cfg.get("from_image")
+            and cfg.get("patch_size") else None)
+    row, views = score_frames(clean, patched, base, box, metrics, context,
+                              quantize, anchors, job.image)
+    row["box_from"] = box_from
     return row, views
 
 
@@ -309,7 +510,7 @@ def save_visuals(views: dict, spatial_metric, out_dir: Path, stem: str,
         diff_{crop,full}_x<amp>.png         0.5 + amp * (patched - clean)
         lpips_map_{crop,full}.png / .npy    PNG is colour-mapped for looking;
                                             the .npy holds the raw values
-        base_crop.png, diff_floor_crop_x<amp>.png
+        base_{crop,full}.png, diff_floor_{crop,full}_x<amp>.png
                                             csf only: the zero-residual
                                             composite, i.e. what lpips_floor
                                             scored — resampling alone
@@ -382,9 +583,11 @@ def save_visuals(views: dict, spatial_metric, out_dir: Path, stem: str,
                    vmin=0, vmax=vmax)
         np.save(d / f"lpips_map_{name}.npy", m.numpy())
     if views["base"] is not None:
-        b = crop(views["base"])
-        _to_png(b, d / "base_crop.png")
-        _to_png(diff(crop(clean), b), d / f"diff_floor_crop_{amp}.png")
+        b = views["base"]
+        _to_png(crop(b), d / "base_crop.png")
+        _to_png(diff(crop(clean), crop(b)), d / f"diff_floor_crop_{amp}.png")
+        _to_png(b, d / "base_full.png")
+        _to_png(diff(clean, b), d / f"diff_floor_full_{amp}.png")
 
 
 def summarise(rows: List[dict]) -> dict:
@@ -440,6 +643,13 @@ def parse_args(argv=None):
                    choices=["alex", "vgg", "squeeze"],
                    help="alex is the LPIPS authors' recommended forward "
                         "metric; vgg is closer to a perceptual loss")
+    p.add_argument("--source", default="auto",
+                   choices=["auto", "png", "checkpoint"],
+                   help="png = score the a_clean.png / c_patched.png the run "
+                        "already wrote (no checkpoint, no dataset); "
+                        "checkpoint = rebuild the frames from final/best.pt "
+                        "(adds the CSF visibility columns); auto = png where "
+                        "the run has them, else checkpoint")
     p.add_argument("--checkpoint", default="auto",
                    choices=["auto", "final", "best"],
                    help="auto = final.pt, else best.pt")
@@ -456,6 +666,11 @@ def parse_args(argv=None):
                    help="save a panel (and, unless --no_save_images, "
                         "every view as its own PNG) for the first N images "
                         "per run")
+    p.add_argument("--anchors", nargs="*", type=float, default=None,
+                   metavar="E",
+                   help="score +-E/255 sign-noise anchors (global and "
+                        "footprint-only) on each frame; bare --anchors = "
+                        "2 4 8 16")
     p.add_argument("--no_save_images", action="store_true",
                    help="panels only, no per-view image files")
     p.add_argument("--amplify", type=float, default=10.0,
@@ -482,6 +697,8 @@ def main(argv=None):
     spatial = (build_metrics(a.nets[:1], device, spatial=True)[a.nets[0]]
                if a.panels > 0 else None)
     image_list = parse_images(a.images, a.n_images)
+    anchors = (() if a.anchors is None
+               else tuple(a.anchors) or (2.0, 4.0, 8.0, 16.0))
     # The run's own --tag is already a column ("tag"); this one names the
     # EVALUATION, so the two cannot share a column without one clobbering
     # the other.
@@ -490,19 +707,8 @@ def main(argv=None):
     from patchreach.patch.spec import Patch
 
     datasets: Dict[tuple, CityscapesSeg] = {}
-    all_rows = []
-    for run in a.runs:
-        if not (run / "config.json").exists():
-            print(f"[skip] {run}: no config.json")
-            continue
-        cfg = json.loads((run / "config.json").read_text())
-        jobs = discover(run, a.checkpoint, image_list)
-        if a.n_images > 0:
-            jobs = jobs[:a.n_images]
-        if not jobs:
-            print(f"[skip] {run}: no {a.checkpoint} checkpoint found")
-            continue
 
+    def dataset_for(cfg):
         root = a.cityscapes_root or cfg.get("cityscapes_root")
         key = (root, cfg.get("img_h", 512), cfg.get("img_w", 1024),
                cfg.get("scale", "resize"))
@@ -511,34 +717,67 @@ def main(argv=None):
             # images and make_dataset() only randomises the train split.
             datasets[key] = CityscapesSeg(root, "val", key[1], key[2],
                                           scale=key[3], random_crop=False)
-        ds = datasets[key]
+        return datasets[key]
 
-        print(f"\n[run ] {run}  ({len(jobs)} image(s), "
+    all_rows = []
+    for run in a.runs:
+        if not (run / "config.json").exists():
+            print(f"[skip] {run}: no config.json")
+            continue
+        cfg = json.loads((run / "config.json").read_text())
+
+        png_jobs = ([] if a.source == "checkpoint"
+                    else discover_pngs(run, cfg))
+        source = "png" if png_jobs else "checkpoint"
+        if a.source == "png" and not png_jobs:
+            print(f"[skip] {run}: no a_clean.png / c_patched.png pairs")
+            continue
+        jobs = (png_jobs if source == "png"
+                else discover(run, a.checkpoint, image_list))
+        if a.n_images > 0:
+            jobs = jobs[:a.n_images]
+        if not jobs:
+            print(f"[skip] {run}: no {a.checkpoint} checkpoint found")
+            continue
+
+        print(f"\n[run ] {run}  ({len(jobs)} image(s) from {source}, "
               f"mode {cfg.get('patch_mode')}, tau {cfg.get('csf_threshold')})")
         rows = []
         for n, job in enumerate(jobs):
-            patch = Patch.load(job.ckpt, device, mean_t, std_t)
-            if patch.cfg.mode == "gan":
-                print("  [skip] gan mode needs the BigGAN generator; not "
-                      "supported in the lpips env")
-                break
-            img = ds[job.image][0].unsqueeze(0).to(device)
-            row, views = evaluate_image(
-                patch, img, mean_t, std_t, metrics, cfg, a.context,
-                quantize=not a.no_quantize)
+            if source == "png":
+                row, views = evaluate_png(
+                    job, cfg, metrics, a.context, not a.no_quantize,
+                    anchors, device)
+                mode, ck_name = cfg.get("patch_mode"), None
+            else:
+                patch = Patch.load(job.ckpt, device, mean_t, std_t)
+                if patch.cfg.mode == "gan":
+                    print("  [skip] gan mode needs the BigGAN generator; "
+                          "not supported in the lpips env")
+                    break
+                img = dataset_for(cfg)[job.image][0].unsqueeze(0).to(device)
+                row, views = evaluate_image(
+                    patch, img, mean_t, std_t, metrics, cfg, a.context,
+                    quantize=not a.no_quantize, anchors=anchors,
+                    image=job.image)
+                mode, ck_name = patch.cfg.mode, job.ckpt.name
             row = {"run": str(run), "tag": cfg.get("tag"), "eval_tag": a.tag,
-                   "arch": cfg.get("arch"), "patch_mode": patch.cfg.mode,
+                   "source": source, "arch": cfg.get("arch"),
+                   "patch_mode": mode,
                    "csf_threshold": cfg.get("csf_threshold"),
                    "csf_param": cfg.get("csf_param"),
                    "csf_enforce": cfg.get("csf_enforce"),
-                   "checkpoint": job.ckpt.name, "which": job.label,
+                   "checkpoint": ck_name, "which": job.label,
                    "image": job.image, **row}
             rows.append(row)
-            main_col = f"lpips_crop_{a.nets[0]}"
-            print(f"  img {job.image:4d} {job.label:>8s}  "
-                  f"{main_col} {row[main_col]:.4f}"
-                  + (f"  floor {row[f'lpips_floor_{a.nets[0]}']:.4f}"
-                     if f"lpips_floor_{a.nets[0]}" in row else "")
+            net0 = a.nets[0]
+            main_col = f"lpips_full_{net0}"
+            print(f"  img {job.image:4d} {job.label:>12s}  "
+                  f"full {row[main_col]:.4f}"
+                  + (f"  floor_full {row[f'lpips_floor_full_{net0}']:.4f}"
+                     f"  resid_full {row[f'lpips_resid_full_{net0}']:.4f}"
+                     if f"lpips_floor_full_{net0}" in row else "")
+                  + f"  crop {row[f'lpips_crop_{net0}']:.4f}"
                   + (f"  vis {row['visibility']:.3f}"
                      if "visibility" in row else "")
                   + f"  psnr {row['psnr_crop']:.1f} dB")
@@ -555,11 +794,12 @@ def main(argv=None):
         write_csv(rows, out / "per_image.csv")
         summ = summarise(rows)
         summ.update({"nets": a.nets, "quantized": not a.no_quantize,
-                     "context": a.context, "checkpoint": a.checkpoint,
-                     "eval_tag": a.tag})
+                     "context": a.context, "source": source,
+                     "checkpoint": a.checkpoint if source == "checkpoint"
+                     else None, "eval_tag": a.tag})
         (out / "summary.json").write_text(json.dumps(summ, indent=2))
-        med = summ.get(f"lpips_crop_{a.nets[0]}", {})
-        print(f"  -> {out}/  median lpips_crop_{a.nets[0]} "
+        med = summ.get(f"lpips_full_{a.nets[0]}", {})
+        print(f"  -> {out}/  median lpips_full_{a.nets[0]} "
               f"{med.get('median', float('nan')):.4f}  "
               f"(IQR {med.get('q25', float('nan')):.4f}-"
               f"{med.get('q75', float('nan')):.4f})")
