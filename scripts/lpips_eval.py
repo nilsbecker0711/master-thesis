@@ -217,7 +217,10 @@ def evaluate_image(patch, img_norm, mean_t, std_t, metrics, cfg: dict,
     """
     Every number for one (patch, image) pair, plus the crops for a panel.
 
-    Returns (row, crops) where row is flat {column: value} for the CSV.
+    Returns (row, views). row is flat {column: value} for the CSV; views
+    holds the full [3,H,W] frames on CPU (clean, patched, and the
+    zero-residual base where one exists) plus the footprint box, for
+    save_visuals().
     """
     H, W = img_norm.shape[-2:]
     mode = patch.cfg.mode
@@ -245,6 +248,7 @@ def evaluate_image(patch, img_norm, mean_t, std_t, metrics, cfg: dict,
     # The control only exists where there is a base to remove the residual
     # from. universal_csf composites onto the clean window at full resolution,
     # so its floor is zero by construction; opaque modes have no base at all.
+    base = None
     if mode == "csf" and patch.reference is not None:
         base = composite(patch, img_norm, mean_t, std_t, quantize,
                          base_only=True)
@@ -265,37 +269,114 @@ def evaluate_image(patch, img_norm, mean_t, std_t, metrics, cfg: dict,
         for k in VIS_KEYS:
             if k in st:
                 row[k] = float(st[k])
-    return row, (clean[crop][0].cpu(), patched[crop][0].cpu())
+    views = {"clean": clean[0].cpu(), "patched": patched[0].cpu(),
+             "base": None if base is None else base[0].cpu(),
+             "box": (top, left, p)}
+    return row, views
 
 
 # ── output ───────────────────────────────────────────────────────────────────
 
-def save_panel(clean, patched, spatial_metric, path: Path, title: str,
-               amplify: float):
-    """clean | patched | amplified difference | LPIPS spatial map."""
+def _to_png(x: torch.Tensor, path: Path):
+    """[3,h,w] in [0,1] -> 8-bit PNG, lossless for already-quantised input."""
+    from PIL import Image
+    arr = (x.clamp(0, 1) * 255).round().byte().permute(1, 2, 0).numpy()
+    Image.fromarray(arr).save(path)
+
+
+def save_visuals(views: dict, spatial_metric, out_dir: Path, stem: str,
+                 title: str, amplify: float, save_images: bool):
+    r"""
+    Panel + (optionally) every view as its own file.
+
+    PANEL, two rows:
+        footprint :  clean | patched | difference x amplify | LPIPS map
+        frame     :  the same four on the whole image, footprint outlined
+
+    The frame row is the context the crop row lacks: whether the patch reads
+    as a blemish in a scene rather than as a texture seen in isolation.
+
+    IMAGES (out_dir/images/<stem>/), at native resolution, no resampling:
+        {clean,patched}_{crop,full}.png     what was scored
+        diff_{crop,full}_x<amp>.png         0.5 + amp * (patched - clean)
+        lpips_map_{crop,full}.png / .npy    PNG is colour-mapped for looking;
+                                            the .npy holds the raw values
+        base_crop.png, diff_floor_crop_x<amp>.png
+                                            csf only: the zero-residual
+                                            composite, i.e. what lpips_floor
+                                            scored — resampling alone
+
+    Both LPIPS maps share one colour scale, so the crop and the frame can be
+    compared by eye. The map on the full frame is not the crop map pasted
+    back: LPIPS features see the surround, so it can light up along a seam.
+    """
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
+    from matplotlib.patches import Rectangle
 
-    with torch.no_grad():
-        smap = spatial_metric(clean[None] * 2 - 1, patched[None] * 2 - 1
-                              )[0, 0].cpu()
-    diff = (0.5 + amplify * (patched - clean)).clamp(0, 1)
-    fig, ax = plt.subplots(1, 4, figsize=(13, 3.6))
-    for a_, im, t in zip(ax[:3], (clean, patched, diff),
-                         ("clean", "patched", f"difference x{amplify:g}")):
-        a_.imshow(im.permute(1, 2, 0).numpy())
-        a_.set_title(t)
-    h = ax[3].imshow(smap.numpy(), cmap="magma")
-    ax[3].set_title(f"LPIPS map (mean {float(smap.mean()):.4f})")
-    fig.colorbar(h, ax=ax[3], fraction=0.046)
-    for a_ in ax:
+    top, left, p = views["box"]
+    clean, patched = views["clean"], views["patched"]
+    dev = next(spatial_metric.parameters()).device
+
+    def lmap(a, b):
+        with torch.no_grad():
+            return spatial_metric(a[None].to(dev) * 2 - 1,
+                                  b[None].to(dev) * 2 - 1)[0, 0].cpu()
+
+    def crop(x):
+        return x[:, top:top + p, left:left + p]
+
+    def diff(a, b):
+        return (0.5 + amplify * (b - a)).clamp(0, 1)
+
+    m_crop = lmap(crop(clean), crop(patched))
+    m_full = lmap(clean, patched)
+    vmax = float(max(m_crop.max(), m_full.max()))
+    amp = f"x{amplify:g}"
+
+    fig, ax = plt.subplots(2, 4, figsize=(16, 7.2),
+                           gridspec_kw={"height_ratios": [1.0, 0.55]})
+    rows = ((crop(clean), crop(patched), m_crop, "footprint", False),
+            (clean, patched, m_full, "full frame", True))
+    for r, (c, pt, m, name, outline) in enumerate(rows):
+        for a_, im, t in zip(ax[r, :3], (c, pt, diff(c, pt)),
+                             ("clean", "patched", f"difference {amp}")):
+            a_.imshow(im.permute(1, 2, 0).numpy())
+            a_.set_title(f"{name}: {t}", fontsize=9)
+        h = ax[r, 3].imshow(m.numpy(), cmap="magma", vmin=0, vmax=vmax)
+        ax[r, 3].set_title(f"{name}: LPIPS map (mean {float(m.mean()):.4f})",
+                           fontsize=9)
+        fig.colorbar(h, ax=ax[r, 3], fraction=0.046)
+        if outline:
+            for a_ in ax[r]:
+                a_.add_patch(Rectangle((left - 0.5, top - 0.5), p, p,
+                                       fill=False, edgecolor="cyan", lw=0.8))
+    for a_ in ax.ravel():
         a_.axis("off")
     fig.suptitle(title, fontsize=9)
     fig.tight_layout()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(path, dpi=120)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out_dir / f"panel_{stem}.png", dpi=120)
     plt.close(fig)
+
+    if not save_images:
+        return
+    d = out_dir / "images" / stem
+    d.mkdir(parents=True, exist_ok=True)
+    import numpy as np
+    for name, c, pt, m in (("crop", crop(clean), crop(patched), m_crop),
+                           ("full", clean, patched, m_full)):
+        _to_png(c, d / f"clean_{name}.png")
+        _to_png(pt, d / f"patched_{name}.png")
+        _to_png(diff(c, pt), d / f"diff_{name}_{amp}.png")
+        plt.imsave(d / f"lpips_map_{name}.png", m.numpy(), cmap="magma",
+                   vmin=0, vmax=vmax)
+        np.save(d / f"lpips_map_{name}.npy", m.numpy())
+    if views["base"] is not None:
+        b = crop(views["base"])
+        _to_png(b, d / "base_crop.png")
+        _to_png(diff(crop(clean), b), d / f"diff_floor_crop_{amp}.png")
 
 
 def summarise(rows: List[dict]) -> dict:
@@ -364,11 +445,20 @@ def parse_args(argv=None):
     p.add_argument("--no_quantize", action="store_true",
                    help="score float composites instead of 8-bit ones")
     p.add_argument("--panels", type=int, default=4,
-                   help="save a visual panel for the first N images per run")
+                   help="save a panel (and, unless --no_save_images, "
+                        "every view as its own PNG) for the first N images "
+                        "per run")
+    p.add_argument("--no_save_images", action="store_true",
+                   help="panels only, no per-view image files")
     p.add_argument("--amplify", type=float, default=10.0,
                    help="difference gain in the panels")
     p.add_argument("--out_name", default="lpips",
                    help="per-run output subdirectory")
+    p.add_argument("--tag", default="",
+                   help="names this evaluation: output goes to "
+                        "<run>/<out_name>_<tag>/ and every row carries it as "
+                        "eval_tag, so best vs final, quantized vs float, or "
+                        "alex vs vgg passes do not overwrite each other")
     p.add_argument("--out_csv", type=Path, default=None,
                    help="one combined CSV over every run, for the tables")
     p.add_argument("--device", default=None)
@@ -384,6 +474,10 @@ def main(argv=None):
     spatial = (build_metrics(a.nets[:1], device, spatial=True)[a.nets[0]]
                if a.panels > 0 else None)
     image_list = parse_images(a.images, a.n_images)
+    # The run's own --tag is already a column ("tag"); this one names the
+    # EVALUATION, so the two cannot share a column without one clobbering
+    # the other.
+    out_sub = f"{a.out_name}_{a.tag}" if a.tag else a.out_name
 
     from patchreach.patch.spec import Patch
 
@@ -421,10 +515,10 @@ def main(argv=None):
                       "supported in the lpips env")
                 break
             img = ds[job.image][0].unsqueeze(0).to(device)
-            row, (c_crop, p_crop) = evaluate_image(
+            row, views = evaluate_image(
                 patch, img, mean_t, std_t, metrics, cfg, a.context,
                 quantize=not a.no_quantize)
-            row = {"run": str(run), "tag": cfg.get("tag"),
+            row = {"run": str(run), "tag": cfg.get("tag"), "eval_tag": a.tag,
                    "arch": cfg.get("arch"), "patch_mode": patch.cfg.mode,
                    "csf_threshold": cfg.get("csf_threshold"),
                    "csf_param": cfg.get("csf_param"),
@@ -441,19 +535,20 @@ def main(argv=None):
                      if "visibility" in row else "")
                   + f"  psnr {row['psnr_crop']:.1f} dB")
             if n < a.panels:
-                save_panel(c_crop, p_crop, spatial,
-                           run / a.out_name / f"panel_{job.label}_"
-                           f"img{job.image:04d}.png",
-                           f"{run.name}  img {job.image}  "
-                           f"{main_col}={row[main_col]:.4f}", a.amplify)
+                save_visuals(views, spatial, run / out_sub,
+                             f"{job.label}_img{job.image:04d}",
+                             f"{run.name}  img {job.image}  "
+                             f"{main_col}={row[main_col]:.4f}", a.amplify,
+                             save_images=not a.no_save_images)
 
         if not rows:
             continue
-        out = run / a.out_name
+        out = run / out_sub
         write_csv(rows, out / "per_image.csv")
         summ = summarise(rows)
         summ.update({"nets": a.nets, "quantized": not a.no_quantize,
-                     "context": a.context, "checkpoint": a.checkpoint})
+                     "context": a.context, "checkpoint": a.checkpoint,
+                     "eval_tag": a.tag})
         (out / "summary.json").write_text(json.dumps(summ, indent=2))
         med = summ.get(f"lpips_crop_{a.nets[0]}", {})
         print(f"  -> {out}/  median lpips_crop_{a.nets[0]} "

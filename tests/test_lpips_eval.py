@@ -60,7 +60,7 @@ def test_box_matches_apply_footprint():
 def test_residual_is_scored_and_outside_is_untouched():
     patch = _csf_patch(32)
     img = _img()
-    row, (c, p) = le.evaluate_image(patch, img, MEAN, STD, METRICS,
+    row, views = le.evaluate_image(patch, img, MEAN, STD, METRICS,
                                     {"from_image": True}, 0.25, True)
     assert row["lpips_crop_alex"] > 0
     # size == p, so the zero-residual composite is the clean crop exactly
