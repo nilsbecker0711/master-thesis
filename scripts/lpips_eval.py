@@ -288,8 +288,6 @@ def score_frames(clean, patched, base, box, metrics, context: float,
     """
     H, W = clean.shape[-2:]
     top, left, p = box
-    top, left, p = footprint_box(patch.placement, H, W, patch.cfg.scale,
-                                 patch.cfg.scale_ref)
     crop = (slice(None), slice(None), slice(top, top + p),
             slice(left, left + p))
     t, b, l, r = expand_box(top, left, p, int(round(context * p)), H, W)
@@ -362,7 +360,8 @@ def evaluate_image(patch, img_norm, mean_t, std_t, metrics, cfg: dict,
     base = (composite(patch, img_norm, mean_t, std_t, quantize,
                       base_only=True)
             if mode == "csf" and patch.reference is not None else None)
-    box = footprint_box(patch.placement, H, W, patch.cfg.scale)
+    box = footprint_box(patch.placement, H, W, patch.cfg.scale,
+                        patch.cfg.scale_ref)
 
     row, views = score_frames(
         clean, patched, base, box, metrics, context, quantize, anchors,
@@ -455,18 +454,25 @@ def png_box(job: PngJob, cfg: dict, clean, patched):
     border pixels unchanged -- `box_from` says which one was used.
     """
     H, W = clean.shape[-2:]
+    # The side rule matters as much as the position: under
+    # --patch_scale_ref area the patch is pasted at int(scale*sqrt(H*W)), and
+    # a height-rule box would score the wrong region without any error.
+    # 'height' is the default for every run written before the flag existed.
     scale = cfg.get("patch_scale", 0.25)
+    ref = cfg.get("patch_scale_ref", "height")
     if job.ckpt is not None:
         ck = torch.load(job.ckpt, map_location="cpu")
+        c = ck["config"]
         return (footprint_box(ck.get("placement"), H, W,
-                              ck["config"].get("scale", scale)), "checkpoint")
+                              c.get("scale", scale), c.get("scale_ref", ref)),
+                "checkpoint")
     if cfg.get("placement", "center") == "center":
-        return footprint_box(None, H, W, scale), "center"
+        return footprint_box(None, H, W, scale, ref), "center"
     changed = (patched - clean).abs().amax(1)[0] > 0.5 / 255
     ys, xs = torch.nonzero(changed, as_tuple=True)
     if len(ys) == 0:
-        return footprint_box(None, H, W, scale), "center"
-    return (footprint_box((int(ys.min()), int(xs.min())), H, W, scale),
+        return footprint_box(None, H, W, scale, ref), "center"
+    return (footprint_box((int(ys.min()), int(xs.min())), H, W, scale, ref),
             "diff")
 
 
@@ -688,8 +694,42 @@ def parse_args(argv=None):
     return p.parse_args(argv)
 
 
+# Directories the attack scripts own inside a run. Writing into one of them
+# could replace a file a later analysis reads -- overfit.py --seeds and
+# overfit_population.py both keep a summary.json of their own at run level.
+ATTACK_DIRS = {"diagnostics", "panels", "patches", "aggregate"}
+
+
+def check_outputs(a):
+    """
+    Refuse, before any work, an output location that could touch run files.
+
+    Every file this script writes lands in <run>/<out_name>[_<tag>]/, which it
+    creates, plus --out_csv. So out_name must be ONE plain directory name that
+    is not the run itself and not an attack-owned directory, and --out_csv may
+    only replace a CSV this script wrote.
+    """
+    sub = f"{a.out_name}_{a.tag}" if a.tag else a.out_name
+    if (not a.out_name or Path(sub).name != sub or sub in (".", "..")
+            or sub.lower() in ATTACK_DIRS):
+        sys.exit(f"[lpips] refusing --out_name/--tag -> {sub!r}: results go to "
+                 f"<run>/{sub}/, which must be one new directory name, not "
+                 f"the run itself or one of {sorted(ATTACK_DIRS)}.")
+    if a.out_csv is not None:
+        if a.out_csv.suffix.lower() != ".csv":
+            sys.exit(f"[lpips] --out_csv must end in .csv, got {a.out_csv}")
+        if a.out_csv.exists():
+            with open(a.out_csv, newline="") as f:
+                header = f.readline()
+            if "lpips_" not in header:
+                sys.exit(f"[lpips] {a.out_csv} exists and was not written by "
+                         f"lpips_eval.py; refusing to overwrite it.")
+    return sub
+
+
 def main(argv=None):
     a = parse_args(argv)
+    out_sub = check_outputs(a)
     device = torch.device(a.device or ("cuda" if torch.cuda.is_available()
                                        else "cpu"))
     mean_t, std_t = norm_tensors(device)
@@ -699,10 +739,6 @@ def main(argv=None):
     image_list = parse_images(a.images, a.n_images)
     anchors = (() if a.anchors is None
                else tuple(a.anchors) or (2.0, 4.0, 8.0, 16.0))
-    # The run's own --tag is already a column ("tag"); this one names the
-    # EVALUATION, so the two cannot share a column without one clobbering
-    # the other.
-    out_sub = f"{a.out_name}_{a.tag}" if a.tag else a.out_name
 
     from patchreach.patch.spec import Patch
 

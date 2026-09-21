@@ -170,8 +170,12 @@ def test_parse_images():
     assert le.parse_images("4, 9 11", 0) == [4, 9, 11]
 
 
-@pytest.mark.parametrize("size", [32, 16])      # 16: resampled base, floor > 0
-def test_png_source_matches_checkpoint_source(tmp_path, size):
+# 16: resampled base, floor > 0. area: on this 2:1 frame the patch is pasted
+# at 45 px, not 32, and the box must follow -- with and without a checkpoint.
+@pytest.mark.parametrize("size,ref,with_ckpt", [
+    (32, "height", True), (16, "height", True),
+    (16, "area", True), (16, "area", False)])
+def test_png_source_matches_checkpoint_source(tmp_path, size, ref, with_ckpt):
     """
     The PNGs report.py writes and the frames rebuilt from the checkpoint are
     the same image, so every shared column must agree -- including the blur
@@ -180,10 +184,14 @@ def test_png_source_matches_checkpoint_source(tmp_path, size):
     from torchvision.utils import save_image
     from patchreach.data.cityscapes import denormalise
 
-    patch = _csf_patch(size)
+    torch.manual_seed(0)
+    patch = Patch(PatchConfig(mode="csf", size=size, scale=0.5,
+                              csf_threshold=4.0, scale_ref=ref),
+                  DEV, MEAN, STD)
     img = _img(3)
     cfg = {"image": 420, "patch_mode": "csf", "from_image": True,
-           "patch_size": size, "patch_scale": 0.5, "placement": "center"}
+           "patch_size": size, "patch_scale": 0.5, "patch_scale_ref": ref,
+           "placement": "center"}
     ck_row, _ = le.evaluate_image(patch, img, MEAN, STD, METRICS, cfg,
                                   0.25, True)
 
@@ -194,15 +202,104 @@ def test_png_source_matches_checkpoint_source(tmp_path, size):
         patched, _ = patch.apply(img)
     save_image(denormalise(img, MEAN, STD), panels / "a_clean.png")
     save_image(denormalise(patched, MEAN, STD), panels / "c_patched.png")
-    patch.save(run / "final.pt")
+    if with_ckpt:
+        patch.save(run / "final.pt")
     (run / "config.json").write_text(json.dumps(cfg))
 
     jobs = le.discover_pngs(run, cfg)
     assert [(j.image, j.label) for j in jobs] == [(420, "run")]
-    png_row, _ = le.evaluate_png(jobs[0], cfg, METRICS, 0.25, True, (), DEV)
-    assert png_row["box_from"] == "checkpoint"
+    png_row, views = le.evaluate_png(jobs[0], cfg, METRICS, 0.25, True, (),
+                                     DEV)
+    assert png_row["box_from"] == ("checkpoint" if with_ckpt else "center")
+    assert views["box"][2] == {"height": 32, "area": 45}[ref]
 
     shared = [k for k in ck_row if k.startswith("lpips_")]
     assert any(k.startswith("lpips_floor_") for k in shared)
     for k in shared:
         assert png_row[k] == pytest.approx(ck_row[k], abs=2e-4), k
+
+
+class _SpatialMAD(torch.nn.Module):
+    """Stand-in for lpips.LPIPS(spatial=True): a [B,1,H,W] map."""
+    def __init__(self):
+        super().__init__()
+        self.dummy = torch.nn.Parameter(torch.zeros(1))    # for .device
+
+    def forward(self, a, b):
+        return (a - b).abs().mean(dim=1, keepdim=True)
+
+
+def _fake_run(tmp_path):
+    """A run as overfit.py leaves it: checkpoint, json, diagnostic PNGs."""
+    from torchvision.utils import save_image
+    from patchreach.data.cityscapes import denormalise
+
+    patch = _csf_patch(16)
+    img = _img(5)
+    patch.set_reference_from_image(img, MEAN, STD)
+    with torch.no_grad():
+        patched, _ = patch.apply(img)
+    run = tmp_path / "run"
+    panels = run / "diagnostics" / "panels"
+    panels.mkdir(parents=True)
+    save_image(denormalise(img, MEAN, STD), panels / "a_clean.png")
+    save_image(denormalise(patched, MEAN, STD), panels / "c_patched.png")
+    (panels / "panel.png").write_bytes(b"attack panel")
+    patch.save(run / "final.pt")
+    (run / "results.json").write_text('{"drop_remote": 12.3}')
+    (run / "summary.json").write_text('{"attack": "summary"}')
+    (run / "config.json").write_text(json.dumps(
+        {"image": 420, "patch_mode": "csf", "from_image": True,
+         "patch_size": 16, "patch_scale": 0.5, "placement": "center"}))
+    return run
+
+
+def _snapshot(root: Path):
+    return {p.relative_to(root): p.read_bytes()
+            for p in root.rglob("*") if p.is_file()}
+
+
+def test_evaluation_never_touches_existing_run_files(tmp_path, monkeypatch):
+    """
+    The whole point: scoring a run must leave every file the attack wrote
+    byte-identical, and write nothing outside <run>/lpips_<tag>/.
+    """
+    monkeypatch.setattr(le, "build_metrics", lambda nets, device,
+                        spatial=False: {n: (_SpatialMAD() if spatial
+                                            else MAD()) for n in nets})
+    run = _fake_run(tmp_path)
+    before = _snapshot(tmp_path)
+
+    le.main([str(run), "--tag", "t", "--panels", "1", "--anchors", "8",
+             "--device", "cpu"])
+
+    after = _snapshot(tmp_path)
+    for path, data in before.items():
+        assert after[path] == data, f"{path} was modified"
+    new = set(after) - set(before)
+    assert new and all(p.parts[:2] == ("run", "lpips_t") for p in new), new
+    assert (run / "lpips_t" / "per_image.csv").exists()
+
+
+@pytest.mark.parametrize("args", [
+    ["--out_name", "."], ["--out_name", "diagnostics"],
+    ["--out_name", "panels"], ["--out_name", "a/b"],
+    ["--out_name", "", "--tag", "x"]])
+def test_output_locations_that_could_hit_run_files_are_refused(tmp_path,
+                                                               args):
+    run = _fake_run(tmp_path)
+    with pytest.raises(SystemExit):
+        le.check_outputs(le.parse_args([str(run), *args]))
+
+
+def test_out_csv_never_overwrites_a_foreign_file(tmp_path):
+    foreign = tmp_path / "results.csv"
+    foreign.write_text("image,miou\n1,50\n")
+    with pytest.raises(SystemExit):
+        le.check_outputs(le.parse_args(["x", "--out_csv", str(foreign)]))
+    with pytest.raises(SystemExit):
+        le.check_outputs(le.parse_args(["x", "--out_csv",
+                                        str(tmp_path / "r.json")]))
+    ours = tmp_path / "lpips.csv"
+    ours.write_text("run,lpips_full_alex\n")
+    assert le.check_outputs(le.parse_args(["x", "--out_csv", str(ours)]))
