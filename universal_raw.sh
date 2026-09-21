@@ -1,8 +1,8 @@
 #!/bin/bash
 #SBATCH -p gpu_a100_il   # Use the dev_gpu_4_a100 partition with A100 GPUs dev_gpu_4
 #SBATCH -n 1                   # Number of tasks (1 for single node)
-#SBATCH -t 20:20:00            # Time limit (10 minutes for debugging purposes)
-#SBATCH --mem=40000        # Memory request (adjust as needed)
+#SBATCH -t 24:00:00            # Time limit (10 minutes for debugging purposes)
+#SBATCH --mem=400000       # Memory request (adjust as needed)
 #SBATCH --gres=gpu:1           # Request 1 GPU (adjust if you need more)
 #SBATCH --cpus-per-task=16     # Number of CPUs per GPU (16 for A100)
 #SBATCH --ntasks-per-node=1    # Number of tasks per node (1 in this case)
@@ -32,7 +32,18 @@ python -c "import sys; print(sys.executable)"
 
 echo "Python version:"
 python --version
+#    --shape alpha \
+    #--lap_freeze_edges --lap_edge_thresh 0.15 --target_class 13 \
+#for LR in 0.1 0.2 0.5; do python scripts/train.py --arch segformer --cityscapes_root $CS --img_h 512 --img_w 1024 --patch_mode universal_csf --patch_size 128 --patch_scale 0.25 --loss_fn cospgd --lr_schedule cosine --lr $LR --batch_size 4 --num_workers 16 --epochs 150 --val_images 500 --csf_threshold 0.25 --no_diagnostics --panel_images "" --tag 150_lr$LR; done
 
-#python scripts/train_conditional_generator.py --arch segformer --cityscapes_root "/pfs/work9/workspace/scratch/ma_nilbecke-thesis/data/cityscapes" --epochs 1 --train_images 128 --val_images 4 --panel_images "" --no_lpips --tag TIMING
-#python scripts/train_conditional_generator.py --arch segformer --cityscapes_root "/pfs/work9/workspace/scratch/ma_nilbecke-thesis/data/cityscapes" --epochs 3 --train_images 512 --val_images 20 --gen_residual none --tag CONTROL
-python scripts/train_conditional_generator.py --arch segformer --cityscapes_root /pfs/work9/workspace/scratch/ma_nilbecke-thesis/data/cityscapes --loss_fn cospgd --gen_residual csf --csf_threshold 0.4 --gen_reference window --gen_placement gradcam --gen_placement_margin 64 --img_h 512 --img_w 1024 --epochs 150 --val_every 10 --tag 150epoch_scsf-tau0.4
+BASE="--arch deeplab_50 --cityscapes_root $CS --img_h 512 --img_w 1024"
+GEOM="--patch_mode raw --patch_size 128 --patch_scale 0.25 --placement center"
+COMMON="--loss_fn cospgd --lr_schedule cosine --batch_size 4 --num_workers 16  --lr 0.1\
+        --val_images 500 --val_every 3"
+        
+
+# D: baseline. lr 0 keeps the patch at its random projected init, which under
+# the projection is the CSF envelope at exactly tau -- the null that makes every
+# other number mean something. ~7 min.
+python scripts/train.py $BASE $GEOM $COMMON
+

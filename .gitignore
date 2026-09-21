@@ -7,3 +7,4 @@ __pycache__/
 slurm-*.out
 /slurm
 /results_old
+/results_wrong_res

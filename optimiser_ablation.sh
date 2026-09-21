@@ -1,7 +1,7 @@
 #!/bin/bash
 #SBATCH -p dev_gpu_a100_il
 #SBATCH -n 1
-#SBATCH -t 00:35:00
+#SBATCH -t 00:30:00
 #SBATCH --mem=60000
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=16

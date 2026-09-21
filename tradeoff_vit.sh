@@ -1,8 +1,8 @@
 #!/bin/bash
-#SBATCH -p accelerated
+#SBATCH -p gpu_a100_il
 #SBATCH -n 1
 #SBATCH -t 08:00:00
-#SBATCH --mem=400000
+#SBATCH --mem=40000
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=16
 #SBATCH --ntasks-per-node=1
