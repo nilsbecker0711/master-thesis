@@ -768,7 +768,8 @@ def choose_png(a, shows: List[str]) -> bool:
 # Directories the attack scripts own inside a run. Writing into one of them
 # could replace a file a later analysis reads -- overfit.py --seeds and
 # overfit_population.py both keep a summary.json of their own at run level.
-ATTACK_DIRS = {"diagnostics", "panels", "patches", "aggregate"}
+ATTACK_DIRS = {"diagnostics", "panels", "patches", "aggregate",
+               "intermediate_patches"}
 
 
 def check_outputs(a):

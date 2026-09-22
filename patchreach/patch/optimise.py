@@ -41,6 +41,13 @@ from ..metrics.miou import (SegMetric, single_image_miou, attack_rates,
                             compare as miou_compare)
 from .lap import magnitude_report
 
+# Where every training entry point parks its per-step / per-epoch patch
+# snapshots. They are progress, not results: a 1000-step run at log_every=10
+# drops a hundred PNGs, and loose in the run directory they bury best.pt,
+# final.pt and the diagnostics the run is actually read for. One name, defined
+# once, so overfit.py, train.py and anything scanning a run agree on it.
+INTERMEDIATE_DIR = "intermediate_patches"
+
 
 def prepare(model, img, patch, img_h: int, img_w: int,
             from_image: bool = False, mean_t=None, std_t=None,
@@ -122,9 +129,11 @@ def attack_image(model, img, label, patch, *,
     never, and one observed run reached a 17.5-point drop at step 660 and was
     inert by step 700.
 
-    `save_step_images` writes a PNG every log_every steps. Right for a single
-    interactive run, catastrophic across hundreds of images — it is off by
-    default and overfit.py turns it on.
+    `save_step_images` writes a PNG every log_every steps, into
+    out_dir/intermediate_patches/ rather than out_dir itself — hundreds of
+    patch_step*.png beside best.pt bury the files a run is actually read for.
+    Right for a single interactive run, catastrophic across hundreds of images
+    — it is off by default and overfit.py turns it on.
 
     `classes` selects which classes enter the mIoU mean, and 'gt' is the only
     safe default for an ATTACK measurement. Under 'union' a class with no
@@ -276,7 +285,9 @@ def attack_image(model, img, label, patch, *,
                     patch.save(out_dir / "best.pt")
                     _save_png(patch, out_dir / "best_patch.png")
             if out_dir is not None and save_step_images:
-                _save_png(patch, out_dir / f"patch_step{step:04d}.png")
+                step_dir = out_dir / INTERMEDIATE_DIR
+                step_dir.mkdir(parents=True, exist_ok=True)
+                _save_png(patch, step_dir / f"patch_step{step:04d}.png")
 
     with torch.no_grad():
         patched, fp = patch.apply(img)

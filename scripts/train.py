@@ -40,6 +40,7 @@ from patchreach.diagnostics import report
 from patchreach.losses import adversarial, reach as reach_mod
 from patchreach.metrics.miou import SegMetric, compare
 from patchreach.patch.lap import magnitude_report, rationality_report
+from patchreach.patch.optimise import INTERMEDIATE_DIR
 from patchreach.utils import (get_device, seed_everything, increment_path,
                               channel_probe)
 
@@ -220,7 +221,11 @@ def main():
 
     out_dir = increment_path(Path(args.out_root) / run_id(args))
     out_dir.mkdir(parents=True, exist_ok=True)
-    (out_dir / "patches").mkdir(exist_ok=True)
+    # Per-epoch snapshots go in their own directory, not loose in the run:
+    # they are progress, and a 200-epoch run would hide best.pt behind them.
+    # The name is shared with the single-image loop, and deliberately NOT
+    # "patches" -- that is the population run's per-image checkpoint tree.
+    (out_dir / INTERMEDIATE_DIR).mkdir(exist_ok=True)
     with open(out_dir / "config.json", "w") as f:
         json.dump(vars(args), f, indent=2)
     print(f"\n### {out_dir} ###")
@@ -410,7 +415,7 @@ def main():
             print(f"           q={adv_loss.q:+.4f}  "
                   f"(step {gstep:,}/{total_steps:,})")
         save_image(patch.render().cpu(),
-                   out_dir / "patches" / f"epoch{epoch:04d}.png")
+                   out_dir / INTERMEDIATE_DIR / f"epoch{epoch:04d}.png")
 
         if epoch % args.val_every == 0 or epoch == 1:
             ev = evaluate(model, val_loader, patch, device, args.num_classes, tgt)
