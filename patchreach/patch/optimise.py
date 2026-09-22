@@ -203,13 +203,14 @@ def attack_image(model, img, label, patch, *,
     # margin scores against the CLEAN PREDICTION, which only exists here.
     # Rebound on this branch alone, exactly like tsallis above; void is set to
     # 255 so the loss excludes the same pixels any_flip_rate excludes.
-    if loss_fn == "margin":
+    if loss_fn in ("margin", "cos_margin"):
         ref = upsample_to(clean_logits, hw).argmax(1)
         ref[label == 255] = 255
         objective = adversarial.build(loss_fn, margin_ref=ref,
                                       margin_kappa=margin_kappa)
         if verbose:
-            log(f"[loss ] margin vs clean prediction, kappa={margin_kappa:g}")
+            log(f"[loss ] {loss_fn} vs clean prediction, "
+                f"kappa={margin_kappa:g}")
     # betas PASSED EXPLICITLY, not defaulted: this loop has always used
     # (0.9, 0.999) and train.py (0.5, 0.999), and routing both through
     # one builder must not quietly move either.

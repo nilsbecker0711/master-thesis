@@ -243,9 +243,10 @@ def main():
     p = add_patch_args(add_model_args(argparse.ArgumentParser()))
     p.add_argument("--loss_fn", default="cospgd",
                    choices=["ce", "cospgd", "ipatch_cospgd", "tsallis",
-                            "margin"])
+                            "margin", "cos_margin"])
     p.add_argument("--margin_kappa", type=float, default=5.0,
-                   help="--loss_fn margin only: required logit margin by "
+                   help="--loss_fn margin/cos_margin only: required logit "
+                        "margin by "
                         "which a pixel must leave its CLEAN prediction "
                         "before it stops drawing gradient.")
     p.add_argument("--from_image", action="store_true",

@@ -15,8 +15,12 @@ Adversarial objectives.
                 differentiable count of any_flip_rate: a pixel flipped by kappa
                 contributes exactly zero gradient, so effort moves to the
                 pixels that have not flipped yet. (Carlini & Wagner, S&P 2017)
+  cos_margin    margin carrying CosPGD's cosine weight, against the same clean
+                prediction: cos(pred, onehot(ref)).detach() * the hinge. The
+                hinge still cuts off hard at kappa; the cosine releases a pixel
+                SMOOTHLY as it crosses its own boundary.
 
-All five take an optional `support` mask restricting which pixels are scored.
+All six take an optional `support` mask restricting which pixels are scored.
 That is where patch-footprint exclusion and reach-restriction compose: the
 caller intersects them and passes one mask, rather than each loss knowing about
 both.
@@ -184,10 +188,60 @@ def margin_loss(logits, ref, support: Optional[torch.Tensor] = None,
     return _reduce(F.relu(z_ref - z_other + kappa), valid)
 
 
+def cos_margin_loss(logits, ref, support: Optional[torch.Tensor] = None,
+                    kappa: float = 5.0):
+    r"""
+    CosPGD's weight on the CW hinge, both against the CLEAN PREDICTION:
+
+        L = mean_i [ cos(softmax(f(x)_i), onehot(ref_i)).detach()
+                     * relu( z_ref(i) - max_{k != ref(i)} z_k + kappa ) ]
+
+    WHAT THE COSINE CHANGES, measured on the two-class approximation where
+    w = p_ref/||p|| and m = z_other - z_ref (m > 0 means flipped):
+
+        m       -7     -3     -1     +1     +3     +6
+        margin  1.00   1.00   1.00   1.00   1.00   0
+        cos     1.00   1.00   0.94   0.35   0.05   0
+
+    Unflipped pixels keep ~full weight, so the confident holdouts a collapsed
+    run leaves behind are still driven at full strength — the property plain
+    CosPGD lacks, because CE's own gradient sigma(m) has already gone flat
+    there. What moves is the region BETWEEN the boundary and kappa: the cosine
+    releases a pixel smoothly once it flips rather than holding it at weight 1
+    until kappa, so this behaves like margin with a softer, smaller kappa while
+    kappa still bounds the hinge.
+
+    The weight is DETACHED, matching cospgd_loss and carrying the same fidelity
+    caveat: the CosPGD paper does not detach.
+
+    The cosine is taken against ref, NOT the GT, so weight and hinge agree on
+    what "this pixel's class" means. Mixing them would weight a pixel by its GT
+    alignment while scoring its clean-prediction margin, and on pixels the model
+    already gets wrong those are different questions.
+    """
+    if logits.shape[1] < 2:
+        raise ValueError("cos_margin loss needs at least two classes")
+    C = logits.shape[1]
+    valid = ref != 255
+    if support is not None:
+        valid = valid & support
+
+    safe = ref.clone()
+    safe[~valid] = 0                      # dummy index, zeroed by `valid`
+    idx = safe.unsqueeze(1)
+    z_ref = logits.gather(1, idx).squeeze(1)
+    z_other = logits.scatter(1, idx, float("-inf")).amax(1)
+
+    onehot = F.one_hot(safe, num_classes=C).permute(0, 3, 1, 2).float()
+    w = F.cosine_similarity(F.softmax(logits, 1), onehot, dim=1).detach()
+    return _reduce(w * F.relu(z_ref - z_other + kappa), valid)
+
+
 def _margin_unbound(*_):
     raise ValueError(
-        "loss_fn='margin' needs the clean prediction bound at build time — "
-        "build('margin', margin_ref=clean_argmax). It is wired through "
+        "loss_fn='margin'/'cos_margin' needs the clean prediction bound at "
+        "build time — build(loss_fn, margin_ref=clean_argmax). It is wired "
+        "through "
         "patch/optimise.attack_image only; placement=gradcam with "
         "--cam_objective attack cannot use it.")
 
@@ -215,11 +269,12 @@ def build(loss_fn: str, target_class: int = 8,
     call site that cannot supply the clean prediction fails loudly rather than
     silently scoring against GT.
     """
-    if loss_fn == "margin":
+    if loss_fn in ("margin", "cos_margin"):
         if margin_ref is None:
             return _margin_unbound
         ref = margin_ref
-        return lambda lg, lb, fp, sp: margin_loss(lg, ref, sp, margin_kappa)
+        fn = margin_loss if loss_fn == "margin" else cos_margin_loss
+        return lambda lg, lb, fp, sp: fn(lg, ref, sp, margin_kappa)
     if loss_fn == "tsallis":
         from .tsallis import TsallisCELoss
         return TsallisCELoss(q=tsallis_q, schedule=tsallis_schedule,
