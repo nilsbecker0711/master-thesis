@@ -9,7 +9,8 @@ margin loss: the properties the objective exists for.
 import pytest
 import torch
 
-from patchreach.losses.adversarial import build, margin_loss
+from patchreach.losses.adversarial import (build, cos_margin_loss,
+                                          margin_loss)
 
 
 def _logits(*cols):
@@ -66,7 +67,8 @@ def test_build_without_ref_raises_on_use():
         f(_logits([1.0, 0.0]), torch.tensor([[[0]]]), None, None)
 
 
-def test_attack_image_runs_margin_end_to_end():
+@pytest.mark.parametrize("loss_fn", ["margin", "cos_margin"])
+def test_attack_image_runs_margin_end_to_end(loss_fn):
     """The kwarg is wired through attack_image and the patch moves."""
     from torch import nn
     from patchreach.patch import optimise
@@ -96,9 +98,70 @@ def test_attack_image_runs_margin_end_to_end():
     start = patch.param.detach().clone()
 
     res = optimise.attack_image(
-        _TinySeg(), img, label, patch, loss_fn="margin", margin_kappa=2.0,
+        _TinySeg(), img, label, patch, loss_fn=loss_fn, margin_kappa=2.0,
         steps=5, lr=0.05, log_every=5, out_dir=None, save_best=False,
         verbose=False, log=lambda *a, **k: None)
 
     assert torch.isfinite(torch.tensor(res["last_loss"]))
     assert not torch.allclose(patch.param.detach(), start)
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+#  cos_margin — the cosine weight on the same hinge
+# ═════════════════════════════════════════════════════════════════════════════
+
+def test_cos_margin_leaves_confident_holdouts_at_full_weight():
+    """
+    The property plain CosPGD lacks. p_ref ~ 1 -> w ~ 1, so the hinge is
+    essentially unweighted where the collapse leaves its holdouts.
+    """
+    lg = _logits([12.0, 0.0, 0.0])
+    ref = torch.tensor([[[0]]])
+    plain = margin_loss(lg, ref, kappa=5.0).item()
+    assert cos_margin_loss(lg, ref, kappa=5.0).item() == pytest.approx(
+        plain, rel=1e-3)
+
+
+def test_cos_margin_releases_a_just_flipped_pixel_early():
+    """Between the boundary and kappa the cosine is the whole difference."""
+    lg = _logits([0.0, 1.0, 0.0])                  # flipped by 1, kappa 5
+    ref = torch.tensor([[[0]]])
+    plain = margin_loss(lg, ref, kappa=5.0).item()
+    cos = cos_margin_loss(lg, ref, kappa=5.0).item()
+    assert 0.0 < cos < plain
+
+
+def test_cos_margin_is_still_exactly_zero_past_kappa():
+    lg = _logits([0.0, 9.0, 0.0]).requires_grad_()
+    ref = torch.tensor([[[0]]])
+    loss = cos_margin_loss(lg, ref, kappa=5.0)
+    loss.backward()
+    assert loss.item() == 0.0
+    assert torch.all(lg.grad == 0)
+
+
+def test_cos_margin_weight_is_detached():
+    """Gradient reaches z_ref and the challenger ONLY, as for plain margin."""
+    lg = _logits([9.0, 2.0, 1.0]).requires_grad_()
+    ref = torch.tensor([[[0]]])
+    cos_margin_loss(lg, ref, kappa=5.0).backward()
+    g = lg.grad[0, :, 0, 0]
+    assert g[2].item() == 0.0, "a live cosine would leak gradient to class 2"
+    assert g[0] > 0 and g[1] < 0
+
+
+def test_cos_margin_excludes_void_and_support():
+    lg = _logits([9.0, 0.0], [9.0, 0.0], [0.0, 9.0])
+    ref = torch.tensor([[[0, 255, 1]]])
+    support = torch.tensor([[[True, True, False]]])
+    one = cos_margin_loss(lg[:, :, :, :1], ref[:, :, :1], kappa=5.0).item()
+    assert cos_margin_loss(lg, ref, support, kappa=5.0).item() == pytest.approx(
+        one)
+
+
+def test_build_dispatches_cos_margin():
+    lg = _logits([9.0, 0.0])
+    ref = torch.tensor([[[0]]])
+    f = build("cos_margin", margin_ref=ref, margin_kappa=5.0)
+    assert f(lg, torch.tensor([[[1]]]), None, None).item() == pytest.approx(
+        cos_margin_loss(lg, ref, kappa=5.0).item())
