@@ -67,7 +67,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import sys
 import time
 from pathlib import Path
@@ -84,7 +83,8 @@ from patchreach.diagnostics import aggregate, report
 from patchreach.metrics import population as pop_mod
 from patchreach.patch import optimise, segmentation_cam
 from patchreach.patch.spec import Patch
-from patchreach.utils import get_device, seed_everything, increment_path
+from patchreach.utils import (get_device, seed_everything, increment_path,
+                              atomic_save)
 
 
 def build_parser():
@@ -168,23 +168,6 @@ def build_parser():
     p.add_argument("--out_root", default="results/population")
     p.add_argument("--tag", default="")
     return p
-
-
-def atomic_save(obj, path: Path):
-    """Write to a temporary file, then rename over the target.
-
-    A plain torch.save that is interrupted leaves a TRUNCATED file, and the
-    next --resume dies in torch.load with nothing to fall back on. That is a
-    live risk here and not a theoretical one: this script is checkpointed
-    after every image precisely so it can be killed at the walltime, and a
-    driver that feeds it short slices kills it hundreds of times. os.replace
-    is atomic on POSIX and on Windows, so the worst case becomes a checkpoint
-    one image stale rather than a run that cannot be resumed at all. Same
-    pattern as sweep_operating_point.py's sweep.json write.
-    """
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    torch.save(obj, tmp)
-    os.replace(tmp, path)
 
 
 def resolve_images(a, n_val: int):
