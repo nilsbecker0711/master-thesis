@@ -3,10 +3,11 @@ The Nesti/Rossolini benchmark protocol: mAcc, the random-patch baseline, and
 the area-matched patch geometry benchmark.sh launches.
 
 What a silent regression would break here is not a number but a COMPARISON.
-mAcc that quietly averaged over the wrong class set, a "random patch" row that
-was actually a grey square, or a --patch_scale that floored to 211 instead of
-212 would each produce a table that looks fine and is not comparable to the
-paper it claims to sit beside.
+mAcc that quietly averaged over the wrong class set, a "random patch" row
+that was actually a grey square, or a --patch_size that disagreed with
+int(img_h * --patch_scale) would each produce a table that looks fine and is
+not comparable to the paper it claims to sit beside — or, for the last one,
+a run that refuses to start at all.
 """
 from __future__ import annotations
 
@@ -22,6 +23,7 @@ sys.path.insert(0, str(ROOT / "scripts"))
 
 from patchreach.data.cityscapes import norm_tensors
 from patchreach.metrics.miou import SegMetric, compare
+from patchreach.patch.placement import footprint_side
 from patchreach.patch.spec import Patch, PatchConfig
 
 DEV = torch.device("cpu")
@@ -163,26 +165,38 @@ def test_grey_and_random_are_different_controls():
     assert (g - r).abs().mean() > 0.1
 
 
-# ── the area-matched geometry benchmark.sh launches ──────────────────────────
+# ── the fixed geometry benchmark_slice.sh launches ───────────────────────────
 
-# theirs (H x W at native), our square side, our --patch_scale at H=1024
-BENCH = [("150x300", 150 * 300, 212, 0.20703125),
-         ("200x400", 200 * 400, 283, 0.2763671875),
-         ("300x600", 300 * 600, 424, 0.4140625)]
+BENCH_SCALE = 0.25
+BENCH_SIZE = 256          # --patch_size in benchmark_slice.sh, at H=1024
 
 
-@pytest.mark.parametrize("theirs,area,side,scale", BENCH)
-def test_bench_scales_survive_the_universal_csf_size_guard(theirs, area,
-                                                           side, scale):
-    """train.py refuses universal_csf unless --patch_size == int(img_h*scale).
-    A rounded decimal (0.207) floors to 211 and the run dies at startup, so
-    the dyadic values in benchmark.sh are load-bearing."""
-    assert int(1024 * scale) == side
+def test_bench_size_survives_the_universal_csf_size_guard():
+    """train.py refuses universal_csf unless --patch_size == int(img_h*scale),
+    because resampling a residual resamples its spectrum. A benchmark whose
+    two numbers disagree dies at startup, so this pairing is load-bearing."""
+    assert int(1024 * BENCH_SCALE) == BENCH_SIZE
 
 
-@pytest.mark.parametrize("theirs,area,side,scale", BENCH)
-def test_bench_squares_are_area_matched_to_their_rectangles(theirs, area,
-                                                            side, scale):
-    """Area is the projection we claim in the write-up; it has to hold to
-    better than a percent or the claim is decoration."""
-    assert abs(side * side - area) / area < 0.01
+def test_the_benchmark_patch_covers_what_the_rest_of_the_thesis_does():
+    """The reason for holding 0.25 rather than adopting Nesti's size ladder:
+    scale_ref='height' fixes coverage by aspect ratio alone, so the native
+    benchmark row covers the same fraction of the frame as every 512x1024
+    run. Lose that and the row is comparable to their paper and to nothing
+    of ours."""
+    small = footprint_side(512, 1024, BENCH_SCALE) ** 2 / (512 * 1024)
+    native = footprint_side(1024, 2048, BENCH_SCALE) ** 2 / (1024 * 2048)
+    assert small == pytest.approx(native, rel=1e-9)
+    assert native == pytest.approx(0.03125, rel=1e-9)
+
+
+def test_our_operating_point_is_not_one_of_their_rungs():
+    """Guard on the write-up, not the code. Their ladder is 2.14 / 3.82 /
+    8.57% of the frame and ours is 3.125%; it sits BETWEEN the first two and
+    matches none, so no row may be quoted against a specific rung as though
+    the sizes agreed."""
+    ours = footprint_side(1024, 2048, BENCH_SCALE) ** 2 / (1024 * 2048)
+    theirs = [(150 * 300), (200 * 400), (300 * 600)]
+    fracs = [a / (1024 * 2048) for a in theirs]
+    assert all(abs(ours - f) / f > 0.10 for f in fracs)
+    assert fracs[0] < ours < fracs[1]

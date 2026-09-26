@@ -55,19 +55,24 @@
 #       spectrum and tau then describes a different tensor than the one
 #       pasted. Decide that before writing an EOT arm.
 #
-#    2. SQUARE PATCHES, AREA-MATCHED to their three 1:2 rectangles.
-#       Everything here is square by construction — footprint_side() returns
-#       one int, patch_budget() builds a size x size envelope.
+#    2. ONE PATCH SIZE, FIXED AT scale 0.25 — not their three-rung ladder,
+#       and square rather than their 1:2 rectangles (everything here is
+#       square by construction: footprint_side() returns one int and
+#       patch_budget() builds a size x size envelope).
 #
-#         theirs     area px    ours      patch_scale at H=1024
-#         150x300     45,000    212x212   0.20703125
-#         200x400     80,000    283x283   0.2763671875
-#         300x600    180,000    424x424   0.4140625
+#         theirs      % of frame      ours              % of frame
+#         150x300         2.14        --                --
+#         200x400         3.82        256x256 @ 0.25    3.125
+#         300x600         8.57        --                --
 #
-#       Exact dyadic rationals on purpose: universal_csf refuses unless
-#       --patch_size == int(img_h * patch_scale), and 0.207 floors to 211.
-#       Area is the axis their own double-patch configs were matched on
-#       (106x212 x2 = 44,944 ~ 45,000).
+#       0.25 is the operating point every other run in this thesis uses, and
+#       because scale_ref='height' fixes coverage by aspect ratio alone, it
+#       is 3.125% of the frame at 512x1024 AND at 1024x2048. So this row
+#       stays comparable to our own body of work; only the absolute pixel
+#       count changes with resolution. Patch size already has a systematic
+#       table of its own (T19), where nu_min = m_c/S is handled properly —
+#       averaging over their ladder here would duplicate it worse.
+#       See the GEOMETRY block below.
 #
 #    3. NOT THEIR LEARNING RATE (0.5, set empirically on an unconstrained
 #       pixel patch). universal_csf at lr 0.2 discards the previous residual
@@ -94,7 +99,6 @@
 
 set -u
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-OUTROOT="results/runs/bench_nesti"
 
 # Set BEFORE the config table, which interpolates it, and overridable from
 # the environment so --list works on a login node with nothing loaded.
@@ -102,12 +106,47 @@ CS="${CS:-/pfs/work9/workspace/scratch/ma_nilbecke-thesis/data/cityscapes}"
 export CS
 
 EPOCHS=200
+
+# ARCH is a variable and lands in the out_dir, so a later b5 run does not
+# collide with this one. NOTE: 'segformer' is an ALIAS for segformer_b0 --
+# registry.py ends with REGISTRY["segformer"] = REGISTRY["segformer_b0"] --
+# so the default here is B0, the smallest MiT. That is what makes 1024x2048
+# affordable at all; it is also the weakest version of the "heavy
+# global-attention transformer" the ERF hypothesis is about, so if the
+# benchmark row is meant to carry that claim it wants b5 and a much longer
+# queue. Override with ARCH=segformer_b5 in the environment; sbatch exports
+# it to the slice.
+ARCH="${ARCH:-segformer_b0}"
+OUTROOT="results/runs/bench_nesti/$ARCH"
+
+# ── GEOMETRY: FIXED AT scale 0.25, NOT their size ladder ─────────────────────
+# Nesti sweep three patch sizes (2.14 / 3.82 / 8.57% of the frame). We hold
+# ONE operating point instead, the 0.25 every other run in this thesis uses.
+#
+# WHY THAT IS THE BETTER TRADE HERE. scale_ref='height' means the footprint
+# is int(H*0.25) and coverage depends only on aspect ratio, which Cityscapes
+# fixes at 1:2. So 0.25 is 3.125% of the frame at 512x1024 AND at 1024x2048
+# -- the benchmark patch covers exactly as much of the scene as every patch
+# in the rest of the results chapter, and the ONLY thing that changes at
+# native resolution is the absolute pixel count (256 vs 128 a side). That
+# keeps this row comparable to our own body of work, which their ladder
+# would have cost us, and patch size already has its own systematic table
+# (T19) where nu_min = m_c/S is handled properly.
+#
+# The comparison to state: we report a fixed operating point against their
+# ladder, and 3.125% sits between their 150x300 (2.14%) and 200x400 (3.82%)
+# rungs -- closest to the middle one. Do not quote our number against a
+# specific rung of theirs as though the sizes matched.
+PSCALE=0.25
+PSIZE=256              # int(1024 * 0.25); universal_csf refuses a mismatch
+GEOM="--patch_size $PSIZE --patch_scale $PSCALE"
+
 # The protocol flags every training config shares. --val_every 50 because
 # each validation is 500 images x 2 forwards at native resolution; the final
 # 500-image evaluation runs after the loop REGARDLESS, so the headline number
 # is never stale. best.pt is then the best of ~5 validations — Nesti report
 # the final patch, so quote `final`, and treat best.pt as a diagnostic.
-PROTO="--arch segformer --cityscapes_root $CS --img_h 1024 --img_w 2048 \
+PROTO="--arch $ARCH --cityscapes_root $CS --img_h 1024 --img_w 2048 \
        --placement center --n_train 250 --train_seed 68 \
        --val_images 500 --val_every 50 --epochs $EPOCHS \
        --optimiser adam --lr_schedule cosine --batch_size 1 \
@@ -116,7 +155,8 @@ PROTO="--arch segformer --cityscapes_root $CS --img_h 1024 --img_w 2048 \
 # ── the config table ─────────────────────────────────────────────────────────
 # name | out_dir | script | args
 #
-# Five rows per size. The two _null rows and the _grey row are --lr 0
+# Six configs: the clean reference plus five rows at the single 0.25
+# operating point. The two _null rows and the _grey row are --lr 0
 # --epochs 1: nothing moves, and the post-loop 500-image evaluation is the
 # entire point of the run.
 #
@@ -144,32 +184,28 @@ PROTO="--arch segformer --cityscapes_root $CS --img_h 1024 --img_w 2048 \
 #             grey square moving the number is acting on pixels it does not
 #             cover.
 configs () {
-  local sizes=(212 283 424)
-  local scales=(0.20703125 0.2763671875 0.4140625)
-  local theirs=(150x300 200x400 300x600)
+  local T="s${PSCALE}"        # the tag: our operating point, not their size
 
   # The clean dataset reference, so the table is self-contained. Sentinel is
-  # its own json rather than a run directory.
+  # its own json rather than a run directory, and the directory is
+  # arch-specific so a later b5 run cannot satisfy b0's sentinel (the
+  # driver's completion check is a glob inside this directory).
+  # clean_baseline.py mkdirs its own parent.
   printf '%s\t%s\t%s\t%s\n' \
-    "clean" "results/tables/bench_nesti" "scripts/clean_baseline.py" \
-    "--arch segformer --cityscapes_root $CS --img_h 1024 --img_w 2048 \
-     --images all --out results/tables/bench_nesti/clean --tag bench_nesti"
+    "clean" "results/tables/bench_nesti/$ARCH" "scripts/clean_baseline.py" \
+    "--arch $ARCH --cityscapes_root $CS --img_h 1024 --img_w 2048 \
+     --images all --out results/tables/bench_nesti/$ARCH/clean --tag bench_nesti"
 
-  local i
-  for i in 0 1 2; do
-    local p="${sizes[$i]}" s="${scales[$i]}" t="${theirs[$i]}"
-    local geom="--patch_size $p --patch_scale $s"
-    printf '%s\t%s\t%s\t%s\n' "csf_$p"      "$OUTROOT/csf_$p" \
-      "scripts/train.py" "$PROTO $geom --patch_mode universal_csf --csf_threshold 0.25 --lr 0.01 --tag ${t}"
-    printf '%s\t%s\t%s\t%s\n' "csf_${p}_null" "$OUTROOT/csf_${p}_null" \
-      "scripts/train.py" "$PROTO $geom --patch_mode universal_csf --csf_threshold 0.25 --lr 0 --epochs 1 --tag ${t}_null"
-    printf '%s\t%s\t%s\t%s\n' "raw_$p"      "$OUTROOT/raw_$p" \
-      "scripts/train.py" "$PROTO $geom --patch_mode raw --lr 0.1 --tag ${t}"
-    printf '%s\t%s\t%s\t%s\n' "raw_${p}_null" "$OUTROOT/raw_${p}_null" \
-      "scripts/train.py" "$PROTO $geom --patch_mode raw --raw_init random --lr 0 --epochs 1 --tag ${t}_null"
-    printf '%s\t%s\t%s\t%s\n' "raw_${p}_grey" "$OUTROOT/raw_${p}_grey" \
-      "scripts/train.py" "$PROTO $geom --patch_mode raw --lr 0 --epochs 1 --tag ${t}_grey"
-  done
+  printf '%s\t%s\t%s\t%s\n' "csf" "$OUTROOT/csf" \
+    "scripts/train.py" "$PROTO $GEOM --patch_mode universal_csf --csf_threshold 0.25 --lr 0.01 --tag $T"
+  printf '%s\t%s\t%s\t%s\n' "csf_null" "$OUTROOT/csf_null" \
+    "scripts/train.py" "$PROTO $GEOM --patch_mode universal_csf --csf_threshold 0.25 --lr 0 --epochs 1 --tag ${T}_null"
+  printf '%s\t%s\t%s\t%s\n' "raw" "$OUTROOT/raw" \
+    "scripts/train.py" "$PROTO $GEOM --patch_mode raw --lr 0.1 --tag $T"
+  printf '%s\t%s\t%s\t%s\n' "raw_null" "$OUTROOT/raw_null" \
+    "scripts/train.py" "$PROTO $GEOM --patch_mode raw --raw_init random --lr 0 --epochs 1 --tag ${T}_null"
+  printf '%s\t%s\t%s\t%s\n' "raw_grey" "$OUTROOT/raw_grey" \
+    "scripts/train.py" "$PROTO $GEOM --patch_mode raw --lr 0 --epochs 1 --tag ${T}_grey"
 }
 
 # ── --list: the driver's view of the table ───────────────────────────────────
