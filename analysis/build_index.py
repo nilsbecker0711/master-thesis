@@ -46,8 +46,13 @@ TOP_LEVEL = ("clean_all", "clean_remote", "final_all", "final_remote",
 
 # Nested keys worth promoting to top-level columns.
 FLATTEN = {
+    # mAcc rides alongside mIoU. This list is a WHITELIST, so a key absent
+    # from it is dropped silently — the exact failure the TOP_LEVEL comment
+    # above records. The benchmark table needs both metrics per scope.
     "final": ["clean_all", "clean_rem", "adv_all", "adv_rem", "drop_all",
-              "drop_remote", "any_flip_rate", "target_hit_rate"],
+              "drop_remote", "any_flip_rate", "target_hit_rate",
+              "clean_acc_all", "adv_acc_all", "drop_acc_all",
+              "clean_acc_rem", "adv_acc_rem", "drop_acc_remote"],
     "rationality": ["ASI", "AGI", "ADE", "L2_to_reference"],
 }
 

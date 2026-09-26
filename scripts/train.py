@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import random
 import sys
 import time
 from dataclasses import asdict
@@ -42,7 +43,7 @@ from patchreach.metrics.miou import SegMetric, compare
 from patchreach.patch.lap import magnitude_report, rationality_report
 from patchreach.patch.optimise import INTERMEDIATE_DIR
 from patchreach.utils import (get_device, seed_everything, increment_path,
-                              channel_probe)
+                              channel_probe, atomic_save)
 
 
 def build_parser():
@@ -103,10 +104,53 @@ def build_parser():
                         "raise this to 8-16 and the epoch time may halve. "
                         "Check before assuming the GPU is the bottleneck.")
     p.add_argument("--exclude_footprint", action="store_true", default=True)
+    p.add_argument("--n_train", type=int, default=0,
+                   help="Optimise on a RANDOM SUBSET of this many training "
+                        "images instead of the full 2975. 0 (default) keeps "
+                        "the whole split, so every run recorded so far is "
+                        "unchanged. 250 is the Nesti et al. (WACV 2022) / "
+                        "Rossolini et al. (TNNLS 2024) protocol, which is the "
+                        "only reason this flag exists — their patches are "
+                        "optimised on 250 sampled training images and "
+                        "evaluated on the entire 500-image val split "
+                        "(--val_images 500). The drawn indices are written to "
+                        "train_images.json in the run directory, because a "
+                        "subset that cannot be named is not reproducible.")
+    p.add_argument("--train_seed", type=int, default=None,
+                   help="Seed for the --n_train draw. Defaults to --seed. "
+                        "SEPARATE from it on purpose: --seed also controls "
+                        "the patch initialisation, so reusing it would make "
+                        "'same images, different init' unaskable — and that "
+                        "is exactly the repeat a benchmark row needs.")
     p.add_argument("--val_images", type=int, default=20)
     p.add_argument("--val_every", type=int, default=5)
 
     p.add_argument("--out_root", type=str, default="results/runs")
+    p.add_argument("--out_dir", type=str, default=None,
+                   help="explicit output directory, bypassing the generated "
+                        "run id. REQUIRED with --resume: the default path "
+                        "goes through increment_path, so a second launch "
+                        "would create <run>_1 and resume nothing. Same "
+                        "convention as overfit_population.py.")
+    p.add_argument("--resume", action="store_true",
+                   help="continue an interrupted run from train_state.pt in "
+                        "--out_dir, restoring the patch, the OPTIMISER and "
+                        "SCHEDULER state, the epoch counter and the RNG. "
+                        "Exists so a long universal run can be fed to a "
+                        "queue as short slices (see driver_benchmark.sh): "
+                        "unlike a population run, which is N independent "
+                        "per-image attacks and is sliceable by construction, "
+                        "this is ONE continuous optimisation and cannot be "
+                        "cut without carrying Adam's moments and the cosine "
+                        "schedule's position across the cut. Idempotent — "
+                        "a finished run (results.json present) exits at once.")
+    p.add_argument("--checkpoint_every", type=int, default=1,
+                   help="write train_state.pt every N epochs. 1 (default) "
+                        "costs one small write per epoch and bounds the work "
+                        "a killed slice loses to a single epoch. Raise it "
+                        "only if an epoch is genuinely cheap; a slice that "
+                        "never reaches a checkpoint makes no progress at all "
+                        "and the driver will stop after two of them.")
     p.add_argument("--tag", type=str, default="",
                    help="Optional slug appended to the run id.")
     p.add_argument("--diag_image", type=int, default=2,
@@ -158,6 +202,16 @@ def run_id(a) -> str:
         bits.append(f"pl-{a.placement}{a.placement_class}")
     if a.reach_mode != "off":
         bits.append(f"reach-{a.reach_mode}")
+    # The training subset is part of the run's identity, not a detail: two
+    # rows differing only in n_train would otherwise land in the same
+    # directory and be separated by increment_path's numeric suffix alone.
+    if getattr(a, "n_train", 0):
+        bits.append(f"n{a.n_train}")
+    # The baseline row must not share a directory with the trained one.
+    if getattr(a, "raw_init", "grey") != "grey":
+        bits.append(f"init-{a.raw_init}")
+    if a.lr == 0:
+        bits.append("lr0")
     if a.tag:
         bits.append(a.tag)
     bits.append(f"s{a.seed}")
@@ -205,6 +259,12 @@ def evaluate(model, loader, patch, device, K, target_class=None):
         out[f"adv_{tag}_union"] = d["adv_union"]
         out[f"drop_{scope}"] = d["drop"]
         out[f"drop_{scope}_union"] = d["drop_union"]
+        # mAcc beside mIoU, because the benchmark this protocol targets
+        # (Nesti et al. WACV 2022, Table 2) quotes both and a row with one
+        # of them cannot be placed next to theirs.
+        out[f"clean_acc_{tag}"] = d["clean_acc"]
+        out[f"adv_acc_{tag}"] = d["adv_acc"]
+        out[f"drop_acc_{scope}"] = d["drop_acc"]
         out[f"n_classes_{scope}"] = d["n_classes_gt"]
         out[f"n_classes_{scope}_union_clean"] = d["n_classes_clean_union"]
         out[f"n_classes_{scope}_union_adv"] = d["n_classes_adv_union"]
@@ -219,15 +279,54 @@ def main():
     seed_everything(args.seed)
     device = get_device()
 
-    out_dir = increment_path(Path(args.out_root) / run_id(args))
+    if args.resume and not args.out_dir:
+        raise SystemExit(
+            "--resume needs --out_dir. Without it the path goes through "
+            "increment_path, which would create a SECOND directory and "
+            "resume nothing while looking like it worked.")
+    out_dir = (Path(args.out_dir) if args.out_dir
+               else increment_path(Path(args.out_root) / run_id(args)))
     out_dir.mkdir(parents=True, exist_ok=True)
+
+    # IDEMPOTENCE, which is the whole contract a queue driver relies on.
+    # results.json is written once, at the very end, so its presence means
+    # this run is finished and re-submitting is a no-op rather than a second
+    # 50,000-step run into the same directory.
+    if args.resume and (out_dir / "results.json").exists():
+        print(f"[resume] {out_dir} already has results.json — nothing to do.")
+        return
+
     # Per-epoch snapshots go in their own directory, not loose in the run:
     # they are progress, and a 200-epoch run would hide best.pt behind them.
     # The name is shared with the single-image loop, and deliberately NOT
     # "patches" -- that is the population run's per-image checkpoint tree.
     (out_dir / INTERMEDIATE_DIR).mkdir(exist_ok=True)
-    with open(out_dir / "config.json", "w") as f:
-        json.dump(vars(args), f, indent=2)
+
+    # CONFIG DRIFT ACROSS A RESUME IS SILENT AND FATAL. The cosine T_max is
+    # epochs x batches and Adam's state was accumulated under one lr, so a
+    # slice relaunched with different --epochs/--lr/--batch_size continues a
+    # DIFFERENT optimisation problem and the run is neither of the two. The
+    # first slice's config.json is the contract; later slices are checked
+    # against it and refused rather than merged.
+    cfg_path = out_dir / "config.json"
+    if args.resume and cfg_path.exists():
+        prev = json.loads(cfg_path.read_text())
+        pinned = ("arch", "patch_mode", "img_h", "img_w", "patch_size",
+                  "patch_scale", "placement", "epochs", "lr", "lr_schedule",
+                  "batch_size", "optimiser", "loss_fn", "n_train",
+                  "train_seed", "seed", "csf_threshold", "raw_init")
+        drift = {k: (prev.get(k), getattr(args, k, None)) for k in pinned
+                 if k in prev and prev.get(k) != getattr(args, k, None)}
+        if drift:
+            raise SystemExit(
+                "--resume refused: this slice's arguments differ from the "
+                "ones the run started under.\n  " + "\n  ".join(
+                    f"{k}: recorded {o!r}, given {n!r}"
+                    for k, (o, n) in drift.items())
+                + "\nFix the launcher, or start a new --out_dir.")
+    else:
+        with open(cfg_path, "w") as f:
+            json.dump(vars(args), f, indent=2)
     print(f"\n### {out_dir} ###")
 
     # setup_model resolves the registry entry, loads the segmentor (registering
@@ -240,6 +339,42 @@ def main():
     mean_t, std_t = norm_tensors(device)
     train_ds = make_dataset(args, "train")
     val_full = make_dataset(args, "val")
+
+    # THE SAMPLED TRAINING SUBSET (Nesti/Rossolini protocol). Drawn from a
+    # dedicated Random instance rather than the global RNG: seed_everything()
+    # has already run, and drawing here off the global stream would make the
+    # patch initialisation depend on whether this flag was passed — two runs
+    # that differ only in --n_train would then differ in their init too, and
+    # the subset would no longer be the only variable.
+    if args.n_train:
+        if args.n_train > len(train_ds):
+            raise SystemExit(f"--n_train {args.n_train} exceeds the train "
+                             f"split ({len(train_ds)} images)")
+        tseed = args.seed if args.train_seed is None else args.train_seed
+        train_idx = sorted(random.Random(tseed).sample(range(len(train_ds)),
+                                                       args.n_train))
+        # ON RESUME THE SUBSET MUST BE THE ONE THE RUN STARTED WITH. The draw
+        # is deterministic in (tseed, n_train, split size) so it re-derives
+        # identically -- but "it should match" is not the same as checking,
+        # and a slice that silently trained on different images would be
+        # invisible in every output.
+        idx_path = out_dir / "train_images.json"
+        if idx_path.exists():
+            recorded = json.loads(idx_path.read_text())["indices"]
+            if recorded != train_idx:
+                raise SystemExit(
+                    f"--resume refused: the sampled training subset does not "
+                    f"match {idx_path}. The recorded draw has "
+                    f"{len(recorded)} images, this one {len(train_idx)}; "
+                    f"they share {len(set(recorded) & set(train_idx))}.")
+        else:
+            with open(idx_path, "w") as f:
+                json.dump({"n_train": args.n_train, "train_seed": tseed,
+                           "indices": train_idx}, f, indent=2)
+        train_ds = Subset(train_ds, train_idx)
+        print(f"[data] train subset {args.n_train} imgs, seed {tseed}, "
+              f"first {train_idx[:5]} -> train_images.json")
+
     train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True,
                               num_workers=args.num_workers, pin_memory=True)
     val_loader = DataLoader(
@@ -357,7 +492,68 @@ def main():
 
     history, best, checked, t0 = [], -1e9, False, time.time()
     gstep = 0
-    for epoch in range(1, args.epochs + 1):
+    # Defined before the loop because a resumed slice can find every epoch
+    # already done and fall straight through to the final evaluation, where
+    # the lap branch reads it.
+    running = float("nan")
+
+    # ── resume ───────────────────────────────────────────────────────────────
+    # EVERYTHING THE NEXT STEP DEPENDS ON, or the cut is not transparent:
+    #   param          the patch itself
+    #   opt            Adam's first and second moments. Dropping these restarts
+    #                  the optimiser cold at every slice boundary, which under
+    #                  a 30-minute slice means ~20 cold starts in one run.
+    #   sched          the cosine position. T_max is the WHOLE run, so a
+    #                  scheduler rebuilt at zero would re-anneal from the top
+    #                  each slice and the lr would sawtooth instead of decay.
+    #   gstep          the tsallis q schedule reads it, and it is the x-axis
+    #                  of every history row.
+    #   best/history   so best.pt is not re-competed against an empty field.
+    #   RNG            the DataLoader shuffle draws from the global torch
+    #                  stream; restoring it makes the epoch order continue as
+    #                  though nothing had stopped.
+    # elapsed_s carries the wall clock ACROSS slices, so wall_clock_s in
+    # results.json is the run's real cost rather than the last slice's.
+    state_path = out_dir / "train_state.pt"
+    start_epoch, elapsed_s = 1, 0.0
+    if args.resume and state_path.exists():
+        st = torch.load(state_path, map_location="cpu")
+        with torch.no_grad():
+            patch.param.copy_(st["param"].to(device))
+        opt.load_state_dict(st["opt"])
+        if sched is not None and st.get("sched") is not None:
+            sched.load_state_dict(st["sched"])
+        start_epoch = int(st["epoch"]) + 1
+        gstep, best = int(st["gstep"]), float(st["best"])
+        history, elapsed_s = st["history"], float(st.get("elapsed_s", 0.0))
+        random.setstate(st["py_rng"])
+        torch.set_rng_state(st["torch_rng"])
+        if st.get("cuda_rng") is not None and torch.cuda.is_available():
+            torch.cuda.set_rng_state_all(st["cuda_rng"])
+        print(f"[resume] epoch {start_epoch}/{args.epochs}, step "
+              f"{gstep:,}/{total_steps:,}, best drop_remote {best:+.2f}, "
+              f"{elapsed_s/3600:.1f} h of wall clock already spent")
+        if start_epoch > args.epochs:
+            print("[resume] all epochs done; going straight to the final "
+                  "evaluation.")
+    elif args.resume:
+        print(f"[resume] no train_state.pt in {out_dir} — starting fresh.")
+    t0 = time.time() - elapsed_s
+
+    def save_state(epoch):
+        atomic_save({"epoch": epoch, "gstep": gstep, "best": best,
+                     "history": history, "elapsed_s": time.time() - t0,
+                     "param": patch.param.detach().cpu(),
+                     "opt": opt.state_dict(),
+                     "sched": (sched.state_dict() if sched is not None
+                               else None),
+                     "py_rng": random.getstate(),
+                     "torch_rng": torch.get_rng_state(),
+                     "cuda_rng": (torch.cuda.get_rng_state_all()
+                                  if torch.cuda.is_available() else None)},
+                    state_path)
+
+    for epoch in range(start_epoch, args.epochs + 1):
         running = 0.0
         for imgs, labels in tqdm(train_loader, desc=f"epoch {epoch}/{args.epochs}"):
             # GLOBAL step, deliberately not per-epoch: a universal patch is one
@@ -429,6 +625,12 @@ def main():
                 patch.save(out_dir / "best.pt")
                 save_image(patch.render().cpu(), out_dir / "best_patch.png")
                 print(f"           * new best drop_remote {best:+.2f}")
+
+        # AFTER the validation, not before: `best` and `history` are written
+        # in that branch, and a checkpoint taken above them would resume into
+        # a state that re-competes a validation it has already run.
+        if epoch % args.checkpoint_every == 0 or epoch == args.epochs:
+            save_state(epoch)
 
     final = evaluate(model, val_loader, patch, device, args.num_classes, tgt)
     # ── calibration for stage 2 ──────────────────────────────────────────────

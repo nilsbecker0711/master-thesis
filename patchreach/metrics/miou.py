@@ -87,8 +87,35 @@ class SegMetric:
                            torch.full_like(tp, float("nan"))) * 100.0
 
     @torch.no_grad()
+    def per_class_acc(self) -> torch.Tensor:
+        r"""
+        Per-class RECALL, tp / gt — the quantity averaged into mAcc.
+
+        NO `classes` ARGUMENT, unlike per_class(). Accuracy is normalised by
+        the ground-truth pixel count, so a class with gt == 0 is 0/0 and the
+        'union' set (denom > 0, which admits classes that were only ever
+        PREDICTED) has no defined value for it. mAcc is a gt-set quantity by
+        construction and pretending otherwise would emit a second number that
+        looks comparable to mIoU-union and is not.
+
+        Reported because Nesti et al. (WACV 2022) and Rossolini et al. (TNNLS
+        2024) quote mIoU AND mAcc, and their patch numbers cannot be entered
+        into the same table without it. It shares the confusion matrix with
+        per_class(), so it costs nothing and cannot drift from the mIoU it
+        sits beside.
+        """
+        cm = self.cm.float()
+        tp, gt = cm.diagonal(), cm.sum(1)
+        return torch.where(gt > 0, tp / gt.clamp(min=1.0),
+                           torch.full_like(tp, float("nan"))) * 100.0
+
+    @torch.no_grad()
     def compute(self, classes: str = "gt") -> float:
         return self.per_class(classes).nanmean().item()
+
+    @torch.no_grad()
+    def compute_acc(self) -> float:
+        return self.per_class_acc().nanmean().item()
 
     @torch.no_grad()
     def n_counted(self, classes: str = "gt") -> int:
@@ -123,6 +150,14 @@ def compare(clean: SegMetric, adv: SegMetric, prefix: str = "") -> dict:
         out[f"{prefix}clean{suffix}"] = c
         out[f"{prefix}adv{suffix}"] = a
         out[f"{prefix}drop{suffix}"] = c - a
+    # mAcc, gt set only — see SegMetric.per_class_acc for why there is no
+    # union variant. Added for the Nesti/Rossolini benchmark table; every
+    # earlier key above is untouched, so runs recorded before this exist
+    # unchanged and simply lack the three acc_ columns.
+    ca, aa = clean.compute_acc(), adv.compute_acc()
+    out[f"{prefix}clean_acc"] = ca
+    out[f"{prefix}adv_acc"] = aa
+    out[f"{prefix}drop_acc"] = ca - aa
     out[f"{prefix}n_classes_gt"] = clean.n_counted("gt")
     out[f"{prefix}n_classes_clean_union"] = clean.n_counted("union")
     out[f"{prefix}n_classes_adv_union"] = adv.n_counted("union")
