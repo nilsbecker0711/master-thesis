@@ -145,7 +145,7 @@ for row in "${ROWS[@]}"; do
             if [ "$stalled" -ge 2 ]; then
                 echo "$(date +%F\ %H:%M)  $name  no progress in 2 slices at"
                 echo "  epoch $n - giving up on this config and moving on."
-                echo "  check slurm/benchmark/${name}_*.err"
+                echo "  check slurm/benchmark/*_${name}_*.err"
                 break
             fi
         else
@@ -165,7 +165,7 @@ for row in "${ROWS[@]}"; do
         if [ "$rc" -eq 3 ]; then
             echo
             echo "FATAL: the slice refused to start -- bad python environment."
-            echo "  See slurm/benchmark/${name}_*.err for the checks to run."
+            echo "  See slurm/benchmark/*_${name}_*.err for the checks to run."
             echo "  Fix it and relaunch the driver; nothing is lost."
             exit 3
         fi

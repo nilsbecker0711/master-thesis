@@ -287,8 +287,12 @@ fi
 
 echo "slice for '$WANT' on $(hostname), $(date)"
 mkdir -p "$ROOT/slurm/benchmark"
-exec 1> "$ROOT/slurm/benchmark/${WANT}_${SLURM_JOB_ID:-local}.out"
-exec 2> "$ROOT/slurm/benchmark/${WANT}_${SLURM_JOB_ID:-local}.err"
+# ARCH IS IN THE LOG NAME. Config names do not vary across architectures --
+# six per-arch drivers all submit a slice called 'raw' -- so without it the
+# logs are distinguishable only by job id, which is exactly the wrong thing
+# to have to grep for when one arch is the one failing.
+exec 1> "$ROOT/slurm/benchmark/${ARCH}_${WANT}_${SLURM_JOB_ID:-local}.out"
+exec 2> "$ROOT/slurm/benchmark/${ARCH}_${WANT}_${SLURM_JOB_ID:-local}.err"
 
 # ── environment ──────────────────────────────────────────────────────────────
 # WHAT ACTUALLY PUTS PYTHON ON PATH HERE, and it is not the lines below.
