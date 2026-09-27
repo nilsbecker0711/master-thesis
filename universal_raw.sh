@@ -35,11 +35,11 @@ python --version
 #    --shape alpha \
     #--lap_freeze_edges --lap_edge_thresh 0.15 --target_class 13 \
 #for LR in 0.1 0.2 0.5; do python scripts/train.py --arch segformer --cityscapes_root $CS --img_h 512 --img_w 1024 --patch_mode universal_csf --patch_size 128 --patch_scale 0.25 --loss_fn cospgd --lr_schedule cosine --lr $LR --batch_size 4 --num_workers 16 --epochs 150 --val_images 500 --csf_threshold 0.25 --no_diagnostics --panel_images "" --tag 150_lr$LR; done
-
-BASE="--arch deeplab_50 --cityscapes_root $CS --img_h 512 --img_w 1024"
-GEOM="--patch_mode raw --patch_size 128 --patch_scale 0.25 --placement center"
-COMMON="--loss_fn cospgd --lr_schedule cosine --batch_size 4 --num_workers 16  --lr 0.1\
-        --val_images 500 --val_every 3"
+export T=5
+BASE="--arch segformer_b5 --cityscapes_root $CS --img_h 1024 --img_w 2048 --inference auto --slide_checkpoint --scale crop"
+GEOM="--patch_mode csf --csf_enforce realised --csf_threshold $T --patch_size 128 --patch_scale 0.25 --placement center"
+COMMON="--loss_fn ce --lr_schedule cosine --batch_size 4 --num_workers 16  --lr 0.1\
+        --val_images 500 --val_every 3 --tag _t$T"
         
 
 # D: baseline. lr 0 keeps the patch at its random projected init, which under
