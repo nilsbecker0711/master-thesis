@@ -146,8 +146,39 @@ GEOM="--patch_size $PSIZE --patch_scale $PSCALE"
 # 500-image evaluation runs after the loop REGARDLESS, so the headline number
 # is never stale. best.pt is then the best of ~5 validations — Nesti report
 # the final patch, so quote `final`, and treat best.pt as a diagnostic.
+# ── INFERENCE MODE: slide, and it is not the repo default ────────────────────
+# --inference auto honours the checkpoint's declared test_cfg: SLIDE for
+# segformer and setr, whole for deeplab and unet. Every other table in this
+# thesis uses whole, so this is a deliberate departure, for two reasons.
+#
+# REALISM. mmseg's SegFormer Cityscapes config declares mode='slide', and the
+# published numbers this row is compared against were produced that way. A
+# model nobody deploys under whole-image forward should not be attacked under
+# whole-image forward: that measures damage to a configuration that does not
+# exist, and it flatters the attack.
+#
+# AND THE USUAL OBJECTION DOES NOT APPLY HERE. clean_baseline.py's
+# SLIDE_WARNING says slide caps a patch's reach, because each window is an
+# independent forward and a patch cannot influence pixels outside the windows
+# containing it -- an ARCHITECTURE-DEPENDENT ceiling that confounds any reach
+# measurement. True in general, and the reason the ERF and reach tables must
+# stay on whole. But compute it for THIS configuration: at 1024x2048 the
+# 1024x1024 crop / 768 stride grid is three windows -- [0,1024], [768,1792],
+# [1024,2048] -- and a CENTRED patch of 128 or 256 px lands in all three, so
+# their union is the entire frame and the cap is exactly zero. Verify with
+# patchreach.models.wrapper.slide_windows before changing arch, resolution or
+# placement: setr_pup's 768 crop caps the same patch to x[512,1792] of 2048,
+# and off-centre placement breaks it for segformer too.
+#
+# COST: three windows is ~3x the forward work per step, and
+# --slide_checkpoint recomputes each window in backward rather than holding
+# every window's graph, which trades a second forward for the memory. That is
+# what makes batch 1 at native resolution fit. The same pair of flags the
+# 1024x2048 overfit runs already use.
+INFER="--inference auto --slide_checkpoint"
+
 PROTO="--arch $ARCH --cityscapes_root $CS --img_h 1024 --img_w 2048 \
-       --placement center --n_train 250 --train_seed 68 \
+       --placement center --n_train 250 --train_seed 68 $INFER \
        --val_images 500 --val_every 50 --epochs $EPOCHS \
        --optimiser adam --lr_schedule cosine --batch_size 1 \
        --num_workers 16 --loss_fn cospgd --no_diagnostics --resume"
@@ -193,13 +224,16 @@ configs () {
   # (results/clean_baselines*), so re-running it here would be an hour of
   # A100 per arch for a number we have.
   #
-  # BUT IT ONLY SUBSTITUTES IF IT MATCHES. The reference for this table has
-  # to be the same measurement: --img_h 1024 --img_w 2048, the full val
-  # split, and --inference whole. A 512x1024 number is a different
-  # measurement, and a SLIDE number is not a clean reference for an attack
-  # run at all -- clean_baseline.py prints a warning saying so, because
-  # under slide a patch cannot influence pixels outside the windows
-  # containing it while every attack path here uses a whole-image forward.
+  # BUT IT ONLY SUBSTITUTES IF IT MATCHES THE ATTACK PATH. The reference for
+  # this table has to be the same measurement: --img_h 1024 --img_w 2048,
+  # the full val split, and --inference auto -- i.e. SLIDE for segformer,
+  # because that is what these rows are now attacked under (see the
+  # INFERENCE MODE block above). A 512x1024 number is a different
+  # measurement, and so is a whole-image one. clean_baseline.py's
+  # SLIDE_WARNING says to compare a slide number only to the published zoo
+  # value; that warning was written when every attack path here used whole,
+  # and the rule it encodes is really "clean and attacked must agree on the
+  # inference mode". They now agree on slide.
   # Check the recorded config before quoting one beside these rows; if it
   # does not match, put the row back:
   #
