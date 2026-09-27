@@ -116,6 +116,21 @@ echo
 
 total_slices=0
 for row in "${ROWS[@]}"; do
+    # SKIP ANYTHING THAT IS NOT A TABLE ROW. `--list` must emit only
+    # name<TAB>out_dir. Any stray stdout from the slice script -- a
+    # `python --version` in a prologue, a module banner, a debug echo --
+    # becomes a PHANTOM CONFIG whose name is that whole line: `finished`
+    # cannot match it, so the driver submits it, the slice answers
+    # "no config named ...", and two dev-GPU slices are spent before the
+    # stall counter moves on to the real rows. Observed exactly that way.
+    case "$row" in
+        *"${TAB}"*) ;;
+        *) echo "$(date +%F\ %H:%M)  IGNORING non-table line from --list:"
+           echo "    >$row<"
+           echo "    Something in $JOB prints to STDOUT before the --list"
+           echo "    branch exits. Send it to stderr, or move it below."
+           continue ;;
+    esac
     name="${row%%${TAB}*}"
     out="${row#*${TAB}}"
     [ -n "$ONLY" ] && [ "$name" != "$ONLY" ] && continue
@@ -176,6 +191,7 @@ done
 echo
 echo "driver done after $total_slices slices, $(date)"
 for row in "${ROWS[@]}"; do
+    case "$row" in *"${TAB}"*) ;; *) continue ;; esac
     name="${row%%${TAB}*}"; out="${row#*${TAB}}"
     if finished "$name" "$out"; then s="done"; else s="INCOMPLETE"; fi
     printf '  %-18s %-10s %s\n' "$name" "$s" "$out"
