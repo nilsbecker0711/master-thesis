@@ -1,7 +1,7 @@
 #!/bin/bash
-#SBATCH -p gpu_a100_il         # full grid; for ONE arm use dev_gpu_a100_il + 00:20:00
+#SBATCH -p dev_gpu_a100_il     # one arm per array task; whole grid -> gpu_a100_il + 06:00:00
 #SBATCH -n 1                   # Number of tasks (1 for single node)
-#SBATCH -t 06:00:00            # Time limit
+#SBATCH -t 00:25:00            # Time limit (an arm is ~4-8 min; 25 fits the dev cap)
 #SBATCH --mem=200000           # Memory request (1024x2048 + slide needs room)
 #SBATCH --gres=gpu:1           # Request 1 GPU
 #SBATCH --cpus-per-task=16     # Number of CPUs per GPU (16 for A100)
@@ -61,7 +61,39 @@ python --version
 : "${DO_RAW:=1}"
 : "${TAG:=T17_transfer}"
 
+# ONE ARM IS THE SCHEDULABLE UNIT, and the reason is that the cost of an arm
+# is six checkpoint loads, not the 78 forward passes -- an arm is roughly
+# 4-8 min, most of it building ViT-L and B5 off the workspace filesystem.
+# The full 12-arm grid in ONE job therefore loads the same six sets of
+# weights twelve times over and takes ~1-2 h, which does not fit the 30 min
+# dev-partition cap and does not need to: the arms are independent.
+#
+#   sbatch --array=0-11 matrix.sh       each task ONE arm, ~4-8 min, parallel
+#   sbatch matrix.sh                    every arm sequentially, ~1-2 h
+#   LIST=1 bash matrix.sh               print the arm list and exit
+#
+# Under --array, SLURM_ARRAY_TASK_ID indexes ARMS below, so the --array range
+# must match the grid. LIST=1 prints it rather than leaving you to multiply
+# it out, and an index past the end exits non-zero instead of silently
+# running nothing.
+ARMS=()
+for L in $LOSSES; do
+  # The unconstrained reference goes FIRST. raw is the ceiling on what any
+  # tau can transfer, so a raw matrix that already collapses off-diagonal
+  # says the csf arms are measuring the collapse and not the constraint.
+  if [ "$DO_RAW" = "1" ]; then ARMS+=("$L|"); fi
+  for T in $TAUS; do ARMS+=("$L|$T"); done
+done
+
 echo "LOSSES=[$LOSSES]  TAUS=[$TAUS]  DO_RAW=$DO_RAW  TAG=$TAG"
+echo "${#ARMS[@]} arm(s) -> sbatch --array=0-$(( ${#ARMS[@]} - 1 )) matrix.sh"
+if [ "${LIST:-0}" = "1" ]; then
+  for i in "${!ARMS[@]}"; do
+    L="${ARMS[$i]%|*}"; T="${ARMS[$i]#*|}"
+    echo "  [$i] $L $([ -n "$T" ] && echo "csf tau=$T" || echo raw)"
+  done
+  exit 0
+fi
 
 n_ok=0; n_fail=0; started=$SECONDS
 
@@ -80,13 +112,24 @@ run () {                       # run <loss> [--csf --tau T]
   fi
 }
 
-for L in $LOSSES; do
-  # The unconstrained reference goes FIRST. raw is the ceiling on what any
-  # tau can transfer, so a raw matrix that already collapses off-diagonal
-  # says the csf arms are measuring the collapse and not the constraint.
-  if [ "$DO_RAW" = "1" ]; then run "$L"; fi
-  for T in $TAUS; do run "$L" --csf --tau "$T"; done
-done
+run_arm () {                   # run_arm <index>
+  local spec="${ARMS[$1]}"
+  local L="${spec%|*}" T="${spec#*|}"
+  if [ -n "$T" ]; then run "$L" --csf --tau "$T"; else run "$L"; fi
+}
+
+if [ -n "${SLURM_ARRAY_TASK_ID:-}" ]; then
+  if [ "$SLURM_ARRAY_TASK_ID" -ge "${#ARMS[@]}" ]; then
+    echo "array index $SLURM_ARRAY_TASK_ID is past the end of a "
+    echo "${#ARMS[@]}-arm grid — the --array range and LOSSES/TAUS/DO_RAW "
+    echo "disagree. Run LIST=1 bash matrix.sh."
+    exit 2
+  fi
+  echo "array task $SLURM_ARRAY_TASK_ID of ${#ARMS[@]}"
+  run_arm "$SLURM_ARRAY_TASK_ID"
+else
+  for i in "${!ARMS[@]}"; do run_arm "$i"; done
+fi
 
 echo ""
 echo "════════════════════════════════════════════════════"
