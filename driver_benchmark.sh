@@ -153,6 +153,18 @@ for row in "${ROWS[@]}"; do
         submit_slice "$name"; rc=$?
         total_slices=$((total_slices + 1))
         echo "$(date +%F\ %H:%M)  $name  slice returned $rc"
+        # sbatch --wait exits with the JOB's exit code. 3 is the slice's
+        # environment preflight: torch missing, or a GPU torch cannot see.
+        # That is not a property of this config, it is a property of every
+        # slice this driver will ever submit, so stop now rather than
+        # spending two doomed slices on each of the remaining configs.
+        if [ "$rc" -eq 3 ]; then
+            echo
+            echo "FATAL: the slice refused to start -- bad python environment."
+            echo "  See slurm/benchmark/${name}_*.err for the checks to run."
+            echo "  Fix it and relaunch the driver; nothing is lost."
+            exit 3
+        fi
         sleep 10          # never spin, in case sbatch rejects instantly
     done
 done

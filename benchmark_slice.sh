@@ -218,7 +218,21 @@ fi
 
 WANT="${1:-}"
 if [ -z "$WANT" ]; then
-    echo "usage: $0 <config-name> | --list" >&2
+    # THE CONFIG NAME IS NOT OPTIONAL, and forgetting it is the single most
+    # likely way to waste a submission -- `sbatch benchmark_slice.sh` is the
+    # habit every other launch script in this repo teaches, and here it is
+    # wrong. Spell out the fix rather than printing a bare usage line.
+    {
+      echo "usage: $0 <config-name> | --list"
+      echo
+      echo "  A config name is REQUIRED. You most likely ran"
+      echo "      sbatch $(basename "$0")"
+      echo "  where the other launch scripts in this repo take no argument."
+      echo "  Use one of:"
+      configs | cut -f1 | sed 's/^/      sbatch '"$(basename "$0")"' /'
+      echo
+      echo "  Or let the driver do it:  sbatch driver_benchmark.sh"
+    } >&2
     exit 2
 fi
 
@@ -227,14 +241,80 @@ mkdir -p "$ROOT/slurm/benchmark"
 exec 1> "$ROOT/slurm/benchmark/${WANT}_${SLURM_JOB_ID:-local}.out"
 exec 2> "$ROOT/slurm/benchmark/${WANT}_${SLURM_JOB_ID:-local}.err"
 
-module --ignore_cache load "cuda/11.8"
-source ~/miniconda3/etc/profile.d/conda.sh
-conda activate /pfs/work9/workspace/scratch/ma_nilbecke-thesis/miniconda3/envs/thesis_backup3
+# ── environment ──────────────────────────────────────────────────────────────
+# WHAT ACTUALLY PUTS PYTHON ON PATH HERE, and it is not the lines below.
+# sbatch defaults to --export=ALL, so a job inherits the submitting shell's
+# PATH: submit from a login shell with the thesis env active and python is
+# already correct before any of this runs. That is why the other launch
+# scripts in this repo work DESPITE these same three lines failing on uc3 --
+# there is no `cuda/11.8` module, there is no ~/miniconda3, and the conda
+# launcher in the workspace still carries a HoreKa shebang
+# (/hkfs/.../miniconda3/bin/python) from when the install was copied across
+# clusters. All three errors are non-fatal and always have been.
+#
+# Inheritance is fragile, though: a slice submitted from a shell without the
+# env gets the system python and dies deep inside an import, which the driver
+# can only read as "no progress" before giving up two slices later. So try to
+# set the environment up, then VERIFY it, and refuse the slice with a legible
+# message rather than burning thirty GPU-minutes on it.
+#
+# All three are overridable from the environment; sbatch exports them.
+# CUDA_MODULE is EMPTY by default because the correct name is cluster
+# specific -- `module spider cuda` on the login node, then export it.
+CUDA_MODULE="${CUDA_MODULE:-}"
+CONDA_SH="${CONDA_SH:-/pfs/work9/workspace/scratch/ma_nilbecke-thesis/miniconda3/etc/profile.d/conda.sh}"
+CONDA_ENV="${CONDA_ENV:-/pfs/work9/workspace/scratch/ma_nilbecke-thesis/miniconda3/envs/thesis_backup3}"
+
+if [ -n "$CUDA_MODULE" ]; then
+    module --ignore_cache load "$CUDA_MODULE" \
+        || echo "[warn] module '$CUDA_MODULE' did not load; continuing"
+fi
+if [ -r "$CONDA_SH" ]; then
+    # shellcheck disable=SC1090
+    if source "$CONDA_SH" && conda activate "$CONDA_ENV"; then
+        echo "[env ] conda activate $CONDA_ENV"
+    else
+        echo "[warn] conda activate failed; falling back to the inherited PATH"
+    fi
+else
+    echo "[warn] no conda.sh at $CONDA_SH; relying on the inherited PATH"
+fi
 export PYTHONNOUSERSITE=1
-export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/pfs/work9/workspace/scratch/ma_nilbecke-thesis/miniconda3/lib
+export LD_LIBRARY_PATH=${LD_LIBRARY_PATH:-}:/pfs/work9/workspace/scratch/ma_nilbecke-thesis/miniconda3/lib
 
 cd "$ROOT" || exit 1
-echo "cwd $(pwd)"; python --version
+echo "cwd    : $(pwd)"
+echo "python : $(command -v python || echo NONE)"
+
+# THE PREFLIGHT. Everything above is best-effort; this is not. A slice that
+# cannot import torch, or that got a GPU it cannot see, produces nothing and
+# is indistinguishable to the driver from one that was merely slow.
+if ! python - <<'PY'
+import sys
+print(f"exe    : {sys.executable}")
+print(f"version: {sys.version.split()[0]}")
+import torch
+print(f"torch  : {torch.__version__}  cuda_available={torch.cuda.is_available()}")
+sys.path.insert(0, ".")
+import patchreach  # noqa: F401
+print("patchreach: ok")
+if not torch.cuda.is_available():
+    sys.exit("no CUDA device visible to torch")
+PY
+then
+    echo
+    echo "FATAL: the python environment is not usable in this job." >&2
+    echo "  This slice would have failed deep inside an import, or run on" >&2
+    echo "  CPU for its whole walltime. Nothing was started." >&2
+    echo "  Checks, on the login node:" >&2
+    echo "    which python && python -c 'import torch; print(torch.__version__)'" >&2
+    echo "    module spider cuda        # then: export CUDA_MODULE=<name>" >&2
+    echo "    ls $CONDA_SH" >&2
+    echo "    head -1 \$(command -v conda)   # a /hkfs/... shebang is stale" >&2
+    echo "  Simplest fix: activate the env in your login shell before" >&2
+    echo "  submitting -- sbatch --export=ALL carries it into the job." >&2
+    exit 3
+fi
 
 row="$(configs | awk -F'\t' -v n="$WANT" '$1 == n')"
 if [ -z "$row" ]; then
