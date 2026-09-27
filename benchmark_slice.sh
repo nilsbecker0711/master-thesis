@@ -155,10 +155,13 @@ PROTO="--arch $ARCH --cityscapes_root $CS --img_h 1024 --img_w 2048 \
 # ── the config table ─────────────────────────────────────────────────────────
 # name | out_dir | script | args
 #
-# Six configs: the clean reference plus five rows at the single 0.25
-# operating point. The two _null rows and the _grey row are --lr 0
-# --epochs 1: nothing moves, and the post-loop 500-image evaluation is the
-# entire point of the run.
+# Five rows at the single 0.25 operating point. NO clean row — that number
+# already exists per architecture; see the note in configs() for the two
+# conditions under which the existing one is a valid reference here.
+#
+# The two _null rows and the _grey row are --lr 0 --epochs 1: nothing
+# moves, and the post-loop 500-image evaluation is the entire point of the
+# run.
 #
 #   csf       the mode under test, tau 0.25 — the rung every other CSF number
 #             in the thesis is quoted at. lr 0.01: the parameter IS the
@@ -186,15 +189,27 @@ PROTO="--arch $ARCH --cityscapes_root $CS --img_h 1024 --img_w 2048 \
 configs () {
   local T="s${PSCALE}"        # the tag: our operating point, not their size
 
-  # The clean dataset reference, so the table is self-contained. Sentinel is
-  # its own json rather than a run directory, and the directory is
-  # arch-specific so a later b5 run cannot satisfy b0's sentinel (the
-  # driver's completion check is a glob inside this directory).
-  # clean_baseline.py mkdirs its own parent.
-  printf '%s\t%s\t%s\t%s\n' \
-    "clean" "results/tables/bench_nesti/$ARCH" "scripts/clean_baseline.py" \
-    "--arch $ARCH --cityscapes_root $CS --img_h 1024 --img_w 2048 \
-     --images all --out results/tables/bench_nesti/$ARCH/clean --tag bench_nesti"
+  # NO `clean` ROW. The clean dataset mIoU per architecture already exists
+  # (results/clean_baselines*), so re-running it here would be an hour of
+  # A100 per arch for a number we have.
+  #
+  # BUT IT ONLY SUBSTITUTES IF IT MATCHES. The reference for this table has
+  # to be the same measurement: --img_h 1024 --img_w 2048, the full val
+  # split, and --inference whole. A 512x1024 number is a different
+  # measurement, and a SLIDE number is not a clean reference for an attack
+  # run at all -- clean_baseline.py prints a warning saying so, because
+  # under slide a patch cannot influence pixels outside the windows
+  # containing it while every attack path here uses a whole-image forward.
+  # Check the recorded config before quoting one beside these rows; if it
+  # does not match, put the row back:
+  #
+  #   printf '%s\t%s\t%s\t%s\n' \
+  #     "clean" "results/tables/bench_nesti/$ARCH" "scripts/clean_baseline.py" \
+  #     "--arch $ARCH --cityscapes_root $CS --img_h 1024 --img_w 2048 \
+  #      --images all --out results/tables/bench_nesti/$ARCH/clean --tag bench_nesti"
+  #
+  # (the driver still has the sentinel branch for it, so re-adding the row
+  # is the only change needed.)
 
   printf '%s\t%s\t%s\t%s\n' "csf" "$OUTROOT/csf" \
     "scripts/train.py" "$PROTO $GEOM --patch_mode universal_csf --csf_threshold 0.25 --lr 0.01 --tag $T"

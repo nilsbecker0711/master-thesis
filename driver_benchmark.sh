@@ -91,6 +91,10 @@ finished () {
     local name="$1" d="$2"
     if [ "$name" = "clean" ]; then
         # clean_baseline.py writes one json rather than a run directory.
+        # The clean row is currently NOT in the table -- that number already
+        # exists per architecture -- so this branch is dormant. It stays so
+        # that re-adding the row (see configs() in benchmark_slice.sh) needs
+        # no change here.
         ls "$d"/clean*bench_nesti*.json >/dev/null 2>&1
     else
         [ -f "$d/results.json" ]
