@@ -27,8 +27,20 @@
 # and the job — the failure the population driver needs a comment to catch.
 
 set -u
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# NOT dirname "$BASH_SOURCE" -- sbatch runs a COPY of this script out of
+# /var/spool/slurmd/job<id>/, so that resolves to the spool directory, which
+# is not the repo and is not writable (the mkdir below fails with permission
+# denied, and the exec redirect then kills the shell). SLURM_SUBMIT_DIR is
+# the directory sbatch was invoked from, which is what we want; the
+# BASH_SOURCE form stays as the fallback for running this on a login node.
+ROOT="${REPO_ROOT:-${SLURM_SUBMIT_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}}"
 cd "$ROOT" || exit 1
+if [ ! -f "scripts/train.py" ]; then
+    echo "FATAL: '$ROOT' is not the repo root -- no scripts/train.py there."
+    echo "  sbatch from the repo root, or set REPO_ROOT=/path/to/master-thesis."
+    exit 1
+fi
 
 echo "driver on $(hostname), $(date)"
 mkdir -p slurm/benchmark

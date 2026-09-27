@@ -98,7 +98,25 @@
 # ═════════════════════════════════════════════════════════════════════════════
 
 set -u
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# ── WHERE THE REPO IS ────────────────────────────────────────────────────────
+# NOT dirname "$BASH_SOURCE". sbatch COPIES the batch script to
+# /var/spool/slurmd/job<id>/slurm_script and executes the copy, so under
+# SLURM that expands to the spool directory -- which is not the repo, is not
+# writable, and made `python scripts/train.py` fail with "can't open file
+# /var/spool/slurmd/job.../scripts/train.py".
+#
+# SLURM already starts a batch job in the directory sbatch was invoked from
+# and exports it as SLURM_SUBMIT_DIR, so that is the answer under a job. The
+# BASH_SOURCE form is kept only as the fallback for running this script
+# directly on a login node (`bash benchmark_slice.sh --list`), where it is
+# correct. REPO_ROOT overrides both.
+ROOT="${REPO_ROOT:-${SLURM_SUBMIT_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}}"
+if [ ! -f "$ROOT/scripts/train.py" ]; then
+    echo "FATAL: '$ROOT' is not the repo root -- no scripts/train.py there." >&2
+    echo "  sbatch from the repo root, or set REPO_ROOT=/path/to/master-thesis." >&2
+    exit 1
+fi
 
 # Set BEFORE the config table, which interpolates it, and overridable from
 # the environment so --list works on a login node with nothing loaded.
