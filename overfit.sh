@@ -1,10 +1,8 @@
 #!/bin/bash
 #SBATCH -p dev_gpu_a100_il   # Use the dev_gpu_4_a100 partition with A100 GPUs dev_gpu_4
 #SBATCH -n 1                   # Number of tasks (1 for single node)
-#SBATCH -t 00:30:00            # Time limit (10 minutes for debugging purposes)
+#SBATCH -t 00:05:00            # Time limit (10 minutes for debugging purposes)
 #SBATCH --mem=40000       # Memory request (adjust as needed)
-#SBATCH -t 00:25:00            # Time limit (10 minutes for debugging purposes)
-#SBATCH --mem=40000        # Memory request (adjust as needed)
 #SBATCH --gres=gpu:1           # Request 1 GPU (adjust if you need more)
 #SBATCH --cpus-per-task=16     # Number of CPUs per GPU (16 for A100)
 #SBATCH --ntasks-per-node=1    # Number of tasks per node (1 in this case)
@@ -36,9 +34,13 @@ python --version
 export PYTHONNOUSERSITE=1
 #python scripts/overfit.py --arch setr_pup --cityscapes_root $CS --img_h 512 --img_w 1024 --patch_mode csf --from_image --patch_size 128 --patch_scale 0.25 --placement center --csf_threshold 0.25 --csf_enforce realised --loss_fn ce --image 42 --steps 1000 --lr 0.2 --lr_schedule cosine --seeds 1
 export T=0.25
-python scripts/overfit.py --arch deeplab_18 --cityscapes_root $CS \
-    --patch_mode raw --placement center --loss_fn cospgd --image 42 --steps 600 \
-    --img_h 1024 --img_w 2048 --inference auto --slide_checkpoint --scale crop \
-    --patch_scale 0.25 --csf_threshold $T --from_image \
-    --lr_schedule cosine --lr 0.1 \
-    --log_every 20 --out_root results/overfit_42 --tag$T
+export A="setr_pup"
+for L in cospgd cos_margin ce; do
+    python scripts/overfit.py --arch $A --cityscapes_root $CS \
+        --patch_mode raw --raw_init random --from_image --patch_scale 0.25 \
+        --placement center --csf_threshold $T --csf_enforce realised \
+        --loss_fn $L --image 464 --steps 1 --lr 0 \
+        --lr_schedule cosine  --img_w 2048 --img_h 1024 --inference auto --slide_checkpoint\
+        --log_every 20 --out_root results/overfit_464/$L/$A --tag rand\
+        
+done

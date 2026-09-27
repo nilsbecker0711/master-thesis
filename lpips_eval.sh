@@ -35,12 +35,12 @@ python --version
 # for the csf patch only means something next to the number it is low
 # relative to. Adjust the globs to the runs you want in the table.
 for cpk in \
-    results/overfit_42/segformer_b5_csf_cospgd_img42_sliding_window_t0.5 \
-    results/overfit_42/segformer_b5_csf_cospgd_img42_sliding_window_t0.25 \
-    results/overfit_42/segformer_b5_csf_cospgd_img42_sliding_window_t1 \
-    results/overfit_42/segformer_b5_csf_cospgd_img42_sliding_window_t2 \
-    results/overfit_42/segformer_b5_raw_cospgd_img42_sliding_window \
-    results/overfit_42/segformer_b5_csf_cospgd_img42_sliding_window_t5; do
+    results/overfit_110/cospgd/deeplab_101/deeplab101_csf_cospgd_img110__t0.5 \
+    results/overfit_110/cospgd/deeplab_101/deeplab101_csf_cospgd_img110__t0.25 \
+    results/overfit_110/cospgd/deeplab_101/deeplab101_csf_cospgd_img110__t1 \
+    results/overfit_110/cos_margin/deeplab_101/deeplab101_csf_cospgd_img110__t2 \
+    results/overfit_110/cos_margin/deeplab_101/deeplab101_csf_cospgd_img110__t5 \
+    results/overfit_110/cos_margin/deeplab_101/deeplab101_raw_cospgd_img110; do
   python scripts/lpips_eval.py "$cpk" --source checkpoint --checkpoint best --cityscapes_root $CS --nets alex vgg --anchors --tag ckpt
 done
 echo "Done: $(date)"

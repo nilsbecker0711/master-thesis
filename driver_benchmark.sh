@@ -1,7 +1,7 @@
 #!/bin/bash
-#SBATCH -p cpu
+#SBATCH -p cpu_il
 #SBATCH -n 1
-#SBATCH -t 72:00:00
+#SBATCH -t 00:05:00
 #SBATCH --cpus-per-task=1
 #SBATCH --mem=2000
 
@@ -31,11 +31,11 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$ROOT" || exit 1
 
 echo "driver on $(hostname), $(date)"
-mkdir -p slurm/benchmark
+#mkdir -p slurm/benchmark
 exec 1> "slurm/benchmark/driver_${SLURM_JOB_ID:-local}.out"
 exec 2> "slurm/benchmark/driver_${SLURM_JOB_ID:-local}.err"
 
-JOB="benchmark_slice.sh"
+JOB="/pfs/work9/workspace/scratch/ma_nilbecke-thesis/master-thesis/benchmark18.sh"
 # Literal, so no editor can turn the field separator into spaces.
 TAB=$'	'
 ONLY="${1:-}"            # optional: run a single config by name
