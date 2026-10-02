@@ -289,11 +289,13 @@ class SACDefence(PatchDefence):
         if logits.shape[-2:] != (H, W):
             logits = F.interpolate(logits, size=(H, W), mode="bilinear",
                                    align_corners=False)
-        raw = (torch.sigmoid(logits) > 0.5).to(x01.dtype)
+        prob = torch.sigmoid(logits)
+        raw = (prob > 0.5).to(x01.dtype)
         mask = (shape_completion(raw, self.square_sizes) if self.complete
                 else raw)
         # SAC zeroes the located region. See the module docstring.
-        return Purified(x01=x01 * (1.0 - mask), mask=mask, raw_mask=raw)
+        return Purified(x01=x01 * (1.0 - mask), mask=mask, raw_mask=raw,
+                        prob=prob)
 
     def describe(self, log=print) -> None:
         log(f"[def ] sac  squares={self.square_sizes}  "
