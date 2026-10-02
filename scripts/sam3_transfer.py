@@ -111,13 +111,100 @@ K_METRIC = K_GT + 1
 
 # ── SAM 3 ────────────────────────────────────────────────────────────────────
 
-def load_sam3():
-    """Build the image model + processor. Imported late so --help works in an
-    env without SAM 3 installed."""
-    from sam3.model_builder import build_sam3_image_model
+BPE_ASSET = "assets/bpe_simple_vocab_16e6.txt.gz"
+
+
+def find_bpe(explicit: str | None) -> str | None:
+    r"""
+    Locate the BPE vocab the text encoder needs, WITHOUT pkg_resources.
+
+    WHY THIS EXISTS. build_sam3_image_model() falls back to
+    pkg_resources.resource_filename("sam3", <asset>) when bpe_path is None, and
+    that call dies with
+
+        TypeError: expected str, bytes or os.PathLike object, not NoneType
+
+    whenever sys.modules['sam3'] is a NAMESPACE package — namespace packages
+    have __file__ = None, and resource_filename takes os.path.dirname of it.
+    A clone sitting at <repo>/sam3/ (the repo root, no __init__.py) next to the
+    real package at <repo>/sam3/sam3/ can resolve exactly that way, and this
+    script putting the repo root on sys.path makes it more likely rather than
+    less. Passing bpe_path explicitly skips the fallback and the whole problem.
+
+    importlib.resources is NOT used as the fallback here on purpose: for a
+    namespace package files() returns a MultiplexedPath, which does not
+    str()-ify to a filesystem path, so it would trade one TypeError for
+    another. A plain filesystem probe is the thing that actually works.
+    """
+    if explicit:
+        p = Path(explicit)
+        if not p.is_file():
+            raise SystemExit(f"\n--sam3_bpe {explicit} is not a file.\n")
+        return str(p)
+
+    root = Path(__file__).resolve().parents[1]
+    for cand in (root / "sam3" / "sam3" / BPE_ASSET,     # clone at <repo>/sam3
+                 root / "sam3" / BPE_ASSET,              # package at <repo>/sam3
+                 Path("sam3") / "sam3" / BPE_ASSET):     # cwd-relative clone
+        if cand.is_file():
+            print(f"[sam3] bpe vocab {cand}")
+            return str(cand)
+
+    # Let the upstream fallback try. It works when 'sam3' is a regular package.
+    print("[sam3] bpe vocab not found on disk; falling back to "
+          "pkg_resources (fails if 'sam3' resolves as a namespace package — "
+          "pass --sam3_bpe <path to bpe_simple_vocab_16e6.txt.gz>)")
+    return None
+
+
+def load_sam3(ckpt: str | None, version: str, resolution: int, conf: float,
+              hw, bpe: str | None = None):
+    """
+    Build the image model + processor. Imported late so --help works in an env
+    without SAM 3 installed.
+
+    CHECKPOINT: build_sam3_image_model() defaults to load_from_HF=True with
+    checkpoint_path=None, which calls hf_hub_download twice. A SLURM COMPUTE
+    NODE USUALLY HAS NO OUTBOUND INTERNET, so that is a connection error unless
+    the files are already in the HF cache. Pass --sam3_ckpt with a path
+    downloaded on the login node, or pre-warm the cache there and export
+    HF_HUB_OFFLINE=1.
+
+    RESOLUTION is the one number that decides what SAM 3 actually sees.
+    Sam3Processor resizes the frame to `resolution` (default 1008) internally,
+    and _forward_grounding interpolates the masks back to the ORIGINAL size
+    before returning them — so the returned mask shape always matches the input
+    and cannot reveal the rescaling. It is reported here instead, because a
+    1024x2048 frame at resolution 1008 means the patch reaches the model
+    smaller than it was trained, and that is a protocol deviation rather than
+    a detail.
+    """
+    from sam3.model_builder import build_sam3_image_model, download_ckpt_from_hf
     from sam3.model.sam3_image_processor import Sam3Processor
-    model = build_sam3_image_model()
-    return Sam3Processor(model)
+
+    if ckpt is None:
+        print(f"[sam3] no --sam3_ckpt; downloading {version} from HF "
+              f"(fails on a node without internet unless the cache is warm)")
+        ckpt = download_ckpt_from_hf(version=version)
+    print(f"[sam3] checkpoint {ckpt}")
+
+    model = build_sam3_image_model(checkpoint_path=ckpt, load_from_HF=False,
+                                   bpe_path=find_bpe(bpe))
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    proc = Sam3Processor(model, resolution=resolution, device=device,
+                         confidence_threshold=conf)
+
+    # The frame is squeezed into `resolution` on the way in. Say by how much,
+    # per axis: the squeeze is ANISOTROPIC on a 1:2 Cityscapes frame, so a
+    # square patch does not stay square inside the model.
+    sy, sx = resolution / hw[0], resolution / hw[1]
+    print(f"[sam3] internal resolution {resolution} vs frame {hw[0]}x{hw[1]} "
+          f"-> scale y={sy:.3g} x={sx:.3g}"
+          + ("  !! ANISOTROPIC: the patch is not square inside the model"
+             if abs(sy - sx) > 1e-6 else ""))
+    print(f"[sam3] confidence_threshold {conf} (filters instances INSIDE the "
+          f"processor; --score_thresh is the separate merge threshold)")
+    return proc
 
 
 def _as_prob(masks: torch.Tensor, hw) -> torch.Tensor:
@@ -161,7 +248,7 @@ def prompt_all(processor, pil: Image.Image, hw, prompts=PROMPTS):
         if masks is None or len(masks) == 0:
             present[c], n_inst[c] = False, 0
             continue
-        m = _as_prob(torch.as_tensor(masks), hw)                  # [N,H,W]
+        m = _as_prob(torch.as_tensor(masks), hw)                   # [N,H,W]
         s = torch.as_tensor(scores).float().view(-1, 1, 1)        # [N,1,1]
         # max over instances: a pixel's evidence for class c is the best
         # instance claiming it, weighted by that instance's confidence.
@@ -275,6 +362,27 @@ def main():
                    help="override the prompt table: {\"0\": \"road\", ...}")
     p.add_argument("--save_png", action="store_true",
                    help="dump clean/patched PNGs for inspection")
+    p.add_argument("--sam3_ckpt", default=None,
+                   help="LOCAL path to sam3.pt / sam3.1_multiplex.pt. Without "
+                        "it the build downloads from HF, which fails on a "
+                        "compute node with no internet. Download on the login "
+                        "node first.")
+    p.add_argument("--sam3_version", choices=["sam3", "sam3.1"],
+                   default="sam3.1",
+                   help="only used when --sam3_ckpt is absent")
+    p.add_argument("--sam3_resolution", type=int, default=1008,
+                   help="Sam3Processor's internal working resolution. The "
+                        "frame is squeezed into it, so it decides how large "
+                        "the patch actually arrives.")
+    p.add_argument("--sam3_bpe", default=None,
+                   help="path to bpe_simple_vocab_16e6.txt.gz. Auto-detected "
+                        "under ./sam3/ when absent. Needed because the "
+                        "upstream pkg_resources fallback dies when 'sam3' "
+                        "resolves as a namespace package.")
+    p.add_argument("--sam3_conf", type=float, default=0.5,
+                   help="Sam3Processor.confidence_threshold — drops instances "
+                        "INSIDE the processor, before the merge. Distinct from "
+                        "--score_thresh and recorded separately.")
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--out_root", default="results/sam3")
     p.add_argument("--tag", default="")
@@ -370,7 +478,9 @@ def main():
     out_dir = Path(increment_path(Path(a.out_root) / tag))
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    processor = load_sam3()
+    processor = load_sam3(a.sam3_ckpt, a.sam3_version,
+                          a.sam3_resolution, a.sam3_conf, (H, W),
+                          a.sam3_bpe)
 
     m = {k: SegMetric(K_METRIC, device="cpu")
          for k in ("clean_all", "clean_rem", "adv_all", "adv_rem")}
@@ -491,6 +601,8 @@ def main():
                    "merge_rule": {"kind": "per_pixel_argmax_over_prompt_scores",
                                   "instance_reduce": "max(mask_prob * score)",
                                   "score_thresh": a.score_thresh,
+                                  "sam3_confidence_threshold": a.sam3_conf,
+                                  "sam3_resolution": a.sam3_resolution,
                                   "below_thresh": "UNASSIGNED",
                                   "unassigned_index": UNASSIGNED},
                    "prompts": prompts,
