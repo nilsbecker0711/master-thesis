@@ -1,6 +1,6 @@
 #!/bin/bash
-#SBATCH -p dev_gpu_a100_il
-#SBATCH -t 00:30:00
+#SBATCH -p gpu_a100_short
+#SBATCH -t 00:05:00
 #SBATCH -N 1
 #SBATCH -n 1
 #SBATCH --gres=gpu:1
@@ -53,10 +53,10 @@ set -u
 # sbatch was invoked from and names it SLURM_SUBMIT_DIR. The BASH_SOURCE form
 # is only the fallback for running this by hand on a login node.
 ROOT="${REPO_ROOT:-${SLURM_SUBMIT_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}}"
-
+LOSS="cospgd"  # the thesis uses cospgd for the main table, ce for the baseline
 ARCH=segformer_b0
 CS="${CS:-/pfs/work9/workspace/scratch/ma_nilbecke-thesis/data/cityscapes}"
-OUTROOT="results/runs/bench_nesti/$ARCH"
+OUTROOT="results/runs/bench_nesti/$LOSS/$ARCH"
 
 # Geometry. 0.25 is the operating point the rest of the thesis uses, and
 # because scale_ref='height' fixes coverage by aspect ratio alone it is
@@ -84,7 +84,7 @@ PROTO="--arch $ARCH --cityscapes_root $CS --img_h 1024 --img_w 2048 \
        --placement center --n_train 250 --train_seed 42 $INFER \
        --val_images 500 --val_every 50 --epochs 200 \
        --optimiser adam --lr_schedule cosine --batch_size 1 \
-       --num_workers 16 --loss_fn cospgd --no_diagnostics --resume"
+       --num_workers 16 --loss_fn $LOSS --no_diagnostics --resume"
 
 # ── the config table: name <TAB> out_dir <TAB> args ──────────────────────────
 # The driver reads this back through --list, so out_dir lives in ONE place.

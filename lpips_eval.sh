@@ -1,7 +1,7 @@
 #!/bin/bash
 #SBATCH -p dev_gpu_a100_il
 #SBATCH -n 1
-#SBATCH -t 00:30:00
+#SBATCH -t 00:10:00
 #SBATCH --mem=40000
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=8
@@ -35,12 +35,12 @@ python --version
 # for the csf patch only means something next to the number it is low
 # relative to. Adjust the globs to the runs you want in the table.
 for cpk in \
-    results/overfit_110/cospgd/deeplab_101/deeplab101_csf_cospgd_img110__t0.5 \
-    results/overfit_110/cospgd/deeplab_101/deeplab101_csf_cospgd_img110__t0.25 \
-    results/overfit_110/cospgd/deeplab_101/deeplab101_csf_cospgd_img110__t1 \
-    results/overfit_110/cos_margin/deeplab_101/deeplab101_csf_cospgd_img110__t2 \
-    results/overfit_110/cos_margin/deeplab_101/deeplab101_csf_cospgd_img110__t5 \
-    results/overfit_110/cos_margin/deeplab_101/deeplab101_raw_cospgd_img110; do
+    results/overfit_464/LAP/Dog_parameterized/cospgd/segformer_b5/segformer_b5_lap_cospgd_img464_from_paper_real \
+    results/overfit_464/LAP/Dog_parameterized/cospgd/segformer_b5/segformer_b5_lap_cospgd_img464_from_paper_train \
+    results/overfit_464/LAP/Dog_parameterized/cospgd/segformer_b5/segformer_b5_lap_cospgd_img464_from_run \
+    results/overfit_464/LAP/Sign_parameterized/cospgd/segformer_b5/segformer_b5_lap_cospgd_img464_from_paper_real \
+    results/overfit_464/LAP/Sign_parameterized/cospgd/segformer_b5/segformer_b5_lap_cospgd_img464_from_paper_train \
+    results/overfit_464/LAP/Sign_parameterized/cospgd/segformer_b5/segformer_b5_lap_cospgd_img464_from_run ; do
   python scripts/lpips_eval.py "$cpk" --source checkpoint --checkpoint best --cityscapes_root $CS --nets alex vgg --anchors --tag ckpt
 done
 echo "Done: $(date)"
