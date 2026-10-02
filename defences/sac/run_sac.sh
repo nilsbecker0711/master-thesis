@@ -78,10 +78,10 @@ SAC_CKPT="${SAC_CKPT:-$MA/checkpoints/sac_coco_at.pth}"
 SAC_URL="https://raw.githubusercontent.com/joellliu/SegmentAndComplete/main/ckpts/coco_at.pth"
 
 ARCH="${ARCH:-segformer_b0}"
-RES="--img_h 512 --img_w 1024"
-TAG=T24_sac
+RES="--img_h 1024 --img_w 2048"
+TAG=raw
 # POINT THIS AT THE ATTACK RUN YOU ARE DEFENDING AGAINST.
-CKPT="${CKPT:-$MA/master-thesis/results/overfit/REPLACE_ME/best.pt}"
+CKPT="${CKPT:-$MA/master-thesis/results/overfit_464/cospgd/segformer_b0/segformer_b0_raw_cospgd_img464/best.pt}"
 
 # ── --fetch: one-time weight download (4.4 MB, login node) ───────────────────
 if [ "${1:-}" = "--fetch" ]; then
@@ -125,7 +125,7 @@ module --ignore_cache load "cuda/11.8"
 source ~/miniconda3/etc/profile.d/conda.sh
 conda activate "$MA/miniconda3/envs/thesis_backup3"
 export PYTHONNOUSERSITE=1
-export LD_LIBRARY_PATH="$LD_LIBRARY_PATH:$MA/miniconda3/lib"
+export LD_LIBRARY_PATH="${LD_LIBRARY_PATH:-}:/pfs/work9/workspace/scratch/ma_nilbecke-thesis/miniconda3/lib"
 cd "$ROOT" || exit 1
 python -c "import sys; print('python', sys.executable)"
 
@@ -145,16 +145,16 @@ SAC="--defence sac --sac_ckpt $SAC_CKPT"
 # ── 1. undefended reference, from the untouched script ───────────────────────
 echo; echo "=== 1/3  undefended eval (scripts/evaluate.py) ==="
 python scripts/evaluate.py --checkpoint "$CKPT" $BASE --from_image \
-    --images fixed10 --diagnostics_on -1 --no_panels --tag "${TAG}_undef"
+    --images 464 --diagnostics_on -1 --no_panels --tag "${TAG}_undef"
 
 # ── 2. defended: the 2x2 + localisation ──────────────────────────────────────
 echo; echo "=== 2/3  defended eval (+ localisation vs the true footprint) ==="
 python defences/evaluate_defended.py --checkpoint "$CKPT" $BASE --from_image \
-    $SAC --images fixed10 --figures --tag "$TAG"
+    $SAC --images 464 --figures --tag "$TAG"
 
 # ── 3. the clean-image price, over the whole val split ───────────────────────
 echo; echo "=== 3/3  clean cost (no patch: every erased pixel is a FP) ==="
-python defences/evaluate_defended.py $BASE $SAC --images all --tag "$TAG"
+python defences/evaluate_defended.py $BASE $SAC --images 464 --tag "$TAG"
 
 echo; echo "done $(date)"
 echo "FIRST: check run 2's undefended drop_remote against run 1's. They are"
