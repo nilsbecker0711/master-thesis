@@ -27,6 +27,7 @@ same reason --inference is decided once in setup_model.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Optional
 
 import torch
 import torch.nn as nn
@@ -42,14 +43,25 @@ class Purified:
              1 = "this is patch", which is the region removed from x01.
     raw_mask [B,1,H,W] float 0/1 — the mask BEFORE completion/post-processing.
 
+    prob     [B,1,H,W] float — the detector's PRE-THRESHOLD score, if it has one.
+
     raw_mask is not diagnostic clutter: SAC's and Jedi's completion steps both
     grow the mask, and growth is what produces false positives on clean images.
     Scoring both against the footprint separates "the detector missed it" from
     "the detector found it and the completion over-grew".
+
+    AND `prob` SEPARATES THE THIRD CASE, WHICH IS THE ONE THAT ACTUALLY HAPPENS.
+    An empty raw_mask is consistent with two completely different failures: the
+    detector scored the patch near zero (out of domain — no threshold rescues
+    it), or it scored it at 0.4 and lost to the 0.5 cut (in domain, wrong
+    operating point — a scale change or a threshold sweep fixes it). Those have
+    opposite conclusions, and a 0/1 mask cannot tell them apart. Keeping the
+    score costs one float map per image.
     """
     x01: torch.Tensor
     mask: torch.Tensor
     raw_mask: torch.Tensor
+    prob: Optional[torch.Tensor] = None
 
     def area_frac(self) -> torch.Tensor:
         """Fraction of the frame the final mask claims, per image. [B]"""

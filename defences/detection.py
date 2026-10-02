@@ -133,3 +133,44 @@ def aggregate_detection(rows) -> dict:
         out[k] = float(v.nanmean()) if bool((~v.isnan()).any()) else NAN
         out[f"{k}_n"] = int((~v.isnan()).sum())
     return out
+
+
+def score_stats(prob, true=None) -> dict:
+    r"""
+    What the detector SCORED, before any threshold. The diagnostic for an empty
+    mask.
+
+    A zero mask has two causes with opposite conclusions:
+
+      in_max near 0      the detector is out of domain on this input. No
+                         threshold, no shape prior and no operating point
+                         rescues it; only retraining or matching the scale it
+                         was trained at.
+      in_max near 0.5    it is in domain and losing to the cut. A threshold
+                         sweep or an --sac_image_scale change moves it.
+
+    `in_` is inside the true footprint, `out_` outside it. Reporting both is the
+    point: a detector that scores 0.4 inside and 0.4 everywhere else has not
+    found anything, it is just uniformly uncertain, and only the CONTRAST
+    between the two says whether there is signal to threshold at all.
+    """
+    if prob is None:
+        return {}
+    p = prob.flatten(1).double() if prob.dim() == 4 else prob.flatten().double()
+    out = {"prob_max": float(p.max()), "prob_mean": float(p.mean()),
+           "prob_q999": float(p.flatten().quantile(0.999))}
+    if true is None:
+        return out
+    t = _as_bool_bchw(true)
+    if t.shape[0] == 1 and prob.shape[0] > 1:
+        t = t.expand(prob.shape[0], -1, -1, -1)
+    pm = prob if prob.dim() == 4 else prob.view(1, 1, *prob.shape[-2:])
+    inside, outside = pm[t.expand_as(pm)], pm[~t.expand_as(pm)]
+    if inside.numel():
+        out.update(in_max=float(inside.max()), in_mean=float(inside.mean()))
+    if outside.numel():
+        out.update(out_max=float(outside.max()), out_mean=float(outside.mean()))
+    if inside.numel() and outside.numel():
+        # The only number that says whether a threshold could ever work here.
+        out["in_out_gap"] = out["in_mean"] - out["out_mean"]
+    return out

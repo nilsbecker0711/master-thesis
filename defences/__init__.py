@@ -22,18 +22,27 @@ share whatever this file does.
       wrapper.py      DefendedSegModel — denormalise, purify, renormalise
       detection.py    predicted mask vs the TRUE footprint
       sac/            Segment and Complete (Liu et al., CVPR 2022)
+      jedi/           Jedi, entropy-based (Tarchoun et al., CVPR 2023)
       evaluate_defended.py
       test_defences.py
 
     --defence none   no wrapper at all
-    --defence sac    Segment and Complete
+    --defence sac    Segment and Complete (learned segmenter + square prior)
+    --defence jedi   entropy threshold + blob cleanup + inpainting
 
-jedi (Tarchoun et al., CVPR 2023) and ram (Yuan et al., IJCV 2024 —
-arXiv:2401.01750, the same paper the bracket taxonomy in
-patchreach/models/registry.py rests on) are named here with a `None` builder so
-`--defence jedi` fails with "not implemented yet" rather than "invalid choice",
-and so a sweep over the full list fails on the cell instead of silently skipping
-it.
+SAC AND JEDI DETECT ON DIFFERENT PRINCIPLES, which is the only reason having both
+is worth anything. SAC is a LEARNED detector: model-independent, but neither
+dataset- nor scale-independent, and the first real run found it out of domain on
+Cityscapes at 1024x2048. Jedi is arithmetic plus twelve calibration scalars, so
+it has no weights to fall out of domain — and it thresholds on local ENTROPY,
+which a contrast budget bounds directly, making it the defence whose detection
+statistic is the same physical quantity the attack constrains.
+
+ram (Yuan et al., IJCV 2024 — arXiv:2401.01750, the same paper the bracket
+taxonomy in patchreach/models/registry.py rests on) is named here with a `None`
+builder so `--defence ram` fails with "not implemented yet" rather than "invalid
+choice", and so a sweep over the full list fails on the cell instead of silently
+skipping it.
 
 RAM WILL NOT LIVE HERE. It refines the attention matrix inside the backbone, so
 it is model surgery rather than an input-space wrapper, and it exists only for
@@ -49,15 +58,11 @@ from .wrapper import DefendedSegModel
 DEFENCES = {
     "none": None,
     "sac": "sac",
-    "jedi": None,
+    "jedi": "jedi",
     "ram": None,
 }
 
 _UNIMPLEMENTED = {
-    "jedi": "Jedi (Tarchoun et al., CVPR 2023). No official code release was "
-            "found, so this needs a reimplementation: windowed Shannon "
-            "entropy, a threshold calibrated on the clean train split, mask "
-            "completion, then inpainting.",
     "ram": "RAM (Yuan et al., IJCV 2024, arXiv:2401.01750). Not an input-space "
            "defence — it rewrites the attention matrix inside the backbone, so "
            "it belongs beside the model, applies only to segformer_*/setr_pup, "
@@ -79,6 +84,9 @@ def build_defence(name: str, device="cpu", log=print, **kw) -> PatchDefence:
     if name == "sac":
         from .sac import SACDefence
         return SACDefence(device=device, log=log, **kw)
+    if name == "jedi":
+        from .jedi import JediDefence
+        return JediDefence(device=device, log=log, **kw)
     raise AssertionError(f"builder for {name!r} is registered but unreachable")
 
 

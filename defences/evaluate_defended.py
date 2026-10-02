@@ -75,7 +75,8 @@ from patchreach.patch.spec import Patch
 from patchreach.utils import get_device, seed_everything, increment_path
 
 from defences import DEFENCES, DefendedSegModel, build_defence
-from defences.detection import aggregate_detection, mask_detection
+from defences.detection import (aggregate_detection, mask_detection,
+                                score_stats)
 from defences.sac.defence import SAC_SQUARE_SIZES
 
 NAN = float("nan")
@@ -105,6 +106,31 @@ def add_defence_args(p):
                    help="SEGMENT only, skip shape completion. The ablation that "
                         "attributes recovery to the segmenter rather than to "
                         "the square prior.")
+    g.add_argument("--jedi_calibration", default=None,
+                   help="JSON of re-measured entropy constants for --defence "
+                        "jedi. THE MOST IMPORTANT KNOB IT HAS: the defaults were "
+                        "measured by the authors on PASCAL/INRIA-scale photos "
+                        "with YOLO patches, and a Cityscapes dashcam frame has a "
+                        "different entropy distribution. Write one with "
+                        "defences.jedi.measure_entropy_stats(). Run the stock "
+                        "constants FIRST so the recalibration is a measured "
+                        "delta rather than an assumption.")
+    g.add_argument("--jedi_fill", default="inpaint",
+                   choices=["inpaint", "grey", "zero"],
+                   help="how the located region is removed. 'inpaint' (cv2 "
+                        "TELEA) is closest to their inpaintCoherent; 'zero' is "
+                        "what SAC does and is therefore the apples-to-apples "
+                        "setting when comparing the two defences.")
+    g.add_argument("--jedi_no_blobs", action="store_true",
+                   help="skip the small-blob cleanup. The ablation separating "
+                        "the entropy threshold from the 0.5%%-of-frame area "
+                        "floor, which at 512x1024 is a 51px side and is a hard "
+                        "detection limit on small patches.")
+    # The optional mask autoencoder is deliberately NOT a flag. Their weights are
+    # not released and the topology is resolution-locked, so any usable one has
+    # to be TRAINED at our resolution on our patch geometry — a square prior,
+    # which is a modelling decision deserving its own script, not a switch.
+    # Reach it as JediDefence(autoencoder=...) from defences.jedi.
     return p
 
 
@@ -120,6 +146,18 @@ def defence_tag(a) -> str:
             bits.append("sq" + "-".join(str(s) for s in a.sac_square_sizes))
         if a.sac_image_scale != 1.0:
             bits.append(f"s{a.sac_image_scale:g}")
+        return "_".join(bits)
+    if a.defence == "jedi":
+        bits = ["jedi"]
+        if a.jedi_fill != "inpaint":
+            bits.append(a.jedi_fill)
+        if a.jedi_no_blobs:
+            bits.append("noblob")
+        # The calibration MUST appear in the path. A run on the authors'
+        # constants and a run on ours are different measurements and must never
+        # land on the same output directory.
+        bits.append("cal-" + (Path(a.jedi_calibration).stem
+                              if a.jedi_calibration else "stock"))
         return "_".join(bits)
     return a.defence
 
@@ -139,6 +177,9 @@ def wrap(a, model, device):
                   square_sizes=(a.sac_square_sizes or SAC_SQUARE_SIZES),
                   image_scale=a.sac_image_scale,
                   complete=not a.sac_no_complete)
+    if a.defence == "jedi":
+        kw = dict(calibration=a.jedi_calibration, fill=a.jedi_fill,
+                  blobs=not a.jedi_no_blobs)
     mean_t, std_t = norm_tensors(device)
     defence = build_defence(a.defence, device=device, **kw)
     wrapped = DefendedSegModel(model, defence, mean_t, std_t).to(device)
@@ -272,11 +313,13 @@ def main():
                 det_clean = mask_detection(model.last.mask, None)
                 det_clean["raw_fp_area_frac"] = mask_detection(
                     model.last.raw_mask, None)["fp_area_frac"]
+                det_clean.update(score_stats(model.last.prob))
                 det_clean_rows.append(det_clean)
                 if attacked:
                     daa = upsample_to(model(patched), hw)
                     det = mask_detection(model.last.mask, fp)
                     det_raw = mask_detection(model.last.raw_mask, fp)
+                    det.update(score_stats(model.last.prob, fp))
                     det_adv_rows.append(det)
                     det_raw_rows.append(det_raw)
 
@@ -340,6 +383,49 @@ def main():
            {"adv": aggregate_detection(det_adv_rows),
             "adv_raw": aggregate_detection(det_raw_rows),
             "clean": aggregate_detection(det_clean_rows)}, pcfg, n_ch, n_act)
+
+
+def _read_empty_mask(da) -> str:
+    r"""
+    An empty mask has three causes with different conclusions. Say which one
+    this is, rather than leaving the reader a table of zeros.
+
+    The deciding quantity is the IN-OUT GAP, not the raw score: a detector
+    scoring 0.4 inside the footprint and 0.4 everywhere else has found nothing,
+    it is uniformly uncertain, and no threshold can create signal that is not
+    there.
+    """
+    if da["in_max"] < 0.1:
+        return f"""    READ THIS AS: OUT OF DOMAIN. The segmenter scored the
+    patch {da['in_max']:.4f} at best, so no threshold, no shape prior and no
+    operating point recovers it.
+
+    SAC is MODEL-independent -- the U-Net never sees the segmentor -- but it is
+    NOT dataset- or SCALE-independent. It is a LEARNED detector, self
+    adversarially trained on COCO patches at detection resolution, and its
+    filters are fixed in absolute pixels.
+
+    TRY, IN ORDER:
+      1. --img_h 512 --img_w 1024, the operating point the rest of the results
+         use. The patch is then 128px rather than 256px and the frame is close
+         to COCO scale. This run was at 1024x2048, the Nesti benchmark
+         resolution, which is the worst case for a learned detector.
+      2. --sac_image_scale to put the patch near the ~100px it was trained on.
+      3. If the in-out gap stays flat under both, only retraining its self
+         adversarial loop on our patches will move it -- and "off-the-shelf SAC
+         does not transfer to Cityscapes" is then a RESULT, not a bug. It just
+         has to be reported with 1 and 2 ruled out, or a reviewer will read it
+         as a configuration error."""
+    if da["in_out_gap"] > 0.05:
+        return f"""    READ THIS AS: IN DOMAIN, WRONG OPERATING POINT. The patch
+    scores {da['in_max']:.4f} inside against {da['out_mean']:.4f} outside, so
+    there IS signal and it is losing to the 0.5 cut. Sweep --sac_image_scale
+    first. Moving the threshold is a DEVIATION from the published method and has
+    to be reported as one."""
+    return f"""    READ THIS AS: UNIFORMLY UNCERTAIN, NO SIGNAL. The in-out gap
+    is only {da['in_out_gap']:+.4f}, so the detector is not distinguishing the
+    patch from the scene at all. A threshold cannot create signal that is not
+    there, and neither can a scale change."""
 
 
 def report(a, m, per_image, idxs, out_dir, attacked, defended, detection,
@@ -416,6 +502,17 @@ def report(a, m, per_image, idxs, out_dir, attacked, defended, detection,
             print(f"    raw mask (segmenter only): coverage "
                   f"{dr['coverage']:.3f}   area "
                   f"{100*dr['pred_area_frac']:.2f}% of frame")
+            if "in_max" in da:
+                print()
+                print("  --- DETECTOR SCORE, pre-threshold (the 0.5 cut) ---")
+                print(f"    inside  the footprint: max {da['in_max']:.4f}   "
+                      f"mean {da['in_mean']:.4f}")
+                print(f"    outside the footprint: max {da['out_max']:.4f}   "
+                      f"mean {da['out_mean']:.4f}")
+                print(f"    in-out gap {da['in_out_gap']:+.4f}")
+                if da["pred_area_frac"] == 0.0:
+                    print()
+                    print(_read_empty_mask(da))
 
     ciou = m["clean_rem"].per_class()
     key = "dadv_rem" if (attacked and defended) else (
