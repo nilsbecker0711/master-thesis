@@ -324,14 +324,14 @@ def test_wrapper_reports_the_inner_inference_mode():
 
 def test_unimplemented_defences_are_named_and_fail_informatively():
     """
-    jedi and ram are registered with a None builder so a sweep over the full
-    list fails on the cell rather than silently skipping it, and so the error
-    says 'not implemented' rather than 'invalid choice'.
+    ram is registered with a None builder so a sweep over the full list fails on
+    the cell rather than silently skipping it, and so the error says 'not
+    implemented' rather than 'invalid choice'. sac and jedi are implemented;
+    see test_jedi.py for jedi's own suite.
     """
     assert {"none", "sac", "jedi", "ram"} <= set(DEFENCES)
-    for name in ("jedi", "ram"):
-        with pytest.raises(SystemExit, match="not implemented yet"):
-            build_defence(name)
+    with pytest.raises(SystemExit, match="not implemented yet"):
+        build_defence("ram")
 
 
 def test_unknown_defence_lists_the_known_ones():

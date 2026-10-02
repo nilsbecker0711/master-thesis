@@ -106,6 +106,31 @@ def add_defence_args(p):
                    help="SEGMENT only, skip shape completion. The ablation that "
                         "attributes recovery to the segmenter rather than to "
                         "the square prior.")
+    g.add_argument("--jedi_calibration", default=None,
+                   help="JSON of re-measured entropy constants for --defence "
+                        "jedi. THE MOST IMPORTANT KNOB IT HAS: the defaults were "
+                        "measured by the authors on PASCAL/INRIA-scale photos "
+                        "with YOLO patches, and a Cityscapes dashcam frame has a "
+                        "different entropy distribution. Write one with "
+                        "defences.jedi.measure_entropy_stats(). Run the stock "
+                        "constants FIRST so the recalibration is a measured "
+                        "delta rather than an assumption.")
+    g.add_argument("--jedi_fill", default="inpaint",
+                   choices=["inpaint", "grey", "zero"],
+                   help="how the located region is removed. 'inpaint' (cv2 "
+                        "TELEA) is closest to their inpaintCoherent; 'zero' is "
+                        "what SAC does and is therefore the apples-to-apples "
+                        "setting when comparing the two defences.")
+    g.add_argument("--jedi_no_blobs", action="store_true",
+                   help="skip the small-blob cleanup. The ablation separating "
+                        "the entropy threshold from the 0.5%%-of-frame area "
+                        "floor, which at 512x1024 is a 51px side and is a hard "
+                        "detection limit on small patches.")
+    # The optional mask autoencoder is deliberately NOT a flag. Their weights are
+    # not released and the topology is resolution-locked, so any usable one has
+    # to be TRAINED at our resolution on our patch geometry — a square prior,
+    # which is a modelling decision deserving its own script, not a switch.
+    # Reach it as JediDefence(autoencoder=...) from defences.jedi.
     return p
 
 
@@ -121,6 +146,18 @@ def defence_tag(a) -> str:
             bits.append("sq" + "-".join(str(s) for s in a.sac_square_sizes))
         if a.sac_image_scale != 1.0:
             bits.append(f"s{a.sac_image_scale:g}")
+        return "_".join(bits)
+    if a.defence == "jedi":
+        bits = ["jedi"]
+        if a.jedi_fill != "inpaint":
+            bits.append(a.jedi_fill)
+        if a.jedi_no_blobs:
+            bits.append("noblob")
+        # The calibration MUST appear in the path. A run on the authors'
+        # constants and a run on ours are different measurements and must never
+        # land on the same output directory.
+        bits.append("cal-" + (Path(a.jedi_calibration).stem
+                              if a.jedi_calibration else "stock"))
         return "_".join(bits)
     return a.defence
 
@@ -140,6 +177,9 @@ def wrap(a, model, device):
                   square_sizes=(a.sac_square_sizes or SAC_SQUARE_SIZES),
                   image_scale=a.sac_image_scale,
                   complete=not a.sac_no_complete)
+    if a.defence == "jedi":
+        kw = dict(calibration=a.jedi_calibration, fill=a.jedi_fill,
+                  blobs=not a.jedi_no_blobs)
     mean_t, std_t = norm_tensors(device)
     defence = build_defence(a.defence, device=device, **kw)
     wrapped = DefendedSegModel(model, defence, mean_t, std_t).to(device)
