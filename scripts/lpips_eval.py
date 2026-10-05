@@ -828,8 +828,22 @@ def main(argv=None):
 
     all_rows = []
     for run in a.runs:
+        # A PATH THAT DOES NOT EXIST IS NOT "no config.json". The two were
+        # reported with one message, and a mistyped arch name (deeplab101 for
+        # the registry's deeplab_101) then looked like a run whose config had
+        # gone missing -- fourteen of them in a row, exit code 0.
+        if not run.exists():
+            print(f"[skip] {run}: no such directory")
+            if run.parent.is_dir():
+                import difflib
+                near = difflib.get_close_matches(
+                    run.name, [p.name for p in run.parent.iterdir()
+                               if p.is_dir()], n=3, cutoff=0.5)
+                if near:
+                    print(f"        did you mean: {', '.join(near)}")
+            continue
         if not (run / "config.json").exists():
-            print(f"[skip] {run}: no config.json")
+            print(f"[skip] {run}: directory exists but holds no config.json")
             continue
         cfg = json.loads((run / "config.json").read_text())
 
@@ -926,6 +940,15 @@ def main(argv=None):
         write_csv(all_rows, a.out_csv)
         print(f"\n[done] {len(all_rows)} rows -> {a.out_csv}")
 
+    if not all_rows:
+        # FAIL LOUDLY. A scoring run that scored nothing is a failure, and
+        # exiting 0 let a shell loop and an sbatch job both report success
+        # while producing no output at all.
+        print(f"\n[lpips] nothing scored: none of the {len(a.runs)} path(s) "
+              f"given yielded an image. See the [skip] lines above.")
+        return 1
+    return 0
+
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

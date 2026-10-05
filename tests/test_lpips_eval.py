@@ -374,3 +374,43 @@ def test_main_scores_best_pngs_when_best_is_asked_for(tmp_path, monkeypatch):
     import csv
     row = next(csv.DictReader(open(run / "lpips_b" / "per_image.csv")))
     assert (row["source"], row["png_shows"]) == ("png", "best")
+
+
+def test_missing_directory_is_not_reported_as_missing_config(tmp_path,
+                                                             capsys,
+                                                             monkeypatch):
+    """
+    A mistyped arch name (deeplab101 for deeplab_101) must say the path does
+    not exist, name the near miss, and exit non-zero -- not report a config
+    that was never there and return success.
+    """
+    monkeypatch.setattr(le, "build_metrics", lambda nets, device,
+                        spatial=False: {n: MAD() for n in nets})
+    (tmp_path / "deeplab_101_csf_cospgd_img464_t2").mkdir()
+    rc = le.main([str(tmp_path / "deeplab101_csf_cospgd_img464_t2"),
+                  "--device", "cpu"])
+    out = capsys.readouterr().out
+    assert "no such directory" in out
+    assert "did you mean: deeplab_101_csf_cospgd_img464_t2" in out
+    assert "no config.json" not in out
+    assert rc == 1
+
+
+def test_existing_directory_without_config_says_so(tmp_path, capsys,
+                                                   monkeypatch):
+    monkeypatch.setattr(le, "build_metrics", lambda nets, device,
+                        spatial=False: {n: MAD() for n in nets})
+    (tmp_path / "run").mkdir()
+    rc = le.main([str(tmp_path / "run"), "--device", "cpu"])
+    out = capsys.readouterr().out
+    assert "holds no config.json" in out
+    assert rc == 1
+
+
+def test_a_successful_run_returns_zero(tmp_path, monkeypatch):
+    monkeypatch.setattr(le, "build_metrics", lambda nets, device,
+                        spatial=False: {n: (_SpatialMAD() if spatial
+                                            else MAD()) for n in nets})
+    run = _fake_run(tmp_path)
+    assert le.main([str(run), "--tag", "ok", "--panels", "0",
+                    "--device", "cpu"]) == 0
