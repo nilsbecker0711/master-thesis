@@ -1,37 +1,70 @@
 #!/bin/bash
-#SBATCH -p dev_gpu_a100_il   # Use the dev_gpu_4_a100 partition with A100 GPUs dev_gpu_4
+#SBATCH -p dev_gpu_a100_il     # Use the dev_gpu_4_a100 partition with A100 GPUs dev_gpu_4
 #SBATCH -n 1                   # Number of tasks (1 for single node)
-#SBATCH -t 00:10:00            # Time limit (10 minutes for debugging purposes)
-#SBATCH --mem=40000        # Memory request (adjust as needed)
+#SBATCH -t 00:30:00            # Time limit
+#SBATCH --mem=400000           # Memory request (adjust as needed)
 #SBATCH --gres=gpu:1           # Request 1 GPU (adjust if you need more)
 #SBATCH --cpus-per-task=16     # Number of CPUs per GPU (16 for A100)
 #SBATCH --ntasks-per-node=1    # Number of tasks per node (1 in this case)
 ##SBATCH --output=slurm/attack_%J_%j_%a.out
 ##SBATCH --error=slurm/attack_%J_%j_%a.err
 
+# T17 transfer matrix. One invocation per arm; the arm is three arguments:
+#   --loss_fn L --csf --tau T   ->  <arch>_csf_L_img464_tT/best.pt
+#   --loss_fn L                 ->  <arch>_raw_L_img464/best.pt
+# Archs, resolution and inference mode are discovered from the source runs.
+# -> results/matrix_464/<loss>/<arm>/matrix.json
+
+set -uo pipefail              # NOT -e: one failed arm must not kill the rest
+
 echo "Running on $(hostname)"
 echo "Date: $(date)"
 
 module --ignore_cache load "cuda/11.8"
 
-# initialize YOUR conda
-
 source ~/miniconda3/etc/profile.d/conda.sh
 conda activate /pfs/work9/workspace/scratch/ma_nilbecke-thesis/miniconda3/envs/thesis_backup3
-#export PYTHONNOUSERSITE=1
-export LD_LIBRARY_PATH=$/pfs/work9/workspace/scratch/ma_nilbecke-thesis/miniconda3/lib
-export CS=/pfs/work9/workspace/scratch/ma_nilbecke-thesis/data/cityscapes
-export RES="--img_h 512 --img_w 1024"     # revisit after Phase 0.1
-export BASE="--arch segformer --cityscapes_root $CS"
+export PYTHONNOUSERSITE=1
+export LD_LIBRARY_PATH=${LD_LIBRARY_PATH:-}:/pfs/work9/workspace/scratch/ma_nilbecke-thesis/miniconda3/lib
+export CS=${CS:-/pfs/work9/workspace/scratch/ma_nilbecke-thesis/data/cityscapes}
+
 echo "Python path:"
 which python
-python -c "import sys; print(sys.executable)"
-
 echo "Python version:"
 python --version
-#--lap_freeze_edges --lap_edge_thresh 0.15 --patch_scale 0.35
-#python scripts/overfit.py --arch segformer --cityscapes_root $CS --patch_mode csf --from_image --loss_fn ipatch_cospgd --target_class 16 --image 420 --steps 1000 --lr 0.2 --csf_threshold 0.25 --csf_enforce realised --seeds 5 --log_every 50 --out_root results/overfit --tag targeted_train_n5
-export PYTHONNOUSERSITE=1
-#python scripts/overfit.py --arch setr_pup --cityscapes_root $CS --img_h 512 --img_w 1024 --patch_mode csf --from_image --patch_size 128 --patch_scale 0.25 --placement center --csf_threshold 0.25 --csf_enforce realised --loss_fn ce --image 42 --steps 1000 --lr 0.2 --lr_schedule cosine --seeds 1
 
-python scripts/transfer_matrix.py --cityscapes_root $CS --archs segformer_b0 segformer_b5 deeplab_101 deeplab_50 deeplab_18 setr_pup --losses cospgd ce --train_image 420 --transfer_image 42 --overfit_root results/matrix_src --out_root results/matrix/raw_0.25  --patch_mode raw
+# TAU IS A STRING, spelled as the run directory spells it: 0.25 -> _t0.25
+: "${LOSSES:=ce}"
+: "${TAUS:=0.25}"
+: "${DO_RAW:=0}"
+: "${TAG:=T17_transfer}"
+
+echo "LOSSES=[$LOSSES]  TAUS=[$TAUS]  DO_RAW=$DO_RAW  TAG=$TAG"
+
+n_ok=0; n_fail=0; started=$SECONDS
+
+run () {                      # run <loss> [--csf --tau T]
+  local loss="$1"; shift
+  local t0=$SECONDS
+  echo ""
+  echo "---- $loss $*   ($(date +%H:%M:%S))"
+  if python scripts/transfer_matrix.py --cityscapes_root "$CS" \
+        --loss_fn "$loss" --tag "$TAG" "$@"; then
+    printf '     ok    %5ds\n' $(( SECONDS - t0 ))
+    n_ok=$(( n_ok + 1 ))
+  else
+    printf '     FAIL  %5ds   %s %s\n' $(( SECONDS - t0 )) "$loss" "$*"
+    n_fail=$(( n_fail + 1 ))
+  fi
+}
+
+for L in $LOSSES; do
+  # raw first: it is the ceiling on what any tau can transfer
+  if [ "$DO_RAW" = "1" ]; then run "$L"; fi
+  for T in $TAUS; do run "$L" --csf --tau "$T"; done
+done
+
+echo ""
+printf '%d ok, %d failed, %dh %dm\n' "$n_ok" "$n_fail" \
+  $(( (SECONDS-started)/3600 )) $(( ((SECONDS-started)%3600)/60 ))
+echo "-> results/matrix_464/<loss>/<arm>/matrix.json"
