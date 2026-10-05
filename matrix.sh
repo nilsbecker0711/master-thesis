@@ -1,8 +1,8 @@
 #!/bin/bash
 #SBATCH -p dev_gpu_a100_il     # one arm per array task; whole grid -> gpu_a100_il + 06:00:00
 #SBATCH -n 1                   # Number of tasks (1 for single node)
-#SBATCH -t 00:25:00            # Time limit (an arm is ~4-8 min; 25 fits the dev cap)
-#SBATCH --mem=200000           # Memory request (1024x2048 + slide needs room)
+#SBATCH -t 00:30:00            # Time limit (an arm is ~4-8 min; 30 is the dev cap)
+#SBATCH --mem=400000           # Memory request (1024x2048 + slide needs room)
 #SBATCH --gres=gpu:1           # Request 1 GPU
 #SBATCH --cpus-per-task=16     # Number of CPUs per GPU (16 for A100)
 #SBATCH --ntasks-per-node=1    # Number of tasks per node (1 in this case)
@@ -54,11 +54,15 @@ echo "Python version:"
 python --version
 
 # ── the grid ────────────────────────────────────────────────────────────────
-# Override from the command line, e.g.
-#   LOSSES=ce TAUS=0.5 DO_RAW=0 sbatch matrix.sh
-: "${LOSSES:=ce cospgd cos_margin}"
-: "${TAUS:=0.05 0.25 0.5}"
-: "${DO_RAW:=1}"
+# Narrowed to the one arm that is actually on disk. Widen from the command
+# line as the 464 block fills in, e.g.
+#   LOSSES="ce cospgd cos_margin" TAUS="0.05 0.25 0.5" DO_RAW=1 sbatch --array=0-11 matrix.sh
+# TAUS MUST BE WRITTEN AS THE DIRECTORY NAME SPELLS IT. tau is carried as a
+# string, not a float, so 0.25 finds _t0.25 and 25 or 0.250 find nothing --
+# which the script reports by printing what IS on disk.
+: "${LOSSES:=ce}"
+: "${TAUS:=0.25}"
+: "${DO_RAW:=0}"
 : "${TAG:=T17_transfer}"
 
 # ONE ARM IS THE SCHEDULABLE UNIT, and the reason is that the cost of an arm

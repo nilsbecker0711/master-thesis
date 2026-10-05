@@ -14,13 +14,22 @@ checkpoints live, what resolution to evaluate at) is DISCOVERED, not passed.
 
 WHAT IT READS. The overfit_464 layout, one directory per (loss, arch):
 
-    results/overfit_464/ce/deeplab_18/deeplab_18_csf_ce_img464_t0.5/best.pt
-    results/overfit_464/ce/deeplab_18/deeplab_18_raw_ce_img464/best.pt
+    results/overfit_464/ce/deeplab_18_csf_ce_img464_t0.25/best.pt
+    results/overfit_464/ce/deeplab_18_raw_ce_img464/best.pt
 
-The architecture list is whatever subdirectories exist under
-<root>/<loss>/, intersected with the registry -- so the matrix is the shape of
-the block that actually finished, and it says so at startup rather than leaving
-cells blank for runs that were never launched.
+and the same one level deeper, which is what overfit.py writes when its
+--out_root carries the architecture too:
+
+    results/overfit_464/ce/deeplab_18/deeplab_18_csf_ce_img464_t0.25/best.pt
+
+Both are accepted, because the 464 block has been launched both ways. See
+find_run.
+
+The architecture list is every registry architecture that HAS a checkpoint for
+this arm -- so the matrix is the shape of the block that actually finished, and
+it says so at startup rather than leaving cells blank for runs that were never
+launched. A tau that matches nothing is a hard error that prints what IS on
+disk, because a typo'd tau and an unlaunched block otherwise look identical.
 
 WHY EVERY PAIR IS EVALUATED ON BOTH IMAGES. The previous version evaluated
 source==target on the transfer image and source!=target on the train image,
@@ -99,9 +108,11 @@ SHARED_KEYS = ("img_h", "img_w", "inference", "scale")
 
 
 # ── locating the sources ─────────────────────────────────────────────────────
-# One function pair, so a second source layout (the per-image validation sweeps
-# at results/validation_<loss>/<arch>/patches/img%04d/best.pt) becomes another
-# branch here and touches nothing else.
+# Every path question lives in find_run, and discover_archs is defined in terms
+# of it, so the two cannot disagree about what exists. A further source layout
+# -- the per-image validation sweeps at
+# results/validation_<loss>/<arch>/patches/img%04d/best.pt -- becomes another
+# parent in find_run's loop and touches nothing else.
 
 def run_dir_name(arch: str, mode: str, loss: str, image: int, tau) -> str:
     """The leaf directory overfit.py built from its arguments."""
@@ -113,47 +124,87 @@ def run_dir_name(arch: str, mode: str, loss: str, image: int, tau) -> str:
 
 def find_run(root: Path, arch: str, mode: str, loss: str, image: int, tau):
     """
-    <root>/<loss>/<arch>/<name>, tolerating a trailing --tag or an
-    increment_path suffix.
+    The run directory for one (arch, arm), or None.
 
-    The exact name first. Then `<name>_*` ONLY -- never `<name>*`, because that
-    would let a tau=0.5 lookup match a tau=0.55 run, and an img464 lookup match
-    img4640. If more than one survives, that is ambiguity and it raises:
-    silently taking the first would make the table a lottery.
+    TWO LAYOUTS ARE ACCEPTED, because both exist on disk. overfit.py's
+    --out_root decides which, and the 464 block has been launched both ways:
+
+        <root>/<loss>/<name>              flat   (out_root results/overfit_464/$L)
+        <root>/<loss>/<arch>/<name>       nested (out_root results/overfit_464/$L/$A)
+
+    Flat is tried first and both are tried always, so a block that was
+    relaunched partway through a rename still resolves. A run found under BOTH
+    raises rather than picking one -- two directories for the same (arch, arm)
+    are two different runs and the table should not choose between them
+    silently.
+
+    Within a parent: the exact name first, then `<name>_*` ONLY -- never
+    `<name>*`, because that would let a tau=0.5 lookup match a tau=0.55 run and
+    an img464 lookup match img4640. A trailing --tag or an increment_path
+    suffix is therefore tolerated; ambiguity inside one parent raises too.
     """
-    parent = root / loss / arch
     name = run_dir_name(arch, mode, loss, image, tau)
-    exact = parent / name
-    if (exact / "best.pt").exists():
-        return exact
-    if not parent.is_dir():
-        return None
-    cand = sorted(d for d in parent.glob(f"{name}_*")
-                  if d.is_dir() and (d / "best.pt").exists())
-    if len(cand) > 1:
+    hits = []
+    for parent in (root / loss, root / loss / arch):
+        if not parent.is_dir():
+            continue
+        if ((parent / name) / "best.pt").exists():
+            hits.append(parent / name)
+            continue
+        cand = sorted(d for d in parent.glob(f"{name}_*")
+                      if d.is_dir() and (d / "best.pt").exists())
+        if len(cand) > 1:
+            raise SystemExit(
+                f"[matrix] {len(cand)} directories match {parent / name}_* and "
+                f"nothing distinguishes them:\n"
+                + "".join(f"           {c.name}\n" for c in cand)
+                + "         Rename or remove all but one.")
+        hits += cand
+    if len(hits) > 1:
         raise SystemExit(
-            f"[matrix] {len(cand)} directories match {parent / name}_* and "
-            f"nothing distinguishes them:\n"
-            + "".join(f"           {c.name}\n" for c in cand)
-            + "         Rename or remove all but one.")
-    return cand[0] if cand else None
+            f"[matrix] {arch} resolves to {len(hits)} runs for this arm, in "
+            f"both the flat and the nested layout:\n"
+            + "".join(f"           {h}\n" for h in hits)
+            + "         Keep one. They are different runs.")
+    return hits[0] if hits else None
 
 
-def discover_archs(root: Path, loss: str) -> list:
-    """Subdirectories of <root>/<loss>/ that name a registry entry."""
+def discover_archs(root: Path, loss: str, mode: str, image: int, tau) -> list:
+    """
+    Every registry architecture that HAS a run for this arm.
+
+    Driven by find_run rather than by listing directories, for two reasons.
+    The flat layout has no per-arch directory to list -- the architecture is a
+    PREFIX of the run directory name, and arch names contain underscores
+    (deeplab_18, segformer_b0) so splitting the name apart is guesswork where
+    matching against the registry is not. And discovery that asks the same
+    question resolution will ask cannot disagree with it: an arch is in the
+    matrix iff its checkpoint for THIS arm is on disk.
+    """
     parent = root / loss
     if not parent.is_dir():
         raise SystemExit(f"[matrix] no such directory: {parent}\n"
                          f"         --loss_fn {loss} under --overfit_root "
                          f"{root} finds nothing.")
-    found = [d.name for d in parent.iterdir() if d.is_dir()]
-    known = [n for n in found if n in REGISTRY]
-    skipped = sorted(set(found) - set(known))
-    if skipped:
-        print(f"[matrix] ignoring {len(skipped)} non-registry subdirectory(ies) "
-              f"under {parent}: {', '.join(skipped)}")
+    found = [a for a in REGISTRY
+             if find_run(root, a, mode, loss, image, tau) is not None]
+    if not found:
+        # The arm is wrong, or the block is not there. Say which by showing
+        # what IS there -- a tau typo is otherwise indistinguishable from an
+        # unlaunched block, and both print "no architectures found".
+        have = sorted(d.name for d in parent.iterdir() if d.is_dir())[:12]
+        raise SystemExit(
+            f"[matrix] no run found for mode={mode}"
+            + (f" tau={tau}" if mode == "csf" else "")
+            + f" under {parent}/\n"
+            f"         looking for <arch>_"
+            f"{run_dir_name('<arch>', mode, loss, image, tau).split('_', 1)[1]}"
+            f"/best.pt\n"
+            f"         what is actually there:\n"
+            + "".join(f"           {h}\n" for h in have)
+            + ("           ...\n" if len(have) == 12 else ""))
     rank = {a: i for i, a in enumerate(ARCH_ORDER)}
-    return sorted(known, key=lambda a: (rank.get(a, len(rank)), a))
+    return sorted(found, key=lambda a: (rank.get(a, len(rank)), a))
 
 
 def load_json(path: Path) -> dict:
@@ -381,10 +432,8 @@ def main():
                 "is no image transfer to measure.")
 
     root = Path(a.overfit_root)
-    archs = a.archs or discover_archs(root, a.loss_fn)
-    if not archs:
-        raise SystemExit(f"[matrix] no architectures found under "
-                         f"{root / a.loss_fn}/")
+    archs = a.archs or discover_archs(root, a.loss_fn, mode, a.train_image,
+                                      a.tau)
     unknown = [x for x in archs if x not in REGISTRY]
     if unknown:
         raise SystemExit(f"[matrix] not in the registry: {', '.join(unknown)}")
@@ -395,7 +444,10 @@ def main():
     for src in archs:
         run = find_run(root, src, mode, a.loss_fn, a.train_image, a.tau)
         if run is None:
-            missing.append(str(root / a.loss_fn / src /
+            # Only reachable via an explicit --archs: discovery only returns
+            # archs whose run resolved. Reported as the flat path, which is
+            # where overfit.py puts it when --out_root stops at the loss.
+            missing.append(str(root / a.loss_fn /
                                run_dir_name(src, mode, a.loss_fn,
                                             a.train_image, a.tau)))
             ckpts[src] = None
