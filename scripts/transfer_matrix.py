@@ -402,8 +402,9 @@ def main():
     p.add_argument("--overfit_root", default="results/overfit_464")
     p.add_argument("--archs", nargs="+", default=None,
                    help="override the architecture list. Default: every "
-                        "registry-known subdirectory of "
-                        "<overfit_root>/<loss_fn>/.")
+                        "registry architecture that HAS a checkpoint for this "
+                        "arm. Naming one whose run is missing leaves its row "
+                        "blank but keeps its column.")
     p.add_argument("--out_root", default="results/matrix_464")
     p.add_argument("--tag", default="")
     a = p.parse_args()
