@@ -258,3 +258,44 @@ precision is not a confound, and never mix precisions in one table.
   whole-frame native memory before claiming it.
 - Any slide result from before PR #40 that finished did so in spite of the bug.
   The bug affected memory only, never gradients, so those numbers stand.
+
+## 2026-10-05: reporting best.pt instead of final.pt for the overfit block
+
+**Problem.** `overfit.py` saves `best.pt` whenever the remote drop sets a new record,
+but every aggregate it prints and writes -- whole-image mIoU, remote mIoU,
+`any_flip_rate`, realised visibility -- is computed from the patch the run ENDED on.
+The only `best.pt` quantity in `results.json` is `best_drop_remote`. A run that
+degraded after its peak (the `degraded_after_peak` flag) therefore has a drop from
+one patch and a flip rate and a visibility from another, and those cannot share a
+row of a table.
+
+**Fix, evaluation-only.** `scripts/best_checkpoint_stats.py` reloads each run's
+`best.pt` and recomputes the whole row on the image the patch was trained on, under
+the architecture, resolution, scale and inference mode the run recorded in
+`config.json`. Nothing is retrained.
+
+- Reported per run: clean/best whole-image mIoU and its drop, clean/best remote mIoU
+  and its drop, `any_flip_rate`, and realised visibility (nominal and local) for the
+  csf arms.
+- The `final.pt` columns are READ from `results.json`, never recomputed, so the table
+  cannot drift from the run log it sits beside.
+- Placement is taken from the checkpoint rather than re-resolved: the image is the
+  one the patch was trained on, so the stored coordinate is exact, and `--placement
+  gradcam` runs stay readable without rebuilding the CAM.
+- `mode='csf'` always rebuilds the base from the evaluated region
+  (`set_reference_from_image` after the placement is known). It is not a flag here;
+  without it the base is grey and both the drop and the visibility describe a visible
+  square rather than the residual.
+- **Cross-check.** The recomputed `best_drop_remote` is compared against the logged
+  one -- the only number that exists on both sides. A gap over 0.5 mIoU is printed as
+  a warning and flagged in the CSV (`checkpoint_matches_log`); such a row means the
+  reconstruction differs from the run and must not be quoted until explained.
+
+Outputs: `<run>/best_stats.json` beside each checkpoint, plus a collected
+`results/best_eval/best_vs_final_<tag>/best_vs_final.csv`. Launcher `best_eval.sh`.
+
+**Consequence for the text.** Quote `best.pt` for the overfit block and say so once
+in the caption: it is the patch the attack found, `final.pt` is where the optimiser
+happened to stop, and the `delta` column in the printed table is the difference. The
+white-box diagonal in `transfer_matrix_new.py` already reads `best_drop_remote`, so
+this makes the overfit table and the transfer matrix describe the same patch.
