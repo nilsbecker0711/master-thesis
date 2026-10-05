@@ -123,6 +123,15 @@ class PatchConfig:
     # the number it turns on.
     pixel_param: str = "sigmoid"   # sigmoid | direct
 
+    # WHAT A PIXEL MODE STARTS FROM. 'grey' is uniform 0.5 and is every run
+    # recorded before this field existed. 'random' draws each pixel uniformly
+    # from [0,1] -- the random-patch FLOOR the patch literature reports beside
+    # its optimised patch, which matters here because mIoU is scored outside
+    # the footprint, so the clean number is not the comparison. Paired with
+    # --lr 0 it IS that baseline row, at no training cost.
+    # Defaulted, not required, so old checkpoints deserialise unchanged.
+    raw_init: str = "grey"         # grey | random
+
     # ── perceptual constraint (csf.py), mode='csf' only ──────────────────────
     csf_threshold: float = 0.25
     csf_model: str = "barten"
@@ -234,6 +243,19 @@ class PatchConfig:
         if self.pixel_param not in ("sigmoid", "direct"):
             raise ValueError("pixel_param must be sigmoid|direct, got "
                              f"{self.pixel_param!r}")
+        if self.raw_init not in ("grey", "random"):
+            raise ValueError("raw_init must be grey|random, got "
+                             f"{self.raw_init!r}")
+        if self.raw_init == "random" and self.mode not in ("raw",):
+            # Every other mode overrides the pixel init before this branch is
+            # reached — lap seeds from its reference, raw_ganinit from a
+            # BigGAN sample, csf/universal_csf from a projected randn — so
+            # accepting the flag there would silently do nothing and the run
+            # would be filed as a random-init row that is not one.
+            raise ValueError("raw_init='random' supports --patch_mode raw "
+                             f"only, got mode={self.mode!r}. csf and "
+                             "universal_csf already start from a random "
+                             "parameter projected onto the CSF envelope.")
         if self.pixel_param == "direct" and self.mode != "raw":
             # lap seeds through lap.logit_seed() and raw_ganinit through a
             # BigGAN sample in logit space; csf/universal_csf parameterise
@@ -465,17 +487,36 @@ class Patch:
             return torch.randn(3, c.size, c.size,
                                device=self.device).requires_grad_(True)
 
+        # THE BASELINE COLUMN. raw_init='grey' is the default and every run
+        # recorded before this existed; 'random' draws each pixel uniformly
+        # from [0,1], which is the RANDOM PATCH the patch-attack literature
+        # reports as its floor (Nesti et al. WACV 2022 quote it beside the
+        # optimised patch, because mIoU is scored outside the patch area and
+        # the clean number therefore is NOT the right comparison).
+        #
+        # Grey and random are different controls and neither substitutes for
+        # the other: grey isolates OCCLUSION, random isolates "an arbitrary
+        # patch of this size at this position". Run at --lr 0 both are free.
+        #
+        # Note the asymmetry with mode='csf'/'universal_csf': those already
+        # initialise from randn and project onto the CSF envelope, so their
+        # --lr 0 run is a random patch AT TAU with no flag needed. Only the
+        # pixel modes start from grey.
+        pixels = (torch.rand(3, c.size, c.size, device=self.device)
+                  if c.raw_init == "random"
+                  else torch.full((3, c.size, c.size), 0.5,
+                                  device=self.device))
         if c.pixel_param == "direct":
             # 0.5 DIRECTLY. Both parameterisations must start from the
             # SAME IMAGE -- uniform mid grey -- or the ablation compares
             # two runs that began at different patches and attributes the
             # difference to the step rule. sigmoid(0) = 0.5 is what the
             # branch below relies on for exactly the same reason.
-            return torch.full((3, c.size, c.size), 0.5,
-                              device=self.device).requires_grad_(True)
-        # raw: zeros -> sigmoid -> uniform 0.5 grey
-        return torch.zeros(3, c.size, c.size,
-                           device=self.device).requires_grad_(True)
+            return pixels.clone().requires_grad_(True)
+        # raw: zeros -> sigmoid -> uniform 0.5 grey. Through logit_seed so the
+        # random branch round-trips exactly (sigmoid(param) == pixels at step
+        # 0) and takes the one init code path the module docstring names.
+        return lap_mod.logit_seed(pixels).clone().requires_grad_(True)
 
     def _require_generator(self):
         if self.G is None:

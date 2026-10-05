@@ -416,12 +416,14 @@ def test_attack_image_does_not_write_step_images_by_default(tmp_path):
     optimise.attack_image(model, img, label, patch, steps=6, log_every=3,
                           num_classes=4, clean_logits=clean, out_dir=tmp_path,
                           verbose=False)
-    assert not list(tmp_path.glob("patch_step*.png"))
+    assert not list(tmp_path.rglob("patch_step*.png"))
 
     optimise.attack_image(model, img, label, patch, steps=6, log_every=3,
                           num_classes=4, clean_logits=clean, out_dir=tmp_path,
                           save_step_images=True, verbose=False)
-    assert list(tmp_path.glob("patch_step*.png"))
+    # ... and when on, into their own subdirectory, never loose in the run.
+    assert not list(tmp_path.glob("patch_step*.png"))
+    assert list((tmp_path / "intermediate_patches").glob("patch_step*.png"))
 
 
 def test_non_finite_loss_raises_rather_than_poisoning_adam():

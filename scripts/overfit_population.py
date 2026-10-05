@@ -83,7 +83,8 @@ from patchreach.diagnostics import aggregate, report
 from patchreach.metrics import population as pop_mod
 from patchreach.patch import optimise, segmentation_cam
 from patchreach.patch.spec import Patch
-from patchreach.utils import get_device, seed_everything, increment_path
+from patchreach.utils import (get_device, seed_everything, increment_path,
+                              atomic_save)
 
 
 def build_parser():
@@ -298,9 +299,9 @@ def main():
         # recoverable from the per-image records, so losing them to a walltime
         # kill would cost the whole run rather than the current image. The same
         # is true of every tensor in the aggregate suite.
-        torch.save(pop.state_dict(), state_path)
+        atomic_save(pop.state_dict(), state_path)
         if diag is not None:
-            torch.save(diag.state_dict(), agg_path)
+            atomic_save(diag.state_dict(), agg_path)
         with open(out_dir / "records.jsonl", "a") as f:
             f.write(json.dumps({k: v for k, v in rec.items()
                                 if k != "history"}) + "\n")

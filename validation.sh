@@ -1,8 +1,8 @@
 #!/bin/bash
 #SBATCH -p gpu_a100_il
 #SBATCH -n 1
-#SBATCH -t 08:00:00
-#SBATCH --mem=100000
+#SBATCH -t 24:00:00
+#SBATCH --mem=400000
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=16
 #SBATCH --ntasks-per-node=1
@@ -81,11 +81,13 @@ export SEED=68
 #                        flat tail is the evidence, and the run prints
 #                        NOT CONVERGED in words if the tail is still climbing.
 export TAU=0.25
-export LR=0.2
-export STEPS=1000
+export LR=0.1
+export STEPS=2000
+export ARCH = "segformer_b0"
+export LOSS = "ce"
 
-export BASE="--arch segformer --cityscapes_root $CS --img_h 512 --img_w 1024"
-export ATTACK="--patch_mode csf --from_image --loss_fn cospgd --csf_threshold $TAU --placement center"
+export BASE="--arch $ARCH --cityscapes_root $CS --img_h 512 --img_w 1024"
+export ATTACK="--patch_mode raw --loss_fn $LOSS  --placement center"
 # --lr_schedule cosine is non-negotiable at this lr. A flat lr was measured
 # swinging 9.6 mIoU points across four identical single-image runs, because
 # Adam's step is ~lr per coordinate whatever the gradient is, so the run never
@@ -100,16 +102,12 @@ export PANELS="--n_panels 3 --panel_select best --select_key drop_remote"
 # Explicit rather than auto-incremented, because --resume needs a stable path
 # and because this is meant to be THE directory for this claim rather than
 # run_3 of an accreting pile.
-export OUT="results/validation/segformer_csf_tau${TAU}_lr${LR}_s${STEPS}_n${N}"
+export OUT="results/validation/${ARCH}_raw_${LOSS}_lr${LR}_s${STEPS}_n${N}"
 
 # ── 0. PILOT — 5 images, so the walltime is arithmetic and not a guess ───────
 # 1000 steps is 3.3x population.sh's 300, and this is the first time this
 # config runs at length over a population. The pilot prints s/img; multiply by
 # N before trusting the -t above.
-python scripts/overfit_population.py $BASE $ATTACK $RUN \
-    --images random --n_images 5 --sample_seed $SEED \
-    --n_panels 1 --panel_select best \
-    --out_dir "${OUT}_pilot"
 
 # ── 1. THE RUN ───────────────────────────────────────────────────────────────
 python scripts/overfit_population.py $BASE $ATTACK $RUN $PANELS \

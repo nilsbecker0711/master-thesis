@@ -7,6 +7,7 @@ from this repo alone.
 """
 from __future__ import annotations
 
+import os
 import random
 import sys
 from contextlib import contextmanager
@@ -18,6 +19,27 @@ import torch
 
 def get_device() -> torch.device:
     return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+
+def atomic_save(obj, path) -> None:
+    """Write to a temporary file, then rename over the target.
+
+    A plain torch.save that is interrupted leaves a TRUNCATED file, and the
+    next --resume dies in torch.load with nothing to fall back on. That is a
+    live risk rather than a theoretical one: both the population loop and
+    train.py checkpoint precisely so they can be killed at the walltime, and
+    a driver feeding short slices kills them dozens to hundreds of times.
+    os.replace is atomic on POSIX and on Windows, so the worst case becomes a
+    checkpoint one unit of work stale rather than a run that cannot resume.
+
+    Lives here, not in a script, because two callers now depend on the
+    guarantee and a second copy is how the two drift apart. Same pattern as
+    sweep_operating_point.py's sweep.json write.
+    """
+    path = Path(path)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    torch.save(obj, tmp)
+    os.replace(tmp, path)
 
 
 def seed_everything(seed: int) -> None:

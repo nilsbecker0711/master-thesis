@@ -1,8 +1,8 @@
 #!/bin/bash
-#SBATCH -p gpu_a100_short   # Use the dev_gpu_4_a100 partition with A100 GPUs dev_gpu_4
+#SBATCH -p dev_gpu_a100_il   # Use the dev_gpu_4_a100 partition with A100 GPUs dev_gpu_4
 #SBATCH -n 1                   # Number of tasks (1 for single node)
-#SBATCH -t 00:20:00            # Time limit (10 minutes for debugging purposes)
-#SBATCH --mem=40000       # Memory request (adjust as needed)
+#SBATCH -t 00:10:00            # Time limit (10 minutes for debugging purposes)
+#SBATCH --mem=40000        # Memory request (adjust as needed)
 #SBATCH --gres=gpu:1           # Request 1 GPU (adjust if you need more)
 #SBATCH --cpus-per-task=16     # Number of CPUs per GPU (16 for A100)
 #SBATCH --ntasks-per-node=1    # Number of tasks per node (1 in this case)
@@ -33,15 +33,5 @@ python --version
 #python scripts/overfit.py --arch segformer --cityscapes_root $CS --patch_mode csf --from_image --loss_fn ipatch_cospgd --target_class 16 --image 420 --steps 1000 --lr 0.2 --csf_threshold 0.25 --csf_enforce realised --seeds 5 --log_every 50 --out_root results/overfit --tag targeted_train_n5
 export PYTHONNOUSERSITE=1
 #python scripts/overfit.py --arch setr_pup --cityscapes_root $CS --img_h 512 --img_w 1024 --patch_mode csf --from_image --patch_size 128 --patch_scale 0.25 --placement center --csf_threshold 0.25 --csf_enforce realised --loss_fn ce --image 42 --steps 1000 --lr 0.2 --lr_schedule cosine --seeds 1
-export T=5
-export A="segformer_b5"
-for L in cospgd; do
-    python scripts/overfit.py --arch $A --cityscapes_root $CS \
-        --patch_mode raw --shape alpha --reference refs/dog_cut.png --lap_freeze_edges --lap_edge_thresh 0.15  --from_image --patch_scale 0.85 \
-        --placement center --csf_threshold $T --csf_enforce realised \
-        --loss_fn $L --image 464 --steps 600 --lr 0.1 \
-        --lap_alpha 0.0001 --lap_beta 0.2 --lap_gamma 0 \
-        --lr_schedule cosine  --img_w 2048 --img_h 1024 --inference auto --slide_checkpoint\
-        --log_every 20 --out_root results/sizeLPIPS --tag raw\
-        
-done
+
+python scripts/transfer_matrix.py --cityscapes_root $CS --archs segformer_b0 segformer_b5 deeplab_101 deeplab_50 deeplab_18 setr_pup --losses cospgd ce --train_image 420 --transfer_image 42 --overfit_root results/matrix_src --out_root results/matrix/raw_0.25  --patch_mode raw

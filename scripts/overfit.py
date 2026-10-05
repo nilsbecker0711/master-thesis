@@ -114,7 +114,7 @@ def run_one(a, seed: int, model, img, label, device, mean_t, std_t, G,
         loss_fn=a.loss_fn, target_class=a.target_class, steps=a.steps,
         lr=a.lr, optimiser=a.optimiser, num_classes=a.num_classes,
         exclude_footprint=a.exclude_footprint, log_every=a.log_every,
-        lr_schedule=a.lr_schedule,
+        lr_schedule=a.lr_schedule, margin_kappa=a.margin_kappa,
         clean_logits=clean_logits, out_dir=out_dir,
         save_step_images=True, save_best=True, verbose=True)
 
@@ -242,7 +242,13 @@ def summarise(rows, out_dir: Path) -> dict:
 def main():
     p = add_patch_args(add_model_args(argparse.ArgumentParser()))
     p.add_argument("--loss_fn", default="cospgd",
-                   choices=["ce", "cospgd", "ipatch_cospgd", "tsallis"])
+                   choices=["ce", "cospgd", "ipatch_cospgd", "tsallis",
+                            "margin", "cos_margin"])
+    p.add_argument("--margin_kappa", type=float, default=5.0,
+                   help="--loss_fn margin/cos_margin only: required logit "
+                        "margin by "
+                        "which a pixel must leave its CLEAN prediction "
+                        "before it stops drawing gradient.")
     p.add_argument("--from_image", action="store_true",
                     help="Initialise the patch with the image region it will replace.")
     p.add_argument("--target_class", type=int, default=8)

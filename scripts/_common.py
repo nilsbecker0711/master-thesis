@@ -106,6 +106,20 @@ def add_patch_args(p):
                         "pixel and projects it back into [0,1] after "
                         "each step, which is what PGD does. Pair with "
                         "--optimiser sign for the full PGD recipe.")
+    p.add_argument("--raw_init", default="grey",
+                   choices=["grey", "random"],
+                   help="pixel modes (raw/lap-less) only. 'grey' (default) is "
+                        "uniform 0.5 and every run to date. 'random' draws "
+                        "each pixel uniformly from [0,1]: the RANDOM PATCH "
+                        "baseline. Since mIoU here is scored OUTSIDE the "
+                        "footprint, the clean number is not the right "
+                        "comparison for an attack — an arbitrary patch of the "
+                        "same size at the same position is, and that is the "
+                        "column Nesti et al. (WACV 2022) report. Combine with "
+                        "--lr 0 to get it without training. csf and "
+                        "universal_csf ignore this: they already initialise "
+                        "from randn projected onto the CSF envelope, so their "
+                        "--lr 0 run is a random patch at exactly tau.")
     p.add_argument("--shape", default="square",
                    choices=["square", "alpha", "chroma", "auto"],
                    help="silhouette source — the Bg() term of Tan et al. Eq 5. "
@@ -526,6 +540,7 @@ def build_patch(a, device, mean_t, std_t, generator=None,
         placement_xy=tuple(a.placement_xy),
         placement_margin=getattr(a, "placement_margin", 0),
         pixel_param=getattr(a, "pixel_param", "sigmoid"),
+        raw_init=getattr(a, "raw_init", "grey"),
         reference_fit=a.reference_fit, logit_clip=a.logit_clip, shape_bg=a.shape_bg, shape_thresh=a.shape_thresh,
         lap_alpha=a.lap_alpha, lap_beta=a.lap_beta, lap_gamma=a.lap_gamma,
         lap_edge_thresh=a.lap_edge_thresh,

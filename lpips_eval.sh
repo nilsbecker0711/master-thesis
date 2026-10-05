@@ -1,8 +1,8 @@
 #!/bin/bash
-#SBATCH -p gpu_a100_short
+#SBATCH -p dev_gpu_a100_il
 #SBATCH -n 1
-#SBATCH -t 00:30:00
-#SBATCH --mem=20000
+#SBATCH -t 00:10:00
+#SBATCH --mem=40000
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=8
 #SBATCH --ntasks-per-node=1
@@ -34,10 +34,13 @@ python --version
 # Score the csf runs AND an opaque raw run with the same settings: an LPIPS
 # for the csf patch only means something next to the number it is low
 # relative to. Adjust the globs to the runs you want in the table.
-python scripts/lpips_eval.py \
-    results/overfit/*csf* results/population/*csf* \
-    results/overfit/*raw* \
-    --cityscapes_root "$CS" --nets alex vgg --panels 4 \
-    --out_csv results/lpips/lpips_all.csv
-
+for cpk in \
+    results/overfit_464/LAP/Dog_parameterized/cospgd/segformer_b5/segformer_b5_lap_cospgd_img464_from_paper_real \
+    results/overfit_464/LAP/Dog_parameterized/cospgd/segformer_b5/segformer_b5_lap_cospgd_img464_from_paper_train \
+    results/overfit_464/LAP/Dog_parameterized/cospgd/segformer_b5/segformer_b5_lap_cospgd_img464_from_run \
+    results/overfit_464/LAP/Sign_parameterized/cospgd/segformer_b5/segformer_b5_lap_cospgd_img464_from_paper_real \
+    results/overfit_464/LAP/Sign_parameterized/cospgd/segformer_b5/segformer_b5_lap_cospgd_img464_from_paper_train \
+    results/overfit_464/LAP/Sign_parameterized/cospgd/segformer_b5/segformer_b5_lap_cospgd_img464_from_run ; do
+  python scripts/lpips_eval.py "$cpk" --source checkpoint --checkpoint best --cityscapes_root $CS --nets alex vgg --anchors --tag ckpt
+done
 echo "Done: $(date)"
