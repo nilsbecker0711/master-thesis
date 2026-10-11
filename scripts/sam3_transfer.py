@@ -237,7 +237,30 @@ def prompt_all(processor, pil: Image.Image, hw, prompts=PROMPTS):
     future SAM 3 release makes prompting stateful (one prompt leaking into the
     next) this is the line to revisit — check it by prompting one image twice in
     opposite orders and diffing the score maps.
+
+    BF16 AUTOCAST IS MANDATORY, not an optimisation. SAM 3's weights load as
+    fp32 but parts of the ViT trunk run in bf16, so without autocast the
+    forward dies partway through an MLP block with
+
+        RuntimeError: mat1 and mat2 must have the same dtype,
+                      but got BFloat16 and Float
+
+    Autocast casts input AND weight together, which is what makes the mixed
+    state consistent. Every notebook under sam3/examples/ opens with
+    `torch.autocast("cuda", dtype=torch.bfloat16).__enter__()`; the README's
+    image snippet omits it, and that omission is this traceback.
+
+    BOTH calls must be inside it. set_image stores bf16 activations in `state`
+    and set_text_prompt consumes them, so autocasting only the first would move
+    the same error into the decoder.
     """
+    # enabled=False on CPU, so the fp32 path still works for local testing.
+    with torch.autocast("cuda", dtype=torch.bfloat16,
+                        enabled=torch.cuda.is_available()):
+        return _prompt_all_inner(processor, pil, hw, prompts)
+
+
+def _prompt_all_inner(processor, pil, hw, prompts):
     state = processor.set_image(pil)
     score = torch.zeros(K_GT, *hw)
     present, n_inst = {}, {}
