@@ -31,7 +31,14 @@ class MAD(torch.nn.Module):
         return (a - b).abs().mean(dim=(1, 2, 3), keepdim=True)
 
 
-METRICS = {"alex": MAD()}
+def _mad_metrics():
+    """One full-reference Metric named like the real lpips_alex column."""
+    mad = MAD()
+    return {"lpips_alex": le.Metric(
+        "lpips_alex", lambda a, b: float(mad(a * 2 - 1, b * 2 - 1).mean()))}
+
+
+METRICS = _mad_metrics()
 
 
 def _img(seed=0):
@@ -84,15 +91,15 @@ def test_residual_is_scored_and_outside_is_untouched():
     img = _img()
     row, views = le.evaluate_image(patch, img, MEAN, STD, METRICS,
                                     {"from_image": True}, 0.25, True)
-    assert row["lpips_crop_alex"] > 0
+    assert row["lpips_alex_crop"] > 0
     # size == p, so the zero-residual composite is the clean crop exactly
-    assert row["lpips_floor_crop_alex"] == pytest.approx(0.0, abs=1e-6)
-    assert row["lpips_floor_full_alex"] == pytest.approx(0.0, abs=1e-6)
+    assert row["lpips_alex_floor_crop"] == pytest.approx(0.0, abs=1e-6)
+    assert row["lpips_alex_floor_full"] == pytest.approx(0.0, abs=1e-6)
     # dilution: the full frame averages the same change over 4x the area
-    assert row["lpips_full_alex"] < row["lpips_crop_alex"]
+    assert row["lpips_alex_full"] < row["lpips_alex_crop"]
     # no blur, so the residual-only composite IS the patched frame
-    assert row["lpips_resid_full_alex"] == pytest.approx(
-        row["lpips_full_alex"], abs=1e-6)
+    assert row["lpips_alex_resid_full"] == pytest.approx(
+        row["lpips_alex_full"], abs=1e-6)
     assert "visibility" in row
 
 
@@ -100,10 +107,10 @@ def test_anchors_grow_with_epsilon_and_dilute_when_local():
     row, _ = le.evaluate_image(_csf_patch(32), _img(), MEAN, STD, METRICS,
                                {"from_image": True, "image": 420}, 0.25,
                                True, anchors=(4.0, 8.0))
-    g4 = row["anchor_linf4_global_full_alex"]
-    g8 = row["anchor_linf8_global_full_alex"]
+    g4 = row["lpips_alex_anchor_linf4_global"]
+    g8 = row["lpips_alex_anchor_linf8_global"]
     assert 0 < g4 < g8
-    assert row["anchor_linf8_patch_full_alex"] < g8
+    assert row["lpips_alex_anchor_linf8_patch"] < g8
 
 
 def test_floor_is_nonzero_when_the_base_is_resampled():
@@ -111,8 +118,8 @@ def test_floor_is_nonzero_when_the_base_is_resampled():
     patch = _csf_patch(16)
     row, _ = le.evaluate_image(patch, _img(), MEAN, STD, METRICS,
                                {"from_image": True}, 0.25, True)
-    assert row["lpips_floor_crop_alex"] > 0
-    assert row["lpips_floor_full_alex"] > 0
+    assert row["lpips_alex_floor_crop"] > 0
+    assert row["lpips_alex_floor_full"] > 0
 
 
 def test_base_only_restores_render():
@@ -161,7 +168,7 @@ def test_saved_checkpoint_round_trips_through_the_pipeline(tmp_path):
     loaded = Patch.load(tmp_path / "final.pt", DEV, MEAN, STD)
     again, _ = le.evaluate_image(loaded, img, MEAN, STD, METRICS,
                                  {"from_image": True}, 0.25, True)
-    assert again["lpips_crop_alex"] == pytest.approx(live["lpips_crop_alex"])
+    assert again["lpips_alex_crop"] == pytest.approx(live["lpips_alex_crop"])
 
 
 def test_parse_images():
@@ -213,8 +220,8 @@ def test_png_source_matches_checkpoint_source(tmp_path, size, ref, with_ckpt):
     assert png_row["box_from"] == ("checkpoint" if with_ckpt else "center")
     assert views["box"][2] == {"height": 32, "area": 45}[ref]
 
-    shared = [k for k in ck_row if k.startswith("lpips_")]
-    assert any(k.startswith("lpips_floor_") for k in shared)
+    shared = [k for k in ck_row if k.startswith("lpips_alex")]
+    assert any(k.startswith("lpips_alex_floor_") for k in shared)
     for k in shared:
         assert png_row[k] == pytest.approx(ck_row[k], abs=2e-4), k
 
@@ -264,9 +271,11 @@ def test_evaluation_never_touches_existing_run_files(tmp_path, monkeypatch):
     The whole point: scoring a run must leave every file the attack wrote
     byte-identical, and write nothing outside <run>/lpips_<tag>/.
     """
-    monkeypatch.setattr(le, "build_metrics", lambda nets, device,
-                        spatial=False: {n: (_SpatialMAD() if spatial
-                                            else MAD()) for n in nets})
+    monkeypatch.setattr(le, "build_metrics", lambda names, device,
+                        spatial=False: (
+                            {"lpips_alex": le.Metric("lpips_alex",
+                                                     _SpatialMAD())}
+                            if spatial else _mad_metrics()))
     run = _fake_run(tmp_path)
     before = _snapshot(tmp_path)
 
@@ -277,8 +286,9 @@ def test_evaluation_never_touches_existing_run_files(tmp_path, monkeypatch):
     for path, data in before.items():
         assert after[path] == data, f"{path} was modified"
     new = set(after) - set(before)
-    assert new and all(p.parts[:2] == ("run", "lpips_t") for p in new), new
-    assert (run / "lpips_t" / "per_image.csv").exists()
+    assert new and all(p.parts[:3] == ("run", "perc_eval", "t")
+                       for p in new), new
+    assert (run / "perc_eval" / "t" / "per_image.csv").exists()
 
 
 @pytest.mark.parametrize("args", [
@@ -300,8 +310,8 @@ def test_out_csv_never_overwrites_a_foreign_file(tmp_path):
     with pytest.raises(SystemExit):
         le.check_outputs(le.parse_args(["x", "--out_csv",
                                         str(tmp_path / "r.json")]))
-    ours = tmp_path / "lpips.csv"
-    ours.write_text("run,lpips_full_alex\n")
+    ours = tmp_path / "perc.csv"
+    ours.write_text("run,eval_tag,lpips_alex_full\n")
     assert le.check_outputs(le.parse_args(["x", "--out_csv", str(ours)]))
 
 
@@ -365,14 +375,17 @@ def test_explicit_checkpoint_is_never_silently_mislabelled(argv, shows, png):
 
 
 def test_main_scores_best_pngs_when_best_is_asked_for(tmp_path, monkeypatch):
-    monkeypatch.setattr(le, "build_metrics", lambda nets, device,
-                        spatial=False: {n: (_SpatialMAD() if spatial
-                                            else MAD()) for n in nets})
+    monkeypatch.setattr(le, "build_metrics", lambda names, device,
+                        spatial=False: (
+                            {"lpips_alex": le.Metric("lpips_alex",
+                                                     _SpatialMAD())}
+                            if spatial else _mad_metrics()))
     run, _ = _run_with_pngs(tmp_path, "best")
     le.main([str(run), "--checkpoint", "best", "--tag", "b", "--panels", "0",
              "--device", "cpu"])
     import csv
-    row = next(csv.DictReader(open(run / "lpips_b" / "per_image.csv")))
+    row = next(csv.DictReader(open(run / "perc_eval" / "b"
+                                   / "per_image.csv")))
     assert (row["source"], row["png_shows"]) == ("png", "best")
 
 
@@ -384,8 +397,8 @@ def test_missing_directory_is_not_reported_as_missing_config(tmp_path,
     not exist, name the near miss, and exit non-zero -- not report a config
     that was never there and return success.
     """
-    monkeypatch.setattr(le, "build_metrics", lambda nets, device,
-                        spatial=False: {n: MAD() for n in nets})
+    monkeypatch.setattr(le, "build_metrics", lambda names, device,
+                        spatial=False: _mad_metrics())
     (tmp_path / "deeplab_101_csf_cospgd_img464_t2").mkdir()
     rc = le.main([str(tmp_path / "deeplab101_csf_cospgd_img464_t2"),
                   "--device", "cpu"])
@@ -398,8 +411,8 @@ def test_missing_directory_is_not_reported_as_missing_config(tmp_path,
 
 def test_existing_directory_without_config_says_so(tmp_path, capsys,
                                                    monkeypatch):
-    monkeypatch.setattr(le, "build_metrics", lambda nets, device,
-                        spatial=False: {n: MAD() for n in nets})
+    monkeypatch.setattr(le, "build_metrics", lambda names, device,
+                        spatial=False: _mad_metrics())
     (tmp_path / "run").mkdir()
     rc = le.main([str(tmp_path / "run"), "--device", "cpu"])
     out = capsys.readouterr().out
@@ -408,9 +421,108 @@ def test_existing_directory_without_config_says_so(tmp_path, capsys,
 
 
 def test_a_successful_run_returns_zero(tmp_path, monkeypatch):
-    monkeypatch.setattr(le, "build_metrics", lambda nets, device,
-                        spatial=False: {n: (_SpatialMAD() if spatial
-                                            else MAD()) for n in nets})
+    monkeypatch.setattr(le, "build_metrics", lambda names, device,
+                        spatial=False: (
+                            {"lpips_alex": le.Metric("lpips_alex",
+                                                     _SpatialMAD())}
+                            if spatial else _mad_metrics()))
     run = _fake_run(tmp_path)
     assert le.main([str(run), "--tag", "ok", "--panels", "0",
                     "--device", "cpu"]) == 0
+
+
+def test_metric_selection_and_aliases():
+    assert le.parse_args(["r"]).metrics == le.DEFAULT_METRICS
+    assert le.parse_args(["r", "--metrics", "all"]).metrics == le.ALL_METRICS
+    # the deprecated --nets still maps onto the lpips package metrics
+    assert le.parse_args(["r", "--nets", "alex", "vgg"]).metrics == [
+        "lpips_alex", "lpips_vgg"]
+    assert le.parse_args(["r", "--metrics", "dists", "cvvdp"]).metrics == [
+        "dists", "cvvdp"]
+
+
+def test_unknown_metric_is_named_and_never_silently_scored(capsys):
+    """
+    A typo must say so. It ends the run only because nothing else was asked
+    for here -- with a real metric alongside it, the run continues without it.
+    (The lpips package is not installed in the test env, so this cannot ask
+    for one.)
+    """
+    with pytest.raises(SystemExit):
+        le.build_metrics(["definitely_not_a_metric"], DEV)
+    out = capsys.readouterr().out
+    assert "unknown metric" in out and "definitely_not_a_metric" in out
+
+
+def test_a_failing_metric_is_skipped_at_that_size_only(capsys):
+    """
+    A metric that OOMs on the full frame must not end the run, and must not
+    lose the sizes it CAN do: niqe fails on a 64px crop and is fine on the
+    frame.
+    """
+    def picky(ref, dist):
+        if ref.shape[-1] == 8:
+            raise RuntimeError("CUDA out of memory")
+        return 0.5
+
+    metrics = {**_mad_metrics(), "picky": le.Metric("picky", picky)}
+    small = le.score_pair(metrics, torch.zeros(1, 3, 8, 8),
+                          torch.ones(1, 3, 8, 8))
+    assert "lpips_alex" in small and "picky" not in small
+    assert "picky" in metrics                    # the metric itself survives
+    big = le.score_pair(metrics, torch.zeros(1, 3, 16, 16),
+                        torch.ones(1, 3, 16, 16))
+    assert big["picky"] == 0.5                   # still scored where it works
+    assert (8, 8) in metrics["picky"].failed
+    assert "skipping that size" in capsys.readouterr().out
+
+
+def test_no_reference_metrics_score_clean_and_patched_separately():
+    nr = le.Metric("fakeniqe", lambda x: float(x.mean()), kind="nr",
+                   lower_better=False)
+    metrics = {**_mad_metrics(), "fakeniqe": nr}
+    row, _ = le.evaluate_image(_csf_patch(32), _img(), MEAN, STD, metrics,
+                               {"from_image": True}, 0.25, True)
+    for region in ("crop", "ctx", "full"):
+        c = row[f"fakeniqe_{region}_clean"]
+        pt = row[f"fakeniqe_{region}_patched"]
+        assert row[f"fakeniqe_{region}_delta"] == pytest.approx(pt - c)
+    # a no-reference score is NOT a distance: it never enters the FR columns
+    assert "fakeniqe_floor_crop" not in row
+
+
+def test_ppd_matches_the_runs_viewing_geometry():
+    # 0.0114 cm pixel at 50 cm -- the CSFlow default PatchConfig carries
+    assert le.ppd_from_cfg({}) == pytest.approx(76.56, abs=0.5)
+    far = le.ppd_from_cfg({"csf_pixel_size_cm": 0.0114,
+                           "csf_viewing_distance_cm": 100.0})
+    assert far == pytest.approx(2 * le.ppd_from_cfg({}), rel=1e-3)
+
+
+@pytest.mark.parametrize("argv", [
+    ["--out_name", "perc_eval", "--tag", "diagnostics"],
+    ["--out_name", "diagnostics"], ["--out_name", "perc_eval", "--tag", "."],
+    ["--out_name", "perc_eval", "--tag", "a/b"]])
+def test_tag_components_are_validated_too(tmp_path, argv):
+    with pytest.raises(SystemExit):
+        le.check_outputs(le.parse_args([str(tmp_path), *argv]))
+
+
+def test_full_reference_metrics_get_clean_first_modified_second():
+    """
+    pyiqa and cvvdp take the DISTORTED frame first; score_pair hands over
+    (clean, modified). An asymmetric metric would be silently inverted if the
+    wrapper got this backwards, so pin the order the callers rely on.
+    """
+    seen = {}
+
+    def asymmetric(ref, dist):
+        seen["ref"] = float(ref.mean())
+        seen["dist"] = float(dist.mean())
+        return 1.0
+
+    metrics = {"asym": le.Metric("asym", asymmetric)}
+    clean = torch.zeros(1, 3, 8, 8)
+    patched = torch.ones(1, 3, 8, 8)
+    le.score_pair(metrics, clean, patched)
+    assert (seen["ref"], seen["dist"]) == (0.0, 1.0)
