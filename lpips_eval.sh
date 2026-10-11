@@ -1,23 +1,19 @@
 #!/bin/bash
 #SBATCH -p dev_gpu_a100_il
 #SBATCH -n 1
-#SBATCH -t 00:10:00
+#SBATCH -t 00:30:00
 #SBATCH --mem=40000
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=8
 #SBATCH --ntasks-per-node=1
 
-# LPIPS NATURALNESS OF SAVED PATCHES — scripts/lpips_eval.py.
+# FULL PERCEPTUAL EVALUATION OF SAVED PATCHES — scripts/lpips_eval.py.
+# Reasoning lives in that script's docstring; this file only launches it.
 #
-# Runs in the lpips_eval env (envs/lpips_eval.yml), NOT thesis_backup3: no
-# segmentor is loaded, the frames are rebuilt from final.pt / best.pt + the
-# val image. Every run directory gets <run>/lpips/{per_image.csv,summary.json,
-# panel_*.png}; --out_csv collects every row in one table.
-#
-# COMPUTE NODES MAY HAVE NO INTERNET. lpips fetches the torchvision AlexNet /
-# VGG weights on first use; warm the cache once on a login node:
+# COMPUTE NODES MAY HAVE NO INTERNET. Every metric downloads weights on first
+# use, so warm the caches once on a login node:
 #     conda activate lpips_eval
-#     python -c "import lpips; lpips.LPIPS(net='alex'); lpips.LPIPS(net='vgg')"
+#     python -c "import lpips, pyiqa; [lpips.LPIPS(net=n) for n in ('alex','vgg','squeeze')]; [pyiqa.create_metric(m) for m in ('dists','stlpips','lpips+','lpips-vgg+','ahiq','topiq_fr','pieapp','niqe','brisque','clipiqa','musiq')]"
 
 echo "Running on $(hostname)"
 echo "Date: $(date)"
@@ -31,16 +27,21 @@ export PYTHONNOUSERSITE=1
 export CS=/pfs/work9/workspace/scratch/ma_nilbecke-thesis/data/cityscapes
 python --version
 
-# Score the csf runs AND an opaque raw run with the same settings: an LPIPS
-# for the csf patch only means something next to the number it is low
-# relative to. Adjust the globs to the runs you want in the table.
-for cpk in \
-    results/overfit_464/LAP/Dog_parameterized/cospgd/segformer_b5/segformer_b5_lap_cospgd_img464_from_paper_real \
-    results/overfit_464/LAP/Dog_parameterized/cospgd/segformer_b5/segformer_b5_lap_cospgd_img464_from_paper_train \
-    results/overfit_464/LAP/Dog_parameterized/cospgd/segformer_b5/segformer_b5_lap_cospgd_img464_from_run \
-    results/overfit_464/LAP/Sign_parameterized/cospgd/segformer_b5/segformer_b5_lap_cospgd_img464_from_paper_real \
-    results/overfit_464/LAP/Sign_parameterized/cospgd/segformer_b5/segformer_b5_lap_cospgd_img464_from_paper_train \
-    results/overfit_464/LAP/Sign_parameterized/cospgd/segformer_b5/segformer_b5_lap_cospgd_img464_from_run ; do
-  python scripts/lpips_eval.py "$cpk" --source checkpoint --checkpoint best --cityscapes_root $CS --nets alex vgg --anchors --tag ckpt
-done
+# ONE invocation for every run: the metric models load once, not once per
+# directory. Score the csf runs AND an opaque raw one — a perceptual number
+# only means something next to what it is low relative to.
+RUNS=(
+    results/overfit_464/LAP/Dog_parameterized/cospgd/segformer_b5/segformer_b5_lap_cospgd_img464_from_paper_real
+    results/overfit_464/LAP/Dog_parameterized/cospgd/segformer_b5/segformer_b5_lap_cospgd_img464_from_paper_train
+    results/overfit_464/LAP/Dog_parameterized/cospgd/segformer_b5/segformer_b5_lap_cospgd_img464_from_run
+    results/overfit_464/LAP/Sign_parameterized/cospgd/segformer_b5/segformer_b5_lap_cospgd_img464_from_paper_real
+    results/overfit_464/LAP/Sign_parameterized/cospgd/segformer_b5/segformer_b5_lap_cospgd_img464_from_paper_train
+    results/overfit_464/LAP/Sign_parameterized/cospgd/segformer_b5/segformer_b5_lap_cospgd_img464_from_run
+)
+
+python scripts/lpips_eval.py "${RUNS[@]}" \
+    --source checkpoint --checkpoint best --cityscapes_root "$CS" \
+    --metrics all --anchors --tag ckpt \
+    --out_csv results/perc_eval/overfit_464_lap_ckpt.csv
+
 echo "Done: $(date)"

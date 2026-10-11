@@ -1,17 +1,45 @@
 #!/usr/bin/env python
 r"""
-LPIPS evaluation of saved patches — how natural does the frame look afterwards?
+Perceptual evaluation of saved patches — how visible is the frame's change?
 
     conda activate lpips_eval
     python scripts/lpips_eval.py results/overfit/segformer_csf_* \
-        --cityscapes_root $CS --nets alex vgg --out_csv lpips_csf.csv
+        --metrics all --anchors --tag png --out_csv perc_csf.csv
 
 RUNS IN ITS OWN ENVIRONMENT, ON PURPOSE. The attack env is pinned to torch 1.11
-+ mmcv 1.x and `lpips` does not install cleanly into it, so this script never
-touches a segmentor. It imports only the model-free half of patchreach
-(patch/spec.py, patch/csf.py, data/cityscapes.py: torch + torchvision + numpy),
-rebuilds the clean and the patched frame from what the attack scripts already
-saved, and scores the pair. No model, no mmseg, no GPU required.
++ mmcv 1.x and the metric packages do not install cleanly into it, so this
+script never touches a segmentor. It imports only the model-free half of
+patchreach (patch/spec.py, patch/csf.py, data/cityscapes.py: torch +
+torchvision + numpy), rebuilds the clean and the patched frame from what the
+attack scripts already saved, and scores the pair. No mmseg, no GPU required.
+
+METRICS (--metrics, 'all' for every one below). The FIRST name is the primary:
+it drives the console line and the panels, and it should stay lpips_alex
+unless there is a reason, because that is the number the patch-attack
+literature reports (IAP, ICCV 2025, quotes LPIPS over the patch region).
+
+    lpips_alex/vgg/squeeze  the reference `lpips` package (Zhang et al. 2018)
+    dists, stlpips, lpips+  newer full-reference deep metrics via pyiqa;
+    ahiq, topiq_fr, pieapp  DISTS tolerates texture resampling where LPIPS
+    ssim, ms_ssim, fsim     does not, which matters here because the pipeline
+                            blur and the residual are different in exactly
+                            that way. ahiq and topiq_fr read HIGHER = better.
+    cvvdp                   ColorVideoVDP: the only metric here that takes the
+                            VIEWING CONDITIONS, built from the run's own
+                            csf_pixel_size_cm / csf_viewing_distance_cm, so it
+                            and the tau budget describe ONE observer. JOD,
+                            10 = indistinguishable, HIGHER = better.
+    niqe, brisque,          no-reference: naturalness proper, scored on each
+    clipiqa, musiq          frame alone. Reported as _clean / _patched /
+                            _delta, because only the delta is about the patch.
+
+A metric that fails on one region (a transformer out of memory on the full
+1024x2048 frame is the realistic case) is dropped with a message; the rest of
+the evaluation continues.
+
+OUTPUT: <run>/perc_eval/[<tag>/] holds every evaluation of that run —
+per_image.csv, summary.json (with a lower_better map, so no table can rank
+cvvdp or ahiq upside down), panels and per-view PNGs.
 
 TWO SOURCES (--source, default auto = png where the run has them):
 
@@ -46,18 +74,20 @@ it is re-derived from the same val image and placement, exactly as
 overfit_population.py does before its diagnostics. Skip that and render()
 falls back to 0.5 grey — an opaque grey square scored as a "CSF patch".
 
-THREE LPIPS NUMBERS PER IMAGE, because one of them alone misleads:
+THREE REGIONS PER METRIC, because one of them alone misleads. Columns are
+<metric>_<region>, e.g. lpips_alex_crop, dists_full, cvvdp_ctx:
 
-    lpips_crop   clean vs patched, the p x p FOOTPRINT only.  <- the result
-    lpips_ctx    the footprint plus a margin (--context x p per side), so a
+    _crop        clean vs patched, the p x p FOOTPRINT only.  <- the result,
+                 and the quantity the patch literature reports
+    _ctx         the footprint plus a margin (--context x p per side), so a
                  visible seam between patch and surround is counted too.
-    lpips_full   the whole frame. LPIPS is a spatial MEAN, so a 128 px patch
-                 in a 512x1024 frame is diluted ~32x. Reported for
-                 completeness; do not quote it as the naturalness number.
+    _full        the whole frame. These metrics are spatial MEANS, so a 256 px
+                 patch in a 1024x2048 frame is diluted ~32x. Quote it only
+                 against things that cover the SAME area (see ANCHORS).
 
 and two controls, csf modes only, each on crop / ctx / full:
 
-    lpips_floor_*  clean vs the ZERO-RESIDUAL composite: the image's own crop
+    <metric>_floor_*  clean vs the ZERO-RESIDUAL composite: the image's own crop
                    pasted back as the patch, zero optimisation -- the base
                    downsampled to --patch_size and resized back up to p.
                    Nonzero whenever patch_size != int(img_h * patch_scale),
@@ -69,19 +99,19 @@ and two controls, csf modes only, each on crop / ctx / full:
                    initialises the residual AT the tau budget (randn * 10,
                    projected), so step 0 is random noise at tau, not the crop.
 
-    lpips_resid_*  clean vs clean + (patched - base): the residual exactly as
+    <metric>_resid_*  clean vs clean + (patched - base): the residual exactly as
                    pasted, on the SHARP original. Removes the blur without
                    rerunning the attack -- what the CSF residual alone costs.
 
 ANCHORS (--anchors). LPIPS has no absolute threshold, so the script can score
 known reference perturbations on the same frame with the same nets:
 
-    anchor_linf{e}_global_full_*  random +-e/255 sign noise on the whole
+    <metric>_anchor_linf{e}_global  random +-e/255 sign noise on the whole
                    frame. e = 8 is the conventional "imperceptible" L_inf
                    budget, and Laidlaw et al. (ICLR 2021) measured human
                    perceptibility of L_inf 8/255 attacks directly; this puts
                    that budget on YOUR LPIPS scale, for YOUR image.
-    anchor_linf{e}_patch_full_*   the same noise confined to the footprint:
+    <metric>_anchor_linf{e}_patch   the same noise confined to the footprint:
                    the local counterpart, diluted exactly like the patch is.
 
 QUANTISATION. The patched frame is rounded to 8 bit before scoring (turn off
@@ -90,13 +120,18 @@ and near threshold a CSF residual is only a few code values, so a float-only
 score would credit the attack with sub-quantum structure no observer can ever
 receive. `frac_px_changed` records how much of the footprint survives.
 
-LPIPS IS NOT A HUMAN STUDY. It is a learned distance calibrated on 2AFC
-judgements of distortions (Zhang et al. 2018), and it is an independent check
-on the CSF budget precisely because nothing in the attack optimised against it.
-Low LPIPS says "close to the original under a deep-feature metric"; it does not
-say "invisible". Put it next to the realised visibility columns, not in place
-of them — and score a raw (opaque) patch run through this same script so the
-csf number has something to be low relative to.
+NONE OF THESE IS A HUMAN STUDY. They are learned or modelled distances, and
+they are an independent check on the CSF budget precisely because nothing in
+the attack optimised against them. A low value says "close to the original
+under this metric"; it does not say "invisible". Put them next to the realised
+visibility columns, not in place of them — and score a raw (opaque) patch run
+through this same script so the csf numbers have something to be low relative
+to.
+
+RUNNING MANY METRICS IS NOT FREE OF RISK: picking the friendliest one after
+seeing the numbers is metric shopping. Fix the primary metric first, report
+the rest as a robustness check, and say in the text that all of them were
+computed.
 """
 from __future__ import annotations
 
@@ -107,7 +142,7 @@ import math
 import re
 import statistics
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional
 
@@ -250,14 +285,214 @@ def composite(patch, img_norm, mean_t, std_t, quantize: bool,
     return quantize8(out) if quantize else out
 
 
-def score_pair(metrics: Dict[str, "torch.nn.Module"], a: torch.Tensor,
+@dataclass
+class Metric:
+    r"""
+    One perceptual metric, normalised to a single call signature.
+
+    kind='fr'  fn(ref, dist) -> float, both [1,3,H,W] in [0,1]: how far the
+               MODIFIED frame (dist) is from the clean one (ref). The order
+               matters: pyiqa and cvvdp both take the distorted image FIRST,
+               and ahiq/topiq_fr/pieapp are not symmetric, so the wrapper --
+               not the caller -- is where the two conventions meet.
+    kind='nr'  fn(a) -> float: a no-reference score of ONE image. These answer
+               a different question -- "does this look like a photograph?" --
+               and are reported for clean and patched separately, because only
+               their DIFFERENCE is about the patch.
+    """
+    name: str
+    fn: object
+    kind: str = "fr"
+    lower_better: bool = True
+    # Sizes this metric has already failed at. PER SIZE, not per metric: niqe
+    # needs blocks bigger than a 64px crop but is perfectly happy on the full
+    # frame, and a transformer that runs out of memory at 1024x2048 still
+    # scores the footprint. Dropping the metric outright would lose the
+    # region it can do.
+    failed: set = field(default_factory=set)
+
+
+# Full-reference metrics from pyiqa, by our column name -> pyiqa model name.
+# LPIPS stays on the reference `lpips` package (same weights, and it is what
+# every number in this repo so far was measured with); everything else comes
+# from pyiqa, which wraps them all behind one API.
+PYIQA_FR = {
+    "dists": "dists",                 # structure/texture split, tolerates
+                                      # texture resampling where LPIPS does not
+    "stlpips": "stlpips",             # shift-tolerant LPIPS (ECCV 2022)
+    "stlpips_vgg": "stlpips-vgg",
+    "lpips_plus": "lpips+",           # retrained LPIPS variants
+    "lpips_vgg_plus": "lpips-vgg+",
+    "ahiq": "ahiq",                   # ViT+CNN, NTIRE winner (HIGHER better)
+    "topiq_fr": "topiq_fr",           # semantic top-down      (HIGHER better)
+    "pieapp": "pieapp",               # pairwise-preference trained
+    "ssim": "ssim",                   # classics, for readers who expect them
+    "ms_ssim": "ms_ssim",
+    "fsim": "fsim",
+}
+
+# No-reference metrics: naturalness proper, scored on each frame alone.
+PYIQA_NR = {
+    "niqe": "niqe",                   # natural-scene statistics (LOWER better)
+    "brisque": "brisque",
+    "clipiqa": "clipiqa",             # CLIP-based     (HIGHER better)
+    "musiq": "musiq",                 # transformer IQA(HIGHER better)
+}
+
+LPIPS_NETS = {"lpips_alex": "alex", "lpips_vgg": "vgg",
+              "lpips_squeeze": "squeeze"}
+
+# CVVDP is listed separately: it is the only metric here that takes the
+# VIEWING CONDITIONS as input (pixels per degree), which is the same
+# assumption the CSF budget is built on -- see build_cvvdp().
+ALL_METRICS = (list(LPIPS_NETS) + list(PYIQA_FR) + ["cvvdp"]
+               + list(PYIQA_NR))
+DEFAULT_METRICS = ["lpips_alex", "lpips_vgg", "dists", "cvvdp"]
+
+
+def ppd_from_cfg(cfg: dict) -> float:
+    """
+    Pixels per degree from the run's own viewing geometry.
+
+        theta_pix = 2 * atan(pixel_size / (2 * distance))      [degrees]
+        ppd       = 1 / theta_pix
+
+    The same two numbers PatchConfig hands to csf.ViewingGeometry, so CVVDP
+    and the tau budget describe one observer rather than two.
+    """
+    px = float(cfg.get("csf_pixel_size_cm", 0.0114) or 0.0114)
+    d = float(cfg.get("csf_viewing_distance_cm", 50.0) or 50.0)
+    return 1.0 / (2.0 * math.degrees(math.atan(0.5 * px / d)))
+
+
+class Cvvdp:
+    r"""
+    ColorVideoVDP, rebuilt when the viewing geometry changes.
+
+    Returns JOD: 10 = indistinguishable, lower = more visible difference, so
+    HIGHER IS BETTER here while every LPIPS-like column is the other way
+    round. One JOD step is calibrated to ~75% preference.
+
+    Unlike the deep-feature metrics this one knows how far away the observer
+    sits, which is why it can agree or disagree with the CSF budget on its own
+    terms rather than only at pixel scale.
+    """
+
+    def __init__(self, device):
+        self.device = device
+        self.ppd = None
+        self.metric = None
+
+    def configure(self, ppd: float, log=print):
+        if self.metric is not None and abs(ppd - self.ppd) < 1e-6:
+            return self.metric
+        import pycvvdp
+        geom = pycvvdp.vvdp_display_geometry((1, 1), ppd=ppd)
+        photo = pycvvdp.vvdp_display_photo_eotf(Y_peak=100.0)
+        self.metric = pycvvdp.cvvdp(display_photometry=photo,
+                                    display_geometry=geom, heatmap=None,
+                                    quiet=True, device=self.device)
+        self.ppd = ppd
+        log(f"[cvvdp] {ppd:.1f} px/deg from the run's viewing geometry")
+        return self.metric
+
+    def __call__(self, ref, dist):
+        # uint8 is one of the two datatypes predict() accepts, and our frames
+        # are already 8-bit: no second quantisation happens here. predict()
+        # takes the TEST frame first and the reference second.
+        u8 = lambda x: (x.clamp(0, 1) * 255).round().to(torch.uint8)
+        jod, _ = self.metric.predict(u8(dist), u8(ref), dim_order="BCHW")
+        return float(jod)
+
+
+def build_metrics(names, device, spatial: bool = False):
+    """
+    name -> Metric, skipping (with a message) anything not installed.
+
+    spatial=True returns the LPIPS map used for the panels; only the lpips
+    package supports it, so the name list is ignored beyond its first net.
+    """
+    if spatial:
+        import lpips
+        net = next((LPIPS_NETS[n] for n in names if n in LPIPS_NETS), "alex")
+        m = lpips.LPIPS(net=net, spatial=True, verbose=False).to(device).eval()
+        return {f"lpips_{net}": Metric(f"lpips_{net}", m)}
+
+    out = {}
+    for name in names:
+        try:
+            if name in LPIPS_NETS:
+                import lpips as _lpips
+                m = _lpips.LPIPS(net=LPIPS_NETS[name], verbose=False
+                                 ).to(device).eval()
+                out[name] = Metric(name, lambda ref, dist, m=m: float(
+                    m(ref * 2 - 1, dist * 2 - 1).mean()))   # lpips wants [-1,1]
+            elif name == "cvvdp":
+                out[name] = Metric(name, Cvvdp(device), lower_better=False)
+            elif name in PYIQA_FR or name in PYIQA_NR:
+                import pyiqa
+                model = PYIQA_FR.get(name) or PYIQA_NR[name]
+                m = pyiqa.create_metric(model, device=device)
+                kind = "fr" if name in PYIQA_FR else "nr"
+                fn = ((lambda ref, dist, m=m: float(m(dist, ref)))
+                      if kind == "fr" else (lambda x, m=m: float(m(x))))
+                out[name] = Metric(name, fn, kind=kind,
+                                   lower_better=bool(m.lower_better))
+            else:
+                print(f"[skip] unknown metric {name!r}; known: "
+                      f"{', '.join(ALL_METRICS)}")
+        except ImportError as e:
+            print(f"[skip] {name}: {e}. pip install pyiqa / cvvdp into the "
+                  f"evaluation env (see envs/lpips_eval.yml).")
+        except Exception as e:                      # a model that will not load
+            print(f"[skip] {name}: {type(e).__name__}: {e}")
+    if not out:
+        sys.exit("[perc] no metric could be built -- nothing to score.")
+    return out
+
+
+def score_pair(metrics: Dict[str, Metric], a: torch.Tensor,
                b: torch.Tensor) -> Dict[str, float]:
-    """LPIPS per network. Inputs [1,3,h,w] in [0,1]; lpips wants [-1,1]."""
+    """
+    Every full-reference metric on one (clean, modified) pair.
+
+    A metric that fails at one size -- a transformer running out of memory on
+    the full 1024x2048 frame is the realistic case -- is skipped at that size
+    for the rest of the run rather than killing an evaluation that is
+    otherwise fine.
+    """
     out = {}
     with torch.no_grad():
-        for net, m in metrics.items():
-            out[net] = float(m(a * 2 - 1, b * 2 - 1).mean())
+        for name, m in metrics.items():
+            if m.kind != "fr" or tuple(a.shape[-2:]) in m.failed:
+                continue
+            try:
+                out[name] = m.fn(a, b)              # a = clean, b = modified
+            except Exception as e:
+                _note_failure(m, a, e)
     return out
+
+
+def score_single(metrics: Dict[str, Metric], x: torch.Tensor
+                 ) -> Dict[str, float]:
+    """Every no-reference metric on ONE frame."""
+    out = {}
+    with torch.no_grad():
+        for name, m in metrics.items():
+            if m.kind != "nr" or tuple(x.shape[-2:]) in m.failed:
+                continue
+            try:
+                out[name] = m.fn(x)
+            except Exception as e:
+                _note_failure(m, x, e)
+    return out
+
+
+def _note_failure(m: Metric, x: torch.Tensor, e: Exception):
+    hw = tuple(x.shape[-2:])
+    m.failed.add(hw)
+    print(f"  [metric] {m.name} failed at {hw[0]}x{hw[1]}: "
+          f"{type(e).__name__}: {e} -- skipping that size from here on")
 
 
 def resampled_base(clean: torch.Tensor, box, size: int,
@@ -304,8 +539,16 @@ def score_frames(clean, patched, base, box, metrics, context: float,
 
     row = {}
     for region, sl in regions:
-        for net, v in score_pair(metrics, clean[sl], patched[sl]).items():
-            row[f"lpips_{region}_{net}"] = v
+        for m, v in score_pair(metrics, clean[sl], patched[sl]).items():
+            row[f"{m}_{region}"] = v
+        # NO-REFERENCE: clean and patched scored separately. The delta is the
+        # part about the patch; the absolute values say how this image sits on
+        # that metric's scale to begin with, which varies hugely by scene.
+        nr_c = score_single(metrics, clean[sl])
+        for m, v in score_single(metrics, patched[sl]).items():
+            row[f"{m}_{region}_clean"] = nr_c.get(m, float("nan"))
+            row[f"{m}_{region}_patched"] = v
+            row[f"{m}_{region}_delta"] = v - nr_c.get(m, float("nan"))
 
     # The control only exists where there is a base to remove the residual
     # from. universal_csf composites onto the clean window at full resolution,
@@ -317,9 +560,9 @@ def score_frames(clean, patched, base, box, metrics, context: float,
         resid = quantize8(resid) if quantize else resid.clamp(0, 1)
         for name, other in (("floor", base), ("resid", resid)):
             for region, sl in regions:
-                for net, v in score_pair(metrics, clean[sl],
-                                         other[sl]).items():
-                    row[f"lpips_{name}_{region}_{net}"] = v
+                for m, v in score_pair(metrics, clean[sl],
+                                       other[sl]).items():
+                    row[f"{m}_{name}_{region}"] = v
 
     diff = patched[crop] - clean[crop]
     mse = float(diff.pow(2).mean())
@@ -338,10 +581,10 @@ def score_frames(clean, patched, base, box, metrics, context: float,
         inside = torch.zeros_like(clean)
         inside[crop] = 1.0
         for e in anchors:
-            for where, m in (("global", 1.0), ("patch", inside)):
-                noisy = quantize8(clean + sign * m * e / 255.0)
-                for net, v in score_pair(metrics, clean, noisy).items():
-                    row[f"anchor_linf{e:g}_{where}_full_{net}"] = v
+            for where, mask in (("global", 1.0), ("patch", inside)):
+                noisy = quantize8(clean + sign * mask * e / 255.0)
+                for m, v in score_pair(metrics, clean, noisy).items():
+                    row[f"{m}_anchor_linf{e:g}_{where}"] = v
 
     views = {"clean": clean[0].cpu(), "patched": patched[0].cpu(),
              "base": None if base is None else base[0].cpu(),
@@ -673,16 +916,6 @@ def write_csv(rows: List[dict], path: Path):
 
 # ── main ─────────────────────────────────────────────────────────────────────
 
-def build_metrics(nets, device, spatial: bool = False):
-    try:
-        import lpips
-    except ImportError:
-        sys.exit("[lpips] package not installed in this environment. "
-                 "Create the env from envs/lpips_eval.yml.")
-    return {n: lpips.LPIPS(net=n, spatial=spatial, verbose=False
-                           ).to(device).eval() for n in nets}
-
-
 def parse_args(argv=None):
     p = argparse.ArgumentParser(
         description=__doc__.split("\n\n")[0],
@@ -692,10 +925,19 @@ def parse_args(argv=None):
     p.add_argument("--cityscapes_root", default=None,
                    help="override the root recorded in config.json — needed "
                         "whenever this runs on a different machine")
-    p.add_argument("--nets", nargs="+", default=["alex"],
+    p.add_argument("--metrics", nargs="+", default=DEFAULT_METRICS,
+                   metavar="M",
+                   help="perceptual metrics to run, or 'all'. The FIRST one "
+                        "is the primary: it drives the console line and the "
+                        "panels. Known: " + ", ".join(ALL_METRICS) + ". "
+                        "lpips_alex is the field's reference point and should "
+                        "stay first unless you have a reason; the rest are a "
+                        "robustness check, not a menu to pick from after "
+                        "seeing the numbers.")
+    p.add_argument("--nets", nargs="+", default=None,
                    choices=["alex", "vgg", "squeeze"],
-                   help="alex is the LPIPS authors' recommended forward "
-                        "metric; vgg is closer to a perceptual loss")
+                   help="deprecated alias: --nets alex vgg == --metrics "
+                        "lpips_alex lpips_vgg")
     p.add_argument("--source", default="auto",
                    choices=["auto", "png", "checkpoint"],
                    help="png = score the a_clean.png / c_patched.png the run "
@@ -730,17 +972,24 @@ def parse_args(argv=None):
                    help="panels only, no per-view image files")
     p.add_argument("--amplify", type=float, default=10.0,
                    help="difference gain in the panels")
-    p.add_argument("--out_name", default="lpips",
-                   help="per-run output subdirectory")
+    p.add_argument("--out_name", default="perc_eval",
+                   help="per-run output subdirectory holding every "
+                        "evaluation of that run")
     p.add_argument("--tag", default="",
                    help="names this evaluation: output goes to "
-                        "<run>/<out_name>_<tag>/ and every row carries it as "
-                        "eval_tag, so best vs final, quantized vs float, or "
-                        "alex vs vgg passes do not overwrite each other")
+                        "<run>/<out_name>/<tag>/ and every row carries it as "
+                        "eval_tag, so png vs checkpoint, best vs final or "
+                        "quantized vs float passes sit side by side instead "
+                        "of overwriting each other")
     p.add_argument("--out_csv", type=Path, default=None,
                    help="one combined CSV over every run, for the tables")
     p.add_argument("--device", default=None)
-    return p.parse_args(argv)
+    a = p.parse_args(argv)
+    if a.nets:                                   # deprecated, still honoured
+        a.metrics = [f"lpips_{n}" for n in a.nets]
+    if len(a.metrics) == 1 and a.metrics[0] == "all":
+        a.metrics = list(ALL_METRICS)
+    return a
 
 
 def choose_png(a, shows: List[str]) -> bool:
@@ -776,26 +1025,30 @@ def check_outputs(a):
     """
     Refuse, before any work, an output location that could touch run files.
 
-    Every file this script writes lands in <run>/<out_name>[_<tag>]/, which it
-    creates, plus --out_csv. So out_name must be ONE plain directory name that
-    is not the run itself and not an attack-owned directory, and --out_csv may
+    Every file this script writes lands in <run>/<out_name>/[<tag>/], which
+    it creates, plus --out_csv. out_name and tag must each be ONE plain
+    directory name, neither the run itself nor an attack-owned directory, so
+    that no evaluation can land on a file a run was read for. --out_csv may
     only replace a CSV this script wrote.
     """
-    sub = f"{a.out_name}_{a.tag}" if a.tag else a.out_name
-    if (not a.out_name or Path(sub).name != sub or sub in (".", "..")
-            or sub.lower() in ATTACK_DIRS):
-        sys.exit(f"[lpips] refusing --out_name/--tag -> {sub!r}: results go to "
-                 f"<run>/{sub}/, which must be one new directory name, not "
-                 f"the run itself or one of {sorted(ATTACK_DIRS)}.")
+    parts = [a.out_name] + ([a.tag] if a.tag else [])
+    for part in parts:
+        if (not part or Path(part).name != part or part in (".", "..")
+                or part.lower() in ATTACK_DIRS):
+            sys.exit(f"[perc] refusing --out_name/--tag component {part!r}: "
+                     f"results go to <run>/{'/'.join(parts)}/, each component "
+                     f"one new directory name, not the run itself or one of "
+                     f"{sorted(ATTACK_DIRS)}.")
+    sub = Path(*parts)
     if a.out_csv is not None:
         if a.out_csv.suffix.lower() != ".csv":
-            sys.exit(f"[lpips] --out_csv must end in .csv, got {a.out_csv}")
+            sys.exit(f"[perc] --out_csv must end in .csv, got {a.out_csv}")
         if a.out_csv.exists():
             with open(a.out_csv, newline="") as f:
                 header = f.readline()
-            if "lpips_" not in header:
-                sys.exit(f"[lpips] {a.out_csv} exists and was not written by "
-                         f"lpips_eval.py; refusing to overwrite it.")
+            if "eval_tag" not in header:
+                sys.exit(f"[perc] {a.out_csv} exists and was not written by "
+                         f"this script; refusing to overwrite it.")
     return sub
 
 
@@ -805,9 +1058,11 @@ def main(argv=None):
     device = torch.device(a.device or ("cuda" if torch.cuda.is_available()
                                        else "cpu"))
     mean_t, std_t = norm_tensors(device)
-    metrics = build_metrics(a.nets, device)
-    spatial = (build_metrics(a.nets[:1], device, spatial=True)[a.nets[0]]
-               if a.panels > 0 else None)
+    metrics = build_metrics(a.metrics, device)
+    primary = next((m for m in a.metrics if m in metrics), None)
+    print(f"[perc] metrics: {', '.join(metrics)}   primary: {primary}")
+    spatial = (list(build_metrics(a.metrics, device, spatial=True).values()
+                    )[0].fn if a.panels > 0 else None)
     image_list = parse_images(a.images, a.n_images)
     anchors = (() if a.anchors is None
                else tuple(a.anchors) or (2.0, 4.0, 8.0, 16.0))
@@ -829,10 +1084,33 @@ def main(argv=None):
 
     all_rows = []
     for run in a.runs:
+        # A PATH THAT DOES NOT EXIST IS NOT "no config.json". The two were
+        # reported with one message, and a mistyped arch name (deeplab101 for
+        # the registry's deeplab_101) then looked like a run whose config had
+        # gone missing -- fourteen of them in a row, exit code 0.
+        if not run.exists():
+            print(f"[skip] {run}: no such directory")
+            if run.parent.is_dir():
+                import difflib
+                near = difflib.get_close_matches(
+                    run.name, [p.name for p in run.parent.iterdir()
+                               if p.is_dir()], n=3, cutoff=0.5)
+                if near:
+                    print(f"        did you mean: {', '.join(near)}")
+            continue
         if not (run / "config.json").exists():
-            print(f"[skip] {run}: no config.json")
+            print(f"[skip] {run}: directory exists but holds no config.json")
             continue
         cfg = json.loads((run / "config.json").read_text())
+        if "cvvdp" in metrics:
+            # The viewing geometry is a property of the RUN, not of this
+            # invocation: the same pixel size and distance the tau budget was
+            # built on. Rebuilt only when it actually changes.
+            try:
+                metrics["cvvdp"].fn.configure(ppd_from_cfg(cfg))
+            except Exception as e:
+                print(f"  [cvvdp] unavailable: {type(e).__name__}: {e}")
+                metrics.pop("cvvdp")
 
         png_jobs = (discover_pngs(run, cfg) if a.source != "checkpoint"
                     else [])
@@ -888,14 +1166,13 @@ def main(argv=None):
                    "checkpoint": ck_name, "which": job.label,
                    "image": job.image, **row}
             rows.append(row)
-            net0 = a.nets[0]
-            main_col = f"lpips_full_{net0}"
+            main_col = f"{primary}_full"
             print(f"  img {job.image:4d} {job.label:>12s}  "
-                  f"full {row[main_col]:.4f}"
-                  + (f"  floor_full {row[f'lpips_floor_full_{net0}']:.4f}"
-                     f"  resid_full {row[f'lpips_resid_full_{net0}']:.4f}"
-                     if f"lpips_floor_full_{net0}" in row else "")
-                  + f"  crop {row[f'lpips_crop_{net0}']:.4f}"
+                  f"{primary} full {row.get(main_col, float('nan')):.4f}"
+                  + (f"  floor_full {row[f'{primary}_floor_full']:.4f}"
+                     f"  resid_full {row[f'{primary}_resid_full']:.4f}"
+                     if f"{primary}_floor_full" in row else "")
+                  + f"  crop {row.get(f'{primary}_crop', float('nan')):.4f}"
                   + (f"  vis {row['visibility']:.3f}"
                      if "visibility" in row else "")
                   + f"  psnr {row['psnr_crop']:.1f} dB")
@@ -911,13 +1188,20 @@ def main(argv=None):
         out = run / out_sub
         write_csv(rows, out / "per_image.csv")
         summ = summarise(rows)
-        summ.update({"nets": a.nets, "quantized": not a.no_quantize,
+        summ.update({"metrics": list(metrics),
+                     "primary": primary,
+                     # which way each column reads, so a table built from
+                     # this file cannot silently rank ahiq or cvvdp upside
+                     # down -- for those two, HIGHER means more similar.
+                     "lower_better": {n: m.lower_better
+                                      for n, m in metrics.items()},
+                     "quantized": not a.no_quantize,
                      "context": a.context, "source": source,
                      "checkpoint": a.checkpoint if source == "checkpoint"
                      else None, "eval_tag": a.tag})
         (out / "summary.json").write_text(json.dumps(summ, indent=2))
-        med = summ.get(f"lpips_full_{a.nets[0]}", {})
-        print(f"  -> {out}/  median lpips_full_{a.nets[0]} "
+        med = summ.get(f"{primary}_full", {})
+        print(f"  -> {out}/  median {primary}_full "
               f"{med.get('median', float('nan')):.4f}  "
               f"(IQR {med.get('q25', float('nan')):.4f}-"
               f"{med.get('q75', float('nan')):.4f})")
@@ -927,6 +1211,15 @@ def main(argv=None):
         write_csv(all_rows, a.out_csv)
         print(f"\n[done] {len(all_rows)} rows -> {a.out_csv}")
 
+    if not all_rows:
+        # FAIL LOUDLY. A scoring run that scored nothing is a failure, and
+        # exiting 0 let a shell loop and an sbatch job both report success
+        # while producing no output at all.
+        print(f"\n[lpips] nothing scored: none of the {len(a.runs)} path(s) "
+              f"given yielded an image. See the [skip] lines above.")
+        return 1
+    return 0
+
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
