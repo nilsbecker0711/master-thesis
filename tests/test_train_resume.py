@@ -289,3 +289,47 @@ def test_the_post_validation_save_keeps_best_and_history(stub, tmp_path):
     st = torch.load(d / "train_state.pt", map_location="cpu")
     assert st["history"], "history was lost by checkpointing before the val"
     assert st["best"] > -1e9
+
+
+def test_validating_does_not_perturb_the_global_rng(stub, tmp_path):
+    """The val loader draws its worker base seed from the default generator
+    on every iteration, even with shuffle=False. Before it was given its own
+    generator, a resume that skipped a validation consumed one draw fewer
+    than an uninterrupted run and every later train shuffle diverged."""
+    import torch.utils.data as tud
+    ds = tud.TensorDataset(torch.arange(4).float().view(4, 1))
+
+    shared = tud.DataLoader(ds, batch_size=1, shuffle=False, num_workers=0)
+    torch.manual_seed(0); before = torch.rand(2)
+    torch.manual_seed(0); list(shared); after = torch.rand(2)
+    assert not torch.equal(before, after), "premise gone: loaders no longer draw"
+
+    owned = tud.DataLoader(ds, batch_size=1, shuffle=False, num_workers=0,
+                           generator=torch.Generator().manual_seed(7))
+    torch.manual_seed(0); before = torch.rand(2)
+    torch.manual_seed(0); list(owned); after = torch.rand(2)
+    assert torch.equal(before, after), "val loader still touches the global RNG"
+
+
+def test_a_kill_inside_a_validation_still_resumes_bit_exactly(stub, tmp_path):
+    """With the val loader on its own RNG, skipping a validation on resume
+    costs history and best.pt but NOT the trajectory."""
+    whole = tmp_path / "whole"
+    _slice(stub, _argv(whole, 4, "--val_every", "1"))
+
+    killed = tmp_path / "killed"
+    real_eval = train_mod.evaluate
+    calls = {"n": 0}
+
+    def die_once(*a, **kw):
+        calls["n"] += 1
+        if calls["n"] == 2:            # die inside epoch 2's validation
+            raise _Killed
+        return real_eval(*a, **kw)
+    stub.setattr(train_mod, "evaluate", die_once)
+    _slice(stub, _argv(killed, 4, "--val_every", "1", "--resume"))
+    stub.setattr(train_mod, "evaluate", real_eval)
+    _slice(stub, _argv(killed, 4, "--val_every", "1", "--resume"))
+
+    a, b = _final(whole), _final(killed)
+    assert torch.equal(a, b), f"max diff {(a - b).abs().max().item():.3e}"
