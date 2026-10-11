@@ -208,8 +208,12 @@ def test_resume_refuses_a_config_that_drifted(stub, tmp_path):
 # ── what the state has to contain ────────────────────────────────────────────
 
 def test_state_carries_everything_the_next_step_needs(stub, tmp_path):
+    # Run to completion rather than killing after N checkpoints: the number
+    # of saves per epoch is an implementation detail (it is two on an epoch
+    # that also validates, one otherwise), and this test is about the
+    # CONTENTS of the state, not when it is written.
     d = tmp_path / "s"
-    _slice(stub, _argv(d, 3), kill_after=3)
+    _slice(stub, _argv(d, 3))
     st = torch.load(d / "train_state.pt", map_location="cpu")
     for k in ("epoch", "gstep", "best", "history", "elapsed_s", "param",
               "opt", "sched", "py_rng", "torch_rng"):
@@ -247,3 +251,41 @@ def test_the_sampled_subset_is_pinned_across_a_resume(stub, tmp_path):
                                     "--train_seed", "68", "--resume"))
     with pytest.raises(SystemExit, match="training subset"):
         train_mod.main()
+
+
+# ── killed inside a validation ───────────────────────────────────────────────
+
+def test_a_kill_inside_the_epoch1_validation_still_checkpoints(stub, tmp_path):
+    """THE b5 BUG. Epoch 1 always validates, and at native resolution that
+    pass can run for hours. save_state used to come AFTER the validation
+    branch, so a job killed inside it had never checkpointed at all: no
+    train_state.pt, every requeue "starting fresh", epoch 1 again, same
+    validation, killed again -- a run that can never advance however often it
+    is resubmitted."""
+    d = tmp_path / "killed_in_val"
+    real_eval = train_mod.evaluate
+
+    def die(*a, **kw):
+        raise _Killed                      # stands in for the walltime kill
+    stub.setattr(train_mod, "evaluate", die)
+    _slice(stub, _argv(d, 4, "--resume"))
+
+    st = torch.load(d / "train_state.pt", map_location="cpu")
+    assert st["epoch"] == 1, "epoch 1's training work was not checkpointed"
+    assert not (d / "results.json").exists()
+
+    # The requeue must now CONTINUE, not restart.
+    stub.setattr(train_mod, "evaluate", real_eval)
+    _slice(stub, _argv(d, 4, "--resume"))
+    assert (d / "results.json").exists()
+    assert torch.load(d / "train_state.pt", map_location="cpu")["epoch"] == 4
+
+
+def test_the_post_validation_save_keeps_best_and_history(stub, tmp_path):
+    """The pre-validation save must not cost best/history on epochs whose
+    validation does complete."""
+    d = tmp_path / "hist"
+    _slice(stub, _argv(d, 2, "--val_every", "1"), kill_after=4)
+    st = torch.load(d / "train_state.pt", map_location="cpu")
+    assert st["history"], "history was lost by checkpointing before the val"
+    assert st["best"] > -1e9
