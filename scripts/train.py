@@ -613,6 +613,32 @@ def main():
         save_image(patch.render().cpu(),
                    out_dir / INTERMEDIATE_DIR / f"epoch{epoch:04d}.png")
 
+        # CHECKPOINT BEFORE THE VALIDATION, and again after it.
+        #
+        # This used to be a single save placed AFTER the validation branch,
+        # reasoning that `best` and `history` are written in there and a
+        # checkpoint taken above them would resume into a state that
+        # re-competes a validation it had already run. That is true and it is
+        # trivial; what it cost is not. Epoch 1 ALWAYS validates, and a
+        # 500-image pass at 1024x2048 under slide takes minutes on b0 and
+        # hours on b5 -- so a job killed inside that pass had never reached
+        # save_state at all. No train_state.pt, every requeue "starting
+        # fresh", epoch 1 again, the same validation, killed again. Observed
+        # on b5: a run that can never advance past epoch 1 no matter how
+        # often it is resubmitted.
+        #
+        # The pre-validation save is what makes the epoch durable. The
+        # post-validation save then captures best/history when the validation
+        # does complete. If the job dies inside the validation, the first
+        # checkpoint stands and the resume skips THIS epoch's validation --
+        # costing one history row and one best.pt comparison, which are
+        # diagnostics. The headline number is the final 500-image evaluation
+        # after the loop, and that always runs.
+        ckpt_now = (epoch % args.checkpoint_every == 0
+                    or epoch == args.epochs)
+        if ckpt_now:
+            save_state(epoch)
+
         if epoch % args.val_every == 0 or epoch == 1:
             ev = evaluate(model, val_loader, patch, device, args.num_classes, tgt)
             extra_s = (f"  hit={ev['target_hit_rate']:.1f}%" if tgt is not None
@@ -626,11 +652,11 @@ def main():
                 save_image(patch.render().cpu(), out_dir / "best_patch.png")
                 print(f"           * new best drop_remote {best:+.2f}")
 
-        # AFTER the validation, not before: `best` and `history` are written
-        # in that branch, and a checkpoint taken above them would resume into
-        # a state that re-competes a validation it has already run.
-        if epoch % args.checkpoint_every == 0 or epoch == args.epochs:
-            save_state(epoch)
+            # Re-save so best/history survive the next kill. Cheap: one more
+            # atomic write of the same small state, only on epochs that both
+            # checkpoint and validate.
+            if ckpt_now:
+                save_state(epoch)
 
     final = evaluate(model, val_loader, patch, device, args.num_classes, tgt)
     # ── calibration for stage 2 ──────────────────────────────────────────────
