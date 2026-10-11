@@ -55,7 +55,8 @@ from PIL import Image
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from patchreach.data.cityscapes import (CityscapesSeg, class_name,
-                                        denormalise, norm_tensors)
+                                        denormalise, label_to_colour,
+                                        norm_tensors)
 from patchreach.metrics.miou import SegMetric, compare
 from patchreach.patch.spec import Patch
 from patchreach.utils import get_device, increment_path, seed_everything
@@ -352,6 +353,81 @@ def to_pil(normalised: torch.Tensor, mean_t, std_t) -> Image.Image:
     return Image.fromarray(arr)
 
 
+# ── visualisation ────────────────────────────────────────────────────────────
+# PIL only, deliberately: matplotlib is not a SAM 3 dependency and is not in
+# the sam3 env, so importing it would make the panel a second install problem.
+
+UNASSIGNED_RGB = (255, 0, 255)      # magenta, so "no prompt claimed this pixel"
+                                    # is distinguishable from void (black).
+
+
+def _colour(lbl: torch.Tensor) -> Image.Image:
+    """[H,W] trainIds (0..18, 19=UNASSIGNED, 255=void) -> PIL RGB.
+
+    label_to_colour() blacks out everything >= 19, which would make UNASSIGNED
+    and void identical — and telling those apart is the whole point here: void
+    is "no ground truth", UNASSIGNED is "SAM 3 claimed nothing".
+    """
+    arr = (label_to_colour(lbl) * 255).to(torch.uint8).permute(1, 2, 0).numpy().copy()
+    arr[(lbl == UNASSIGNED).cpu().numpy()] = UNASSIGNED_RGB
+    return Image.fromarray(arr)
+
+
+def _changed(pc: torch.Tensor, pa: torch.Tensor, fp: torch.Tensor) -> Image.Image:
+    """Where the prediction moved. Red = changed OUTSIDE the footprint (the
+    only kind that is evidence of reach); blue = changed inside it (occlusion,
+    expected and uninteresting); grey = unchanged."""
+    ch = (pc != pa).cpu().numpy()
+    inside = fp.cpu().numpy()
+    h, w = ch.shape
+    arr = torch.full((h, w, 3), 40, dtype=torch.uint8).numpy()
+    arr[ch & ~inside] = (220, 30, 30)
+    arr[ch & inside] = (40, 90, 200)
+    return Image.fromarray(arr)
+
+
+def _grid(cells, cell_w: int = 512, cols: int = 3) -> Image.Image:
+    """(title, PIL) pairs -> one labelled contact sheet."""
+    from PIL import ImageDraw
+    shots = [(t, im) for t, im in cells]
+    ar = shots[0][1].height / shots[0][1].width
+    cw, chh = cell_w, int(cell_w * ar)
+    bar, rows = 18, (len(shots) + cols - 1) // cols
+    sheet = Image.new("RGB", (cols * cw, rows * (chh + bar)), (16, 16, 16))
+    d = ImageDraw.Draw(sheet)
+    for i, (title, im) in enumerate(shots):
+        x, y = (i % cols) * cw, (i // cols) * (chh + bar)
+        sheet.paste(im.resize((cw, chh), Image.NEAREST), (x, y + bar))
+        d.text((x + 4, y + 4), title, fill=(235, 235, 235))
+    return sheet
+
+
+def save_panel(path, pil_clean, pil_adv, label, pc, pa, fp, prompts):
+    """Six panels: the two inputs, the two SAM 3 label maps, GT, and the diff.
+
+    The diff panel is the one to read first — red pixels outside the footprint
+    are the only thing that distinguishes transfer from occlusion.
+    """
+    from PIL import ImageDraw
+    adv = pil_adv.copy()
+    ys, xs = torch.where(fp.cpu())
+    if len(ys):
+        ImageDraw.Draw(adv).rectangle(
+            [int(xs.min()), int(ys.min()), int(xs.max()), int(ys.max())],
+            outline=(255, 255, 0), width=5)
+    sheet = _grid([
+        ("clean input", pil_clean),
+        ("patched input (footprint outlined)", adv),
+        ("ground truth", _colour(label)),
+        ("SAM 3 - clean", _colour(pc)),
+        ("SAM 3 - patched", _colour(pa)),
+        ("changed: red=outside fp, blue=inside", _changed(pc, pa, fp)),
+    ])
+    path.parent.mkdir(parents=True, exist_ok=True)
+    sheet.save(path)
+    return sheet
+
+
 # ── main ─────────────────────────────────────────────────────────────────────
 
 def main():
@@ -531,6 +607,14 @@ def main():
         pa = merge_prompts(sc_a, a.score_thresh).unsqueeze(0)
 
         fp_cpu = fp.cpu()
+
+        # The panel goes here rather than beside the raw PNG dump above,
+        # because it needs pc/pa, which do not exist until after prompt_all.
+        if a.save_png:
+            save_panel(out_dir / "images" / f"img{i:04d}_panel.png",
+                       pil_clean, pil_adv, label[0], pc[0], pa[0],
+                       fp_cpu[0], prompts)
+
         m["clean_all"].update(pc, label)
         m["clean_rem"].update(pc, label, exclude=fp_cpu)
         m["adv_all"].update(pa, label)
@@ -604,7 +688,7 @@ def main():
     print(f"  remote mIoU  clean {agg['clean_rem']:6.2f} -> "
           f"adv {agg['adv_rem']:6.2f}   drop {agg['rem_drop']:+.2f}")
     print(f"  WITH HEADROOM ONLY ({len(keep)}/{K_GT} classes)  "
-          f"{c_keep:6.2f} -> {a_keep:6.2f}   drop {a_keep - c_keep:+.2f}")
+          f"{c_keep:6.2f} -> {a_keep:6.2f}   drop {c_keep - a_keep:+.2f}")
     # torch.std is unbiased, so n=1 gives nan. Print the count instead of a nan
     # that reads like a failed computation rather than "no spread is defined".
     spread = (f"+/- {drops.std():.2f}" if len(per_image) > 1
@@ -633,7 +717,7 @@ def main():
                    "headroom": headroom,
                    "with_headroom_only": {"n_classes": len(keep),
                                           "clean": c_keep, "adv": a_keep,
-                                          "drop": a_keep - c_keep},
+                                          "drop": c_keep - a_keep},
                    "per_class_iou": {
                        class_name(c): {"clean": float(ciou[c]),
                                        "adv": float(aiou[c])}
