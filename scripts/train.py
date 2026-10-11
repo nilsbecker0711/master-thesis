@@ -377,9 +377,25 @@ def main():
 
     train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True,
                               num_workers=args.num_workers, pin_memory=True)
+    # generator=: ITS OWN RNG, so validating does not perturb the global one.
+    # A DataLoader draws its worker base seed from the default generator on
+    # EVERY iteration, even with shuffle=False -- one int64, but enough to
+    # shift the stream. That matters since the checkpoint fix: a job killed
+    # inside a validation resumes from the save taken BEFORE it and skips
+    # that validation, so the resumed run would consume one draw fewer than
+    # an uninterrupted one and every subsequent train shuffle would differ.
+    # The run would still be valid, just no longer bit-identical, and
+    # tests/test_train_resume.py exists to assert exactly that identity.
+    # Validation has no randomness to seed anyway.
+    #
+    # num_workers honours --num_workers rather than the hardcoded 2 it used
+    # to be. The val pass reads 500 native-resolution PNG pairs; at 2 workers
+    # that is ~8x less loader throughput than the training loop gets on the
+    # same 16 allocated CPUs, for no stated reason.
     val_loader = DataLoader(
         Subset(val_full, list(range(min(args.val_images, len(val_full))))),
-        batch_size=1, shuffle=False, num_workers=2)
+        batch_size=1, shuffle=False, num_workers=args.num_workers,
+        generator=torch.Generator().manual_seed(args.seed))
     print(f"[data] train {len(train_ds)} imgs / {len(train_loader)} batches, "
           f"val {args.val_images} imgs @ {args.img_h}x{args.img_w}")
 
