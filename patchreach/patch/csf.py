@@ -328,7 +328,23 @@ def rfft_frequency_grid(H: int, W: int, device=None
 
 
 def radial_frequency_cpp(H: int, W: int, device=None) -> torch.Tensor:
-    """|f| in cycles/pixel on the rfft2 grid. Max is 0.5 (Nyquist)."""
+    r"""
+    |f| = sqrt(fy^2 + fx^2) in cycles/pixel on the rfft2 grid.
+
+    MAX IS sqrt(2)/2 = 0.7071, NOT 0.5. 0.5 c/px is the Nyquist limit of ONE
+    axis; this is the LENGTH of a two-component vector whose components are
+    each bounded by it, so the diagonal corner bin reaches 0.707. That bin is
+    the pixel checkerboard, (-1)^(x+y), and it is exactly representable: along
+    the (1,1) direction the lattice lines x+y=k are spaced 1/sqrt(2) px apart,
+    so the diagonal Nyquist is 1/(2*(1/sqrt(2))) = 0.707.
+
+    The earlier claim "Max is 0.5" here was wrong and it mattered, because the
+    corner is where the budget lives: at 0.0131 deg/px the corner is 54.1 cpd,
+    where Barten gives CSF = 1.27 against 13.4 at the axis Nyquist and 715 at
+    the peak. The 1/CSF envelope therefore rises ~560x from peak to corner,
+    not 53x, and 91.7% of the normalised envelope's power sits above 0.5 c/px
+    (99.6% above 0.35) on 22% of the bins. See patch_budget's max_cpp.
+    """
     fy, fx = rfft_frequency_grid(H, W, device)
     return (fy ** 2 + fx ** 2).sqrt()
 
@@ -432,10 +448,37 @@ def amplitude_budget(csf: torch.Tensor, threshold: float = 1.0,
             ).clamp(max=max_amplitude)
 
 
+def band_limit(budget: torch.Tensor, size: int, min_cycles: float = 2.0,
+               max_cpp: float = 0.0, device=None) -> torch.Tensor:
+    r"""
+    Zero the budget outside the radial band [min_cycles/size, max_cpp].
+
+    ONE implementation, because both budget builders need the same mask and a
+    cutoff applied in only one of them would make the lref path a different
+    experiment from the legacy one.
+
+    max_cpp=0 disables the high cut and is every run recorded before this
+    argument existed. The low cut is unchanged; see patch_budget.
+    """
+    f = radial_frequency_cpp(size, size, device)
+    keep = torch.ones_like(budget, dtype=torch.bool)
+    if min_cycles > 0:
+        keep &= (f >= min_cycles / float(size))
+    if max_cpp > 0:
+        keep &= (f <= max_cpp)
+    if not bool(keep.any()):
+        raise ValueError(
+            f"the band [{min_cycles}/{size}, {max_cpp}] c/px contains no rfft "
+            f"bin at size={size}: every bin would be zeroed and "
+            f"normalise_budget_to_tau would divide by ~0. Widen it.")
+    return torch.where(keep, budget, torch.zeros_like(budget))
+
+
 def patch_budget(size: int, geometry: ViewingGeometry = ViewingGeometry(),
                  model: str = "barten", threshold: float = 1.0,
                  min_cycles: float = 2.0, max_amplitude: float = 0.25,
-                 device=None) -> Tuple[torch.Tensor, torch.Tensor]:
+                 device=None, max_cpp: float = 0.0
+                 ) -> Tuple[torch.Tensor, torch.Tensor]:
     r"""
     (csf_values, budget) for a size x size PATCH, with the low-frequency band
     removed. Returns both because every downstream call needs both.
@@ -465,15 +508,37 @@ def patch_budget(size: int, geometry: ViewingGeometry = ViewingGeometry(),
 
     `max_amplitude` also drops to 0.25 here, since a quarter of the dynamic
     range in a single component is already far beyond anything the constraint
-    is supposed to permit.
+    is supposed to permit. NOTE it is inert at this geometry: the largest
+    pre-normalisation allowance is 0.1965 at both 128 and 256, so the cap has
+    never bound in any run.
+
+    `max_cpp` IS THE HIGH CUT, and it exists because the envelope's power is
+    not where the text assumed. Measured on this budget at size=256, tau=1:
+
+        91.7% of the power sits above 0.5 c/px, 99.6% above 0.35, on 22% of
+        the bins — the diagonal corner, i.e. a 1-2 px checkerboard.
+
+    That is a consequence of applying a full-field threshold envelope per bin,
+    not a bug: 1/CSF really is ~560x larger at 54 cpd than at the peak. But it
+    puts the allowance in the band a network's own stem discards. The power of
+    this envelope surviving a 2x2 box average is 0.75%, against 25% for a flat
+    spectrum and 42% for a 0.20-0.35 band; after a 4x4 average, 0.13%.
+
+    Cutting at max_cpp and THEN normalising (the caller's
+    normalise_budget_to_tau) moves the allowance into the surviving bins
+    instead of deleting it: every live bin is still exactly tau JND on its
+    own, the pooled figure is still tau, and the scale-up is
+    (N_live_full/N_live_band)^(1/beta) — only 1.38x at max_cpp=0.35, because
+    the normaliser counts bins, not power. So the band-limited arm is the SAME
+    nominal visibility with ~11x less total RMS, all of it in bands the model
+    can propagate. It is the control that separates "the CSF shape is the
+    constraint" from "the CSF shape is the problem".
+
+    max_cpp=0 disables the cut and is every run recorded before it existed.
     """
     csf = csf_map(size, size, geometry, model, device)
     budget = amplitude_budget(csf, threshold, max_amplitude)
-    if min_cycles > 0:
-        f_min = min_cycles / float(size)          # cycles per pixel
-        budget = torch.where(radial_frequency_cpp(size, size, device) >= f_min,
-                             budget, torch.zeros_like(budget))
-    return csf, budget
+    return csf, band_limit(budget, size, min_cycles, max_cpp, device)
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -1025,7 +1090,7 @@ def patch_budget_at_luminance(size: int, Y_ref: float,
                               min_cycles: float = 2.0,
                               max_amplitude: float = 0.25,
                               units: str = "srgb",
-                              device=None):
+                              device=None, max_cpp: float = 0.0):
     r"""
     (csf_values, budget) at background luminance Y_ref — the luminance-aware
     twin of patch_budget().
@@ -1041,7 +1106,8 @@ def patch_budget_at_luminance(size: int, Y_ref: float,
     `min_cycles` carries over unchanged from patch_budget, and for the same
     reason: below one cycle across the patch a component is a brightness
     offset, not a grating, and the patch border turns any offset into a
-    broadband edge. Nothing about luminance changes that argument.
+    broadband edge. Nothing about luminance changes that argument. `max_cpp`
+    carries over too — see patch_budget for what it is for.
     """
     geometry = geometry if geometry is not None else ViewingGeometry()
     if units not in ("srgb", "linear"):
@@ -1053,11 +1119,7 @@ def patch_budget_at_luminance(size: int, Y_ref: float,
         c_ref = linear_to_srgb(torch.tensor(float(Y_ref)))
         budget = (budget / srgb_slope(c_ref).clamp(min=1e-6)
                   ).clamp(max=max_amplitude)
-    if min_cycles > 0:
-        f_min = min_cycles / float(size)
-        budget = torch.where(radial_frequency_cpp(size, size, device) >= f_min,
-                             budget, torch.zeros_like(budget))
-    return csf, budget
+    return csf, band_limit(budget, size, min_cycles, max_cpp, device)
 
 
 # ═════════════════════════════════════════════════════════════════════════════
