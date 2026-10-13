@@ -102,9 +102,12 @@ from ..patch.conditional_generator import (composite_batch, denormalise_batch,
 
 # The SAME radial banding csf.report() prints its budget table over, so a
 # sensitivity row lines up with the budget row above it without rebinning.
-DEFAULT_BANDS: Tuple[Tuple[float, float], ...] = (
-    (0.00, 0.02), (0.02, 0.05), (0.05, 0.10),
-    (0.10, 0.20), (0.20, 0.35), (0.35, 0.50))
+# ONE list, shared with csf.report() so the sensitivity table and the budget
+# table are read over the same bands. The top band (0.50, 0.71) covers the
+# diagonal corner of the rfft grid, where 91.7% of the budget's power actually
+# sits -- it was missing, so RQ1 measured six bands holding 0.4% of the
+# allowance. `keep = (f >= lo) & (f < hi)` admits the corner at 0.70711.
+DEFAULT_BANDS: Tuple[Tuple[float, float], ...] = csf_mod.RADIAL_BANDS
 
 NORMALISE_MODES = ("visibility", "rms")
 CONTRAST_MEAN_MODES = ("local", "fixed")

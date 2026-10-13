@@ -140,6 +140,31 @@ class PatchConfig:
     csf_pixel_size_cm: float = 0.0114
     csf_viewing_distance_cm: float = 50.0
 
+    # HIGH CUT ON THE BUDGET, in cycles/pixel. 0 = off, and off is every run
+    # recorded before this field existed.
+    #
+    # WHY IT EXISTS. The 1/CSF envelope puts 91.7% of its power above 0.5 c/px
+    # and 99.6% above 0.35 — the diagonal corner of the rfft grid, which is a
+    # 1-2 px checkerboard. Measured, not argued: see csf.patch_budget. A 2x2
+    # box average passes 0.75% of that power and a 4x4 average 0.13%, while a
+    # 0.20-0.35 band keeps 42% and 2.0%. Every architecture here downsamples at
+    # the stem (b0/b5 7x7 stride 4, setr 16x16 patch embed, r101 7x7 stride 2),
+    # so the band carrying the allowance is the band the stem throws away.
+    #
+    # WHAT THE CUT DOES, and it is not a weakening. The cut is applied BEFORE
+    # normalise_budget_to_tau, so the surviving bins absorb the allowance: each
+    # live bin is still exactly tau JND, pooled visibility is still tau, and
+    # the amplitude scale-up is only (N_full/N_band)^(1/beta) = 1.38x at 0.35
+    # because the normaliser counts bins rather than power. Net effect at
+    # tau=1, size=256: total RMS falls from 0.137 to ~0.012 while the RMS
+    # inside 0.20-0.35 RISES from 0.0085 to 0.0119. Same nominal visibility,
+    # an order of magnitude less energy, all of it where the model can read it.
+    #
+    # It is therefore the clean test of whether the 1/CSF SHAPE is the
+    # constraint or the problem, and it needs no new mode, no new loss and no
+    # change to the visibility accounting.
+    csf_max_cpp: float = 0.0
+
     # ── universal_csf only ───────────────────────────────────────────────────
     # ONE residual shared across the whole dataset, added onto whatever content
     # it lands on. mode='csf' optimises a fresh residual per image and takes
@@ -273,6 +298,20 @@ class PatchConfig:
             if self.csf_enforce not in ("nominal", "realised"):
                 raise ValueError("csf_enforce must be nominal|realised, got "
                                  f"{self.csf_enforce!r}")
+            # 0.7072 and not 0.5: the rfft grid's radial maximum is
+            # sqrt(2)/2, so a cut above 0.5 is meaningful and a cut at 0.708
+            # is a no-op rather than an error. See csf.radial_frequency_cpp.
+            if not 0.0 <= self.csf_max_cpp <= 0.7072:
+                raise ValueError(
+                    "csf_max_cpp must be in [0, 0.7072] cycles/pixel (0 = no "
+                    f"high cut), got {self.csf_max_cpp!r}")
+            if 0.0 < self.csf_max_cpp <= self.csf_min_cycles / self.size:
+                # Caught here rather than in band_limit, so the message names
+                # the two flags the user actually typed.
+                raise ValueError(
+                    f"csf_max_cpp={self.csf_max_cpp:g} is at or below the low "
+                    f"cut csf_min_cycles/size = "
+                    f"{self.csf_min_cycles / self.size:g}: the band is empty.")
         if self.mode == "csf":
             if self.csf_param not in ("pgd", "squash"):
                 raise ValueError("csf_param must be pgd|squash, got "
@@ -363,13 +402,14 @@ class Patch:
             if c.csf_lref > 0:
                 self._csf_values, budget = csf_mod.patch_budget_at_luminance(
                     c.size, c.csf_lref, geom, c.csf_model, 1.0,
-                    c.csf_min_cycles, units="srgb", device=self.device)
+                    c.csf_min_cycles, units="srgb", device=self.device,
+                    max_cpp=c.csf_max_cpp)
                 self._contrast_scale = csf_mod.calibrated_contrast_scale(
                     c.csf_lref)
             else:
                 self._csf_values, budget = csf_mod.patch_budget(
                     c.size, geom, c.csf_model, 1.0, c.csf_min_cycles,
-                    device=self.device)
+                    device=self.device, max_cpp=c.csf_max_cpp)
                 self._contrast_scale = csf_mod.CONTRAST_SCALE
             # Normalise ONCE. The envelope depends only on the configuration,
             # never on the parameter, so recomputing it per step would be pure
@@ -401,7 +441,8 @@ class Patch:
                 csf_mod.ViewingGeometry(self.cfg.csf_pixel_size_cm,
                                         self.cfg.csf_viewing_distance_cm),
                 self.cfg.csf_model, tau_here,
-                self.cfg.csf_min_cycles, device=self.device)
+                self.cfg.csf_min_cycles, device=self.device,
+                max_cpp=self.cfg.csf_max_cpp)
             self._csf_budget = (
                 csf_mod.normalise_budget_to_tau(
                     budget, self._csf_values, self.cfg.csf_threshold,
@@ -873,8 +914,20 @@ class Patch:
         spec = torch.fft.rfft2(self.param.data, norm="forward")
         mag = spec.abs()
         scale = (self._csf_budget / mag.clamp(min=eps)).clamp(max=1.0)
+        # OVER LIVE BINS, matching _spectral_occupancy. Dividing by ALL bins
+        # was numerically identical while the only dead band was the six bins
+        # below min_cycles (33018/33024 live at size 256), but csf_max_cpp
+        # makes 61% of the grid dead at a 0.35 cut, and the old denominator
+        # would then report frac_at_bound 0.385 for a residual whose every
+        # live bin is pinned -- reading as "the box is not binding" in the one
+        # arm built to test whether it binds.
+        # expand_as, NOT a bare sum: the budget is [S, S//2+1] and the scale
+        # is [3, S, S//2+1], so counting the numerator over three channels
+        # against a one-channel denominator reports up to 3.0.
+        live = (self._csf_budget > 0).expand_as(scale)
         self._frac_at_bound = float(
-            ((scale < 1.0) & (self._csf_budget > 0)).float().mean())
+            ((scale < 1.0) & live).float().sum()
+            / live.float().sum().clamp(min=1.0))
         self.param.data = torch.fft.irfft2(
             spec * scale, s=self.param.shape[-2:], norm="forward")
 
@@ -1127,6 +1180,15 @@ class Patch:
             ctop, cleft = (H - p) // 2, (W - p) // 2
             d = ((top - ctop) ** 2 + (left - cleft) ** 2) ** 0.5
             log(f"[patch] top-left  : ({top}, {left})  {d:.0f}px from centre")
+        if c.mode in ("csf", "universal_csf") and self._csf_budget is not None:
+            live = self._csf_budget > 0
+            f = csf_mod.radial_frequency_cpp(c.size, c.size,
+                                             self._csf_budget.device)
+            lo, hi = float(f[live].min()), float(f[live].max())
+            log(f"[patch] band      : {lo:.4f}-{hi:.4f} c/px "
+                f"({int(live.sum()):,} live bins"
+                + (f", high cut {c.csf_max_cpp:g}" if c.csf_max_cpp > 0
+                   else ", no high cut") + ")")
         if c.mode == "csf":
             st = self.stats()
             rel = "==" if c.csf_param == "squash" else "<="

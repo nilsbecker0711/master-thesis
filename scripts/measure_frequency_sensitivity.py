@@ -90,9 +90,14 @@ def build_parser():
                         "claim is made. Guards against reading an argmax out "
                         "of six near-zero rates.")
     p.add_argument("--n_bands", type=int, default=0,
-                   help="0 uses spectral.DEFAULT_BANDS, which match the bands "
-                        "csf.report() prints its budget over. >0 replaces them "
-                        "with that many equal-width bands over [0, 0.5].")
+                   help="0 uses spectral.DEFAULT_BANDS, which ARE the bands "
+                        "csf.report() prints its budget over (csf.RADIAL_BANDS). "
+                        ">0 replaces them with that many equal-width bands over "
+                        "[0, 0.7071]. The ceiling is sqrt(2)/2 and not 0.5: 0.5 "
+                        "is the per-axis Nyquist, while the radial frequency is "
+                        "the length of (fy, fx) and reaches 0.707 in the "
+                        "diagonal corner -- which is where the budget spends "
+                        "92% of its power.")
     p.add_argument("--out_dir", default="results/spectral")
     return p
 
@@ -111,7 +116,8 @@ def main():
     patch = build_patch(a, device, mean_t, std_t)
 
     if a.n_bands > 0:
-        edges = torch.linspace(0.0, 0.5, a.n_bands + 1).tolist()
+        edges = torch.linspace(0.0, csf_mod.MAX_CPP,
+                               a.n_bands + 1).tolist()
         bands = list(zip(edges[:-1], edges[1:]))
     else:
         bands = list(spectral.DEFAULT_BANDS)

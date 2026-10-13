@@ -201,6 +201,103 @@ def test_low_band_is_removed():
     assert float(naive[f < 2.0 / S].max()) > 0.0     # the failure, reproduced
 
 
+def test_the_envelope_puts_its_power_in_the_diagonal_corner():
+    """
+    THE NUMBER THE THESIS TEXT GOT WRONG. 0.5 c/px is the per-AXIS Nyquist;
+    the rfft grid's radial maximum is sqrt(2)/2 = 0.707, and that corner is
+    where 1/CSF is ~560x the peak. Measured here so the claim in Chapter 2/4
+    cannot drift from the code again.
+    """
+    S = 256
+    f = C.radial_frequency_cpp(S, S)
+    assert float(f.max()) == pytest.approx(2 ** 0.5 / 2, rel=1e-5)
+
+    csf, raw = C.patch_budget(S, threshold=1.0)
+    B = C.normalise_budget_to_tau(raw, csf, threshold=1.0)
+    w = torch.full_like(B, 2.0)              # Parseval on the half-spectrum
+    w[:, 0] = 1.0
+    w[:, -1] = 1.0
+    power = w * B.pow(2)
+    assert float(power[f > 0.5].sum() / power.sum()) == pytest.approx(0.917,
+                                                                      abs=0.01)
+    assert float(power[f > 0.35].sum() / power.sum()) == pytest.approx(0.996,
+                                                                       abs=0.01)
+    assert float((f > 0.5).float().mean()) == pytest.approx(0.217, abs=0.01)
+
+
+def test_high_cut_moves_the_allowance_instead_of_deleting_it():
+    """
+    The band-limited arm must be the SAME nominal visibility as the full-band
+    one, or it is a weaker attack rather than a differently-shaped one. The cut
+    runs before normalise_budget_to_tau, so the live bins absorb what the
+    corner gave up: pooled visibility stays at tau, the in-band RMS RISES, and
+    only the total RMS falls.
+    """
+    S, TAU = 256, 1.0
+    f = C.radial_frequency_cpp(S, S)
+    band = (f > 0.20) & (f <= 0.35)
+
+    def envelope(max_cpp):
+        csf, raw = C.patch_budget(S, threshold=1.0, max_cpp=max_cpp)
+        return C.normalise_budget_to_tau(raw, csf, threshold=TAU)
+
+    full, cut = envelope(0.0), envelope(0.35)
+    assert float(cut[f > 0.35].max()) == 0.0        # the cut actually bit
+    assert float(cut[band].min()) > float(full[band].min())   # and paid out
+
+    w = torch.full_like(full, 2.0)
+    w[:, 0] = 1.0
+    w[:, -1] = 1.0
+
+    def rms(B, m=None):
+        p = w * B.pow(2)
+        return float((p if m is None else p[m]).sum()) ** 0.5
+
+    assert rms(cut) < rms(full) / 5           # ~0.012 against 0.137
+    assert rms(cut, band) > rms(full, band)   # ~0.0119 against 0.0085
+
+    # Pooled visibility at all-bins-at-bound is tau for BOTH, which is the
+    # whole point: the two arms are matched on the observer model and differ
+    # only in where the energy sits. Built the way a run starts — a big randn
+    # projected onto the envelope, so every live bin lands at its bound.
+    torch.manual_seed(0)
+    csf, _ = C.patch_budget(S, threshold=1.0)
+    for B in (full, cut):
+        d, frac = C.projected_residual(torch.randn(1, 3, S, S) * 10.0, B)
+        # frac_at_bound is over ALL bins here, so for the cut envelope it tops
+        # out at the LIVE fraction (0.385 at 0.35 c/px) rather than at 1. Every
+        # live bin is still pinned, which is what this compares against.
+        assert frac == pytest.approx(float((B > 0).float().mean()), abs=1e-3)
+        assert float(C.visibility_index(d, csf)) == pytest.approx(TAU, rel=0.02)
+
+
+def test_high_cut_is_off_by_default_so_old_runs_are_untouched():
+    S = 128
+    for lref in (0.0, 0.097):
+        a = (C.patch_budget(S, threshold=1.0)[1] if lref == 0 else
+             C.patch_budget_at_luminance(S, lref, threshold=1.0)[1])
+        b = (C.patch_budget(S, threshold=1.0, max_cpp=0.0)[1] if lref == 0 else
+             C.patch_budget_at_luminance(S, lref, threshold=1.0,
+                                         max_cpp=0.0)[1])
+        assert torch.equal(a, b), lref
+
+
+def test_an_empty_band_is_refused_rather_than_divided_by():
+    """
+    A cut below the low cut zeroes every bin, and normalise_budget_to_tau would
+    then divide by its eps floor and return a budget of order 1e11 -- a run
+    that reports tau and is a blank screen's worth of noise. Caught at config
+    time, where the message can name both flags.
+    """
+    with pytest.raises(ValueError, match="empty"):
+        PatchConfig(mode="csf", size=128, csf_min_cycles=2.0,
+                    csf_max_cpp=0.01).validate()
+    with pytest.raises(ValueError, match="0.7072"):
+        PatchConfig(mode="csf", size=128, csf_max_cpp=0.9).validate()
+    with pytest.raises(ValueError, match="no rfft bin"):
+        C.band_limit(torch.ones(8, 5), 8, min_cycles=2.0, max_cpp=0.05)
+
+
 def test_residual_energy_concentrates_at_high_frequency():
     """The RAPSD is the direct evidence that camouflage happened."""
     torch.manual_seed(0)

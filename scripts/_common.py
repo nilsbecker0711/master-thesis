@@ -324,6 +324,17 @@ def add_csf_args(p):
                         "far. >0 switches to the calibrated budget, which is "
                         "~1.9x tighter at Nyquist — measured, not estimated. "
                         "0.097 is the Cityscapes train median at centre.")
+    g.add_argument("--csf_max_cpp", type=float, default=0.0,
+                   help="HIGH CUT on the budget, in cycles/pixel. 0 (default) "
+                        "= off, i.e. every run to date. The 1/CSF envelope "
+                        "puts 91.7%% of its power above 0.5 c/px and 99.6%% "
+                        "above 0.35 -- the diagonal corner, a 1-2px "
+                        "checkerboard, of which a 2x2 box average passes "
+                        "0.75%%. The cut is applied BEFORE the tau "
+                        "normalisation, so the surviving bins absorb the "
+                        "allowance: same nominal tau, same per-bin JND, ~11x "
+                        "less total RMS, more RMS in the bands the stem can "
+                        "propagate. 0.35 is the band the probe measured.")
     g.add_argument("--csf_param", default="pgd", choices=["pgd", "squash"],
                    help="mode=csf only. How the parameter becomes a residual. "
                         "pgd: the parameter IS the residual and every rfft bin "
@@ -553,6 +564,7 @@ def build_patch(a, device, mean_t, std_t, generator=None,
         csf_viewing_distance_cm=a.csf_viewing_distance_cm,
         csf_display_peak_cd_m2=getattr(a, "csf_display_peak_cd_m2", 100.0),
         csf_lref=getattr(a, "csf_lref", 0.0),
+        csf_max_cpp=getattr(a, "csf_max_cpp", 0.0),
         csf_composite=getattr(a, "csf_composite", "clip"),
         tsallis_q=getattr(a, "tsallis_q", 0.0),
         tsallis_schedule=getattr(a, "tsallis_schedule", "const"),
