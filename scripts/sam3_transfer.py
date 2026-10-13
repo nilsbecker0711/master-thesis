@@ -55,8 +55,7 @@ from PIL import Image
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from patchreach.data.cityscapes import (CityscapesSeg, class_name,
-                                        denormalise, label_to_colour,
-                                        norm_tensors)
+                                        denormalise, norm_tensors)
 from patchreach.metrics.miou import SegMetric, compare
 from patchreach.patch.spec import Patch
 from patchreach.utils import get_device, increment_path, seed_everything
@@ -354,78 +353,71 @@ def to_pil(normalised: torch.Tensor, mean_t, std_t) -> Image.Image:
 
 
 # ── visualisation ────────────────────────────────────────────────────────────
-# PIL only, deliberately: matplotlib is not a SAM 3 dependency and is not in
-# the sam3 env, so importing it would make the panel a second install problem.
+# SAME FIGURES AS THE TRAINING SCRIPT, not a parallel implementation.
+# overfit.py writes report.run(..., out_dir / "diagnostics", ...) and
+# evaluate.py writes report.save_panels(...); this calls the same helpers into
+# the same directory name, so a SAM 3 panel and a SegFormer panel can sit side
+# by side in the thesis without the reader re-learning the legend, the
+# change-map greys or the panel lettering.
+#
+# NEEDS MATPLOTLIB, which is not a SAM 3 dependency. The import is deferred and
+# its failure names the fix rather than throwing from six frames inside
+# report.py.
 
-UNASSIGNED_RGB = (255, 0, 255)      # magenta, so "no prompt claimed this pixel"
-                                    # is distinguishable from void (black).
+_NO_MPL = """
+The diagnostics panels need matplotlib, which is not a SAM 3 dependency and so
+is absent from this env:
+
+    python -m pip install matplotlib
+
+Underlying error: {err}
+"""
 
 
-def _colour(lbl: torch.Tensor) -> Image.Image:
-    """[H,W] trainIds (0..18, 19=UNASSIGNED, 255=void) -> PIL RGB.
+def _onehot(lbl: torch.Tensor, K: int = K_METRIC) -> torch.Tensor:
+    """[H,W] labels -> [1,K,H,W] one-hot, standing in for logits.
 
-    label_to_colour() blacks out everything >= 19, which would make UNASSIGNED
-    and void identical — and telling those apart is the whole point here: void
-    is "no ground truth", UNASSIGNED is "SAM 3 claimed nothing".
+    report.save_panels() consumes its two logit arguments ONLY through
+    upsample_to(...).argmax(1), so a one-hot round-trips to exactly the label
+    map it came from. That is what lets SAM 3 — which emits masks and scores,
+    never a logit volume — produce the identical figure set.
+
+    K is K_METRIC (20), not 19: UNASSIGNED has to survive the round trip, or
+    the change map would silently read "no prompt claimed this" as class 0.
     """
-    arr = (label_to_colour(lbl) * 255).to(torch.uint8).permute(1, 2, 0).numpy().copy()
-    arr[(lbl == UNASSIGNED).cpu().numpy()] = UNASSIGNED_RGB
-    return Image.fromarray(arr)
+    return F.one_hot(lbl.long(), K).permute(2, 0, 1).unsqueeze(0).float()
 
 
-def _changed(pc: torch.Tensor, pa: torch.Tensor, fp: torch.Tensor) -> Image.Image:
-    """Where the prediction moved. Red = changed OUTSIDE the footprint (the
-    only kind that is evidence of reach); blue = changed inside it (occlusion,
-    expected and uninteresting); grey = unchanged."""
-    ch = (pc != pa).cpu().numpy()
-    inside = fp.cpu().numpy()
-    h, w = ch.shape
-    arr = torch.full((h, w, 3), 40, dtype=torch.uint8).numpy()
-    arr[ch & ~inside] = (220, 30, 30)
-    arr[ch & inside] = (40, 90, 200)
-    return Image.fromarray(arr)
+def save_diagnostics(out_dir, img, label, patched, pc, pa, fp, patch,
+                     mean_t, std_t):
+    """The training script's panel set, for one image, under diagnostics/.
 
+    Writes a_clean, b_clean_prediction, c_patched, d_adv_prediction,
+    e_change_map, f_ground_truth, patch, panel.png and per_class_iou.png — the
+    same names overfit.py and evaluate.py produce.
 
-def _grid(cells, cell_w: int = 512, cols: int = 3) -> Image.Image:
-    """(title, PIL) pairs -> one labelled contact sheet."""
-    from PIL import ImageDraw
-    shots = [(t, im) for t, im in cells]
-    ar = shots[0][1].height / shots[0][1].width
-    cw, chh = cell_w, int(cell_w * ar)
-    bar, rows = 18, (len(shots) + cols - 1) // cols
-    sheet = Image.new("RGB", (cols * cw, rows * (chh + bar)), (16, 16, 16))
-    d = ImageDraw.Draw(sheet)
-    for i, (title, im) in enumerate(shots):
-        x, y = (i % cols) * cw, (i // cols) * (chh + bar)
-        sheet.paste(im.resize((cw, chh), Image.NEAREST), (x, y + bar))
-        d.text((x + 4, y + 4), title, fill=(235, 235, 235))
-    return sheet
-
-
-def save_panel(path, pil_clean, pil_adv, label, pc, pa, fp, prompts):
-    """Six panels: the two inputs, the two SAM 3 label maps, GT, and the diff.
-
-    The diff panel is the one to read first — red pixels outside the footprint
-    are the only thing that distinguishes transfer from occlusion.
+    UNASSIGNED (19) renders BLACK in the overlays: label_to_colour() blacks out
+    everything >= 19 and _legend_handles() filters it from the key. That is the
+    one place these panels differ in meaning from a SegFormer panel — black
+    here is "no prompt claimed this pixel", not void. Say so in the caption.
     """
-    from PIL import ImageDraw
-    adv = pil_adv.copy()
-    ys, xs = torch.where(fp.cpu())
-    if len(ys):
-        ImageDraw.Draw(adv).rectangle(
-            [int(xs.min()), int(ys.min()), int(xs.max()), int(ys.max())],
-            outline=(255, 255, 0), width=5)
-    sheet = _grid([
-        ("clean input", pil_clean),
-        ("patched input (footprint outlined)", adv),
-        ("ground truth", _colour(label)),
-        ("SAM 3 - clean", _colour(pc)),
-        ("SAM 3 - patched", _colour(pa)),
-        ("changed: red=outside fp, blue=inside", _changed(pc, pa, fp)),
-    ])
-    path.parent.mkdir(parents=True, exist_ok=True)
-    sheet.save(path)
-    return sheet
+    try:
+        from patchreach.diagnostics import report
+    except ImportError as e:                               # pragma: no cover
+        raise SystemExit(_NO_MPL.format(err=e))
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    lc, la = _onehot(pc), _onehot(pa)
+    # DETACH. Patch.apply() builds a differentiable chain from the patch
+    # parameter, so `patched` arrives carrying a graph and report.save_panels()
+    # calls .numpy() on it. to_pil() survives the same tensor only by accident:
+    # its .to(torch.uint8) drops the graph, because integer tensors cannot
+    # require grad. Nothing downstream of here needs gradients.
+    report.save_panels(img.detach(), label, patched.detach(), lc, la,
+                       fp.unsqueeze(0), patch, mean_t, std_t, out_dir)
+    return report.per_class_iou_figure(
+        lc, la, label, K_METRIC, out_dir / "per_class_iou.png", None,
+        title="SAM 3, per-class IoU")
 
 
 # ── main ─────────────────────────────────────────────────────────────────────
@@ -611,9 +603,9 @@ def main():
         # The panel goes here rather than beside the raw PNG dump above,
         # because it needs pc/pa, which do not exist until after prompt_all.
         if a.save_png:
-            save_panel(out_dir / "images" / f"img{i:04d}_panel.png",
-                       pil_clean, pil_adv, label[0], pc[0], pa[0],
-                       fp_cpu[0], prompts)
+            save_diagnostics(out_dir / "diagnostics" / f"img{i:04d}",
+                             img, label, patched, pc[0], pa[0], fp_cpu[0],
+                             patch, mean_t, std_t)
 
         m["clean_all"].update(pc, label)
         m["clean_rem"].update(pc, label, exclude=fp_cpu)
