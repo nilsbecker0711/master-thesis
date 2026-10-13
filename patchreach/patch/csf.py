@@ -204,8 +204,15 @@ class ViewingGeometry:
         log(f"[csf ] verify by : viewing at {self.matched_distance_cm(1.0):.0f}"
             f"/PPI cm — {self.matched_distance_cm(141):.0f} cm on a 141 PPI "
             f"laptop, {self.matched_distance_cm(93):.0f} cm on a 93 PPI panel")
-        log(f"[csf ] Nyquist   : {self.nyquist_cpd:.1f} cpd "
-            f"(human cutoff is ~50-60 cpd, so the grid does not reach it)")
+        # THE DIAGONAL IS THE ONE THAT MATTERS, and printing only the
+        # per-axis figure invited the wrong conclusion: "38.3 cpd, below the
+        # ~50-60 cpd human cutoff, so the grid cannot represent a frequency
+        # that is invisible outright" is false on the diagonal, where the grid
+        # reaches 54.1 cpd with CSF 1.27 rather than 0 -- which is why the
+        # envelope hands those bins ~560x the allowance it gives the peak.
+        log(f"[csf ] Nyquist   : {self.nyquist_cpd:.1f} cpd per axis, "
+            f"{self.nyquist_cpd * 2 ** 0.5:.1f} cpd on the diagonal "
+            f"(human cutoff ~50-60 cpd, so the corner is inside the passband)")
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -226,6 +233,26 @@ class BartenParams:
     E: float = 500.0              # Td, retinal illuminance
     phi_0: float = 3e-8           # deg^2 s, neural noise
     u_0: float = 7.0              # cpd, lateral inhibition cutoff
+
+
+# THE RADIAL BANDS, and they run to sqrt(2)/2 = 0.7071, not to 0.5.
+#
+# 0.5 c/px is the per-AXIS Nyquist. radial_frequency_cpp returns the LENGTH of
+# (fy, fx), and the corner bin has both components at 0.5, so |f| = 0.707 --
+# the pixel checkerboard, whose bars run diagonally and sit 1/sqrt(2) px apart.
+# Neither axis exceeds Nyquist; the diagonal of the box is simply longer than
+# its sides.
+#
+# THE TOP BAND IS NOT COSMETIC. 91.7% of the normalised envelope's power sits
+# above 0.5 c/px and 99.6% above 0.35 (size 256, tau 1), so a band list that
+# stopped at 0.5 measured six bands holding 0.4% of the budget and never looked
+# at the band holding the rest. spectral.DEFAULT_BANDS is this list, so the
+# sensitivity probe and this module's budget table cannot drift apart.
+MAX_CPP: float = 2 ** 0.5 / 2
+
+RADIAL_BANDS: Tuple[Tuple[float, float], ...] = (
+    (0.00, 0.02), (0.02, 0.05), (0.05, 0.10),
+    (0.10, 0.20), (0.20, 0.35), (0.35, 0.50), (0.50, 0.71))
 
 
 def optical_mtf(f_cpd: torch.Tensor, sigma: float) -> torch.Tensor:
@@ -905,8 +932,7 @@ def report(H: int, W: int, geometry: ViewingGeometry = ViewingGeometry(),
         f"{float(f_cpp.reshape(-1)[int(csf.argmax())]):.4f} cyc/px "
         f"({float(geometry.to_cycles_per_degree(f_cpp.reshape(-1)[int(csf.argmax())])):.2f} cpd)")
     log("[csf ] amplitude budget by radial frequency:")
-    for lo, hi in ((0.0, 0.02), (0.02, 0.05), (0.05, 0.1),
-                   (0.1, 0.2), (0.2, 0.35), (0.35, 0.5001)):
+    for lo, hi in RADIAL_BANDS:
         m = (f_cpp >= lo) & (f_cpp < hi)
         if not bool(m.any()):
             continue

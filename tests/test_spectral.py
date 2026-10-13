@@ -141,6 +141,44 @@ def test_scale_to_cost_hits_the_target_exactly():
     assert torch.allclose(v, torch.full_like(v, 0.25), atol=1e-5)
 
 
+def test_the_default_bands_cover_the_grid_to_its_radial_maximum():
+    """
+    THE GAP THIS CLOSES. The list stopped at 0.50 while the rfft grid runs to
+    sqrt(2)/2 = 0.7071, so the probe measured six bands holding 0.4% of the
+    budget's power and never touched the band holding the other 99.6%. RQ1 was
+    answered over the frequencies the attack barely uses.
+    """
+    assert S.DEFAULT_BANDS is C.RADIAL_BANDS          # one list, not two
+    lo0, hi_last = S.DEFAULT_BANDS[0][0], S.DEFAULT_BANDS[-1][1]
+    assert lo0 == 0.0
+    assert hi_last > C.MAX_CPP                        # the corner is inside
+    for (a_lo, a_hi), (b_lo, b_hi) in zip(S.DEFAULT_BANDS,
+                                          S.DEFAULT_BANDS[1:]):
+        assert a_hi == b_lo                           # no gaps, no overlaps
+
+    # every bin of a real grid falls in exactly one band
+    f = C.radial_frequency_cpp(64, 64)
+    n = sum(int(((f >= lo) & (f < hi)).sum()) for lo, hi in S.DEFAULT_BANDS)
+    assert n == f.numel()
+
+
+def test_the_top_band_stimulus_is_non_empty_and_stays_in_band():
+    """
+    A band whose mask selects no bin would silently probe nothing: the stimulus
+    is all-zero, the flip rate is 0.0, and the row reads as "the network cannot
+    see this band" when in fact nothing was shown to it.
+    """
+    lo, hi = S.DEFAULT_BANDS[-1]
+    d = S.band_limited_noise(2, 64, 64, lo, hi)
+    assert float(d.abs().max()) > 0
+
+    f = C.radial_frequency_cpp(64, 64)
+    mag = torch.fft.rfft2(d, norm="forward").abs()
+    inside = float(mag[:, :, (f >= lo) & (f < hi)].pow(2).sum())
+    total = float(mag.pow(2).sum())
+    assert inside / total > 0.999
+
+
 def test_scale_to_cost_does_not_move_energy_between_bands():
     """
     A uniform rescale is the ONLY normalisation that leaves the spectrum's
