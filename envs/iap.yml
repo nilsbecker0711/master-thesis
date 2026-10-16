@@ -1,0 +1,95 @@
+# Environment for the IAP comparison arm (scripts/iap_attack.py).
+#
+# WHAT IT NEEDS THAT THE ATTACK ENV DOES NOT
+# ------------------------------------------
+# One package: torchmetrics, for the SSIM and PSNR the reference reports
+# (`SSIM(data_range=1.0)`, `PSNR(data_range=1.0)`). It is already pinned in
+# requirements.txt at 0.11.4 but is not guaranteed to be present in the
+# cluster env.
+#
+# It needs no other new dependency, and that is a decision, not luck:
+#
+#   pytorch_grad_cam   NOT USED. The reference's GradCAM is built for a Swin
+#                      CLASSIFIER with a reshape_transform; there is no
+#                      classification logit to differentiate in a segmentor, so
+#                      localisation goes through this repository's own
+#                      patch/segmentation_cam.py instead (deviation D2).
+#   opencv             only imported by the reference's utils.py and never
+#                      called.
+#   timm               only for the reference's own Swin checkpoints.
+#
+# Everything else IAP touches — the segmentors, Cityscapes, the objectives — is
+# the attack stack: torch 1.11 + mmcv 1.x + mmseg 0.x.
+#
+# THE RELIABLE ROUTE IS A CLONE, NOT THIS FILE
+# --------------------------------------------
+# The attack stack is a pinned torch 1.11 / mmcv-full 1.x / mmseg 0.x triple
+# whose versions must match what the checkpoints were trained under, and
+# solving it from scratch is a gamble that is only worth taking on a machine
+# that does not already have it. Where it exists, clone it and add the one
+# package:
+#
+#   conda create --name iap --clone <the attack env>      # thesis_backup3
+#   conda activate iap
+#   pip install torchmetrics==0.11.4
+#   pip install -e . --no-deps
+#
+# Two minutes, no solve, and bit-identical model behaviour to every other arm
+# of the thesis — which is the point of a comparison arm.
+#
+# FROM SCRATCH (this file), for a machine without the attack env
+# --------------------------------------------------------------
+#   conda env create -f envs/iap.yml
+#   conda activate iap
+#   # mmcv-full is NOT on PyPI for this combination; mim resolves the
+#   # openmmlab wheel index for the installed torch/CUDA pair:
+#   mim install "mmcv-full==1.6.2"
+#   pip install "mmsegmentation==0.29.1"
+#   pip install -e . --no-deps
+#
+# CONFIRM THOSE TWO PINS against the working attack env before trusting a
+# number from this arm — `pip list | grep -i mm` there — because mmcv/mmseg
+# minor versions move the config schema and a config that builds a DIFFERENT
+# variant from the checkpoint loads with missing-key warnings and runs.
+#
+# WHAT IS NOT AVAILABLE HERE: --arch internimage_*. InternImage needs the
+# mmseg_custom package and a compiled ops_dcnv3 CUDA extension, neither of
+# which is part of patch-reach (see models/registry.py). SegFormer, SETR,
+# Swin/UPerNet and the DeepLabs all run without it, which is enough for the
+# csf-vs-IAP comparison; add InternImage only if that row is required, and
+# then clone the attack env rather than building this one.
+#
+# CPU IS ENOUGH FOR THE TESTS, not for a run. `pytest -q tests/test_iap.py`
+# needs only torch and torchmetrics — no segmentor, no CUDA. One IAP image is
+# three rungs x 1000 steps at 1024x2048.
+name: iap
+channels:
+  - conda-forge
+dependencies:
+  # 3.9 — the cluster's python, and mmcv 1.x wheels are built for it.
+  - python=3.9
+  - pip
+  - numpy<2
+  - scipy
+  - pillow
+  - matplotlib
+  - pandas
+  - pyyaml
+  - tqdm
+  - pip:
+      # cu113 to match `module load cuda/11.8`-era drivers on the cluster; the
+      # wheels bundle their own CUDA runtime.
+      - --extra-index-url https://download.pytorch.org/whl/cu113
+      - torch==1.11.0+cu113
+      - torchvision==0.12.0+cu113
+      # SSIM and PSNR, the two invisibility metrics the reference computes
+      # itself. 0.11.4 is requirements.txt's pin; later majors moved the
+      # import path for the image metrics.
+      - torchmetrics==0.11.4
+      # mim, which is how mmcv-full is installed (see the header — it cannot
+      # come from this file, because the wheel index depends on the torch and
+      # CUDA versions resolved above).
+      - openmim==0.3.9
+      - yapf==0.32.0          # mmcv imports it at config-parse time
+      - addict==2.4.0         # mmcv Config
+      - prettytable==3.16.0   # mmseg's eval tables
