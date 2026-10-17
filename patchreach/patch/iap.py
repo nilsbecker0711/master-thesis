@@ -1,5 +1,5 @@
-r"""
-IAP — Invisible Adversarial Patch (Dutta & Zhang, ICCV 2025), ported to
+﻿r"""
+IAP â€” Invisible Adversarial Patch (Dutta & Zhang, ICCV 2025), ported to
 semantic segmentation.
 
     paper  https://arxiv.org/abs/2507.06856
@@ -14,7 +14,7 @@ replaces. The difference is which visibility model. csf uses a contrast
 sensitivity function over spatial frequency; IAP uses a local-texture
 sensitivity map, pixel-local, no frequency axis at all. Having both means the
 thesis compares two visibility models under one attack, one dataset and one set
-of architectures — which is a result — rather than quoting IAP's ImageNet
+of architectures â€” which is a result â€” rather than quoting IAP's ImageNet
 classification numbers beside Cityscapes segmentation numbers, which is not.
 
 WHAT IAP IS, in four parts. Every one is reproduced here.
@@ -28,7 +28,7 @@ WHAT IAP IS, in four parts. Every one is reproduced here.
                               w1 * (toward target) + w2 * (away from truth)
                               + w3 * sum( sens * |delta - base| ).
   4. COLOUR-CONSTANT UPDATE   delta <- delta - lr * mean_c(grad) * delta / sens.
-                              Three multiplications, each load-bearing — see
+                              Three multiplications, each load-bearing â€” see
                               colour_constant_step_.
 
 and around them: delta initialised to the image region itself, a ladder of
@@ -46,28 +46,28 @@ difference against csf is attributable to the visibility model.
 Parts 1, 2 and 4 are pixel-space operations on the patch and its neighbourhood.
 They do not know what task the model performs and are ported unchanged.
 
-DECLARED DEVIATIONS — every one of these belongs in the write-up
+DECLARED DEVIATIONS â€” every one of these belongs in the write-up
 ----------------------------------------------------------------
 D1  THE PAPER AND THE RELEASED CODE DISAGREE ON THE LOCALISATION SCORE. The
     paper scores a window by J_y / Sens; utils.py computes exactly that
     (`perturbPrior`) and then calls find_location(image, mask, ...) with the
     RAW CAM, so perturbPrior is dead code and the released localisation is
     Grad-CAM alone. Both are available here via `score=`, and the DEFAULT is
-    'cam' — the released behaviour, because that is the procedure that produced
+    'cam' â€” the released behaviour, because that is the procedure that produced
     the published numbers. 'cam_over_sens' is the paper's text.
 
 D2  GRAD-CAM. Classification Grad-CAM differentiates one logit; there is no
     such scalar for a segmentor. This uses the repository's SegmentationCAM
     (S_seg = -L, see patch/segmentation_cam.py) with the model's own argmax as
     the pseudo-label, which makes the score the mean log-probability of the
-    prediction rather than a raw logit — the post-softmax Grad-CAM variant.
+    prediction rather than a raw logit â€” the post-softmax Grad-CAM variant.
     The reference additionally passes eigen_smooth=True and aug_smooth=True to
     pytorch_grad_cam; neither is reproduced. aug_smooth averages the map over
     flips and scale jitter, which is six extra full-resolution forward AND
     backward passes per image at 1024x2048.
 
 D3  THE REGULARISER IS A SUM over patch elements, and the patch grew from
-    84x84 to 256x256 — 9.3x more elements. At equal mean |delta - base| the
+    84x84 to 256x256 â€” 9.3x more elements. At equal mean |delta - base| the
     term is therefore 9.3x larger against adversarial losses that are per-pixel
     MEANS and have not changed scale. w3 = 3 is consequently NOT the same
     operating point it was in the paper. `reduce='sum'` is the released
@@ -84,14 +84,14 @@ D4  THE LADDER'S FAILURE BRANCH. The released code tries lr in
 
 D5  THE EARLY STOP. "argmax == target and softmax >= 0.9" has no single-label
     analogue. The criteria here are built on the metrics this thesis already
-    reports (metrics/miou.attack_rates) — see `progress_rate`. All of them are
+    reports (metrics/miou.attack_rates) â€” see `progress_rate`. All of them are
     strictly harder to satisfy than a one-label flip, so the ladder usually
     runs every rung, which is the compute IAP budgets for a failed attack.
 
 D6  CLIPPING. The paper says the update is clipped to the valid pixel range;
     the released code never clips, so delta can leave [0,1] and the saved
     "image" is not one. Clipping here is Patch.project() under
-    pixel_param='direct' — the repository's own PGD projection — and it is ON
+    pixel_param='direct' â€” the repository's own PGD projection â€” and it is ON
     by default. `clamp=False` reproduces the released code.
 
 D7  THE SENSITIVITY MAP'S BORDER. The reference's windows are ANCHORED at
@@ -105,7 +105,7 @@ D7  THE SENSITIVITY MAP'S BORDER. The reference's windows are ANCHORED at
 
 D8  THE FOOTPRINT IS EXCLUDED from both adversarial terms. Classification has
     no analogue; segmentation must, or the cheapest minimiser of a targeted
-    loss is to paint the patch itself in the target class — loss collapses,
+    loss is to paint the patch itself in the target class â€” loss collapses,
     remote effect stays zero. See losses/adversarial.ipatch_cospgd_loss.
 
 D9  IN THE RELEASED CODE THE REGULARISER HAS NO GRADIENT AT ALL, and this is
@@ -125,8 +125,8 @@ D9  IN THE RELEASED CODE THE REGULARISER HAS NO GRADIENT AT ALL, and this is
     on the reference's own expression: with |delta - temp| held at 0.1 the term
     is worth 2542.7 and what reaches delta.grad is 0.000e+00.
 
-    So the perceptibility regulariser changes the REPORTED loss — it is the
-    paper's "human distance" column — and changes the OPTIMISATION not at all.
+    So the perceptibility regulariser changes the REPORTED loss â€” it is the
+    paper's "human distance" column â€” and changes the OPTIMISATION not at all.
     Whatever invisibility the released code achieves comes from the 1/sens
     factor in the update rule and from starting at the image region, i.e. from
     parts 1 and 4, and not from part 3. A direct consequence worth stating in
@@ -137,7 +137,7 @@ D9  IN THE RELEASED CODE THE REGULARISER HAS NO GRADIENT AT ALL, and this is
     so the gradient is live and equals w3 * sens * sign(delta - base). This is
     the one place the port deliberately prefers the paper, and the reason is
     that the alternative is to reproduce a method whose central regularisation
-    term provably does nothing — which is not what "IAP" denotes in the
+    term provably does nothing â€” which is not what "IAP" denotes in the
     literature and not how a reviewer would read the name. D1 goes the other
     way, to the released code, because there BOTH branches are coherent
     procedures; here one of them is a dropped term.
@@ -154,7 +154,7 @@ D10 UNDER SLIDE INFERENCE THE LOCALISATION MAP IS WHOLE-FRAME WHILE THE ATTACK
     inference calls the segmentor once per window, so a forward hook on the
     backbone fires n_windows times; SegmentationCAM._hook assigns rather than
     appends, so only the last window's activations survive, and the rest of the
-    CAM then treats one tile as the frame. It does not raise — a 4-D backbone
+    CAM then treats one tile as the frame. It does not raise â€” a 4-D backbone
     yields a tile's CAM stretched over the whole frame, and a token backbone
     has the window's token count mis-factorised against the frame's dimensions
     into a transposed map. Measured; see tests/verify_cam_rejects_tiled.py.
@@ -169,7 +169,7 @@ D10 UNDER SLIDE INFERENCE THE LOCALISATION MAP IS WHOLE-FRAME WHILE THE ATTACK
     does.
 
     ARGUE IT BOTH WAYS, because it genuinely cuts both ways. In favour: the
-    whole-frame map is the better localisation signal — it is not truncated at
+    whole-frame map is the better localisation signal â€” it is not truncated at
     tile boundaries, and a tiled map would be an artefact of the tiling grid
     rather than of the model's sensitivity. Against: the map and the attack no
     longer see the same model behaviour, so "IAP localised this patch" and "the
@@ -179,7 +179,7 @@ D10 UNDER SLIDE INFERENCE THE LOCALISATION MAP IS WHOLE-FRAME WHILE THE ATTACK
 
     WHAT IT COSTS, and the reason it is not the default: one un-tiled forward
     AND backward at the full input size, per image. That is precisely what the
-    2026-09-21 log entry calls memory-bound at native resolution — slide +
+    2026-09-21 log entry calls memory-bound at native resolution â€” slide +
     checkpointing makes the attack LOOP cheap, not this pass. prepare() resets
     the CUDA peak counter around it, reports the figure, and converts an OOM
     into a message naming --iap_locate center as the fallback.
@@ -189,14 +189,14 @@ D10 UNDER SLIDE INFERENCE THE LOCALISATION MAP IS WHOLE-FRAME WHILE THE ATTACK
     and the attack share a model. Here they do not, so the clean baseline is
     taken from the attack's model in a separate pass. Reusing them would
     measure clean mIoU under whole-frame inference and the attacked frame under
-    slide, making every drop in the run the difference of two inference modes —
+    slide, making every drop in the run the difference of two inference modes â€”
     off by a point or two, i.e. invisible.
 
 WHAT THIS MODULE IS NOT
 -----------------------
 It is not a PatchConfig mode. IAP's parameterisation IS this repository's
-raw + pixel_param='direct' — the parameter is the pixel, projected back into
-[0,1] after the step — so a new mode would be a second name for an existing
+raw + pixel_param='direct' â€” the parameter is the pixel, projected back into
+[0,1] after the step â€” so a new mode would be a second name for an existing
 one. What IAP adds is a different STEP RULE and a different REGULARISER, and
 those live here, driven by scripts/iap_attack.py.
 
@@ -217,7 +217,7 @@ from ..losses import adversarial
 from ..metrics.miou import single_image_miou, attack_rates
 from .placement import find_max_response_placement
 
-# ── the released settings, named once ────────────────────────────────────────
+# â”€â”€ the released settings, named once â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 # src/IAP.py: learning_rates = [0.05,0.09,0.2]; iterations = 1000; the loss
 # weights are the literals 1.5, 1.0 (implicit) and 3 in its `loss = ...` line.
 # src/utils.py: sens = 1/(stdimg+0.001).
@@ -225,7 +225,7 @@ IAP_LRS: Tuple[float, ...] = (0.05, 0.09, 0.2)
 IAP_STEPS = 1000
 IAP_W1, IAP_W2, IAP_W3 = 1.5, 1.0, 3.0
 SENS_EPS = 1e-3
-# 84x84 on 224x224 — the geometry every published IAP number was measured at.
+# 84x84 on 224x224 â€” the geometry every published IAP number was measured at.
 # Only reduce='sum84' reads it; see D3.
 REF_PATCH_SIDE = 84
 
@@ -235,7 +235,7 @@ REG_REDUCTIONS = ("sum", "sum84", "mean")
 # other arm of this thesis uses, so the difference between it and 'cam' IS the
 # contribution of perceptibility-aware localisation. Yuan et al.'s Table 7 puts
 # centre at the STRONGEST position, so this control can beat the real thing on
-# attack strength while losing on invisibility — which is the trade IAP claims
+# attack strength while losing on invisibility â€” which is the trade IAP claims
 # to make, stated as a measurement.
 LOCALISE_SCORES = ("cam", "cam_over_sens", "center")
 STOP_CRITERIA = ("none", "flip", "target", "drop")
@@ -245,9 +245,9 @@ STOP_CRITERIA = ("none", "flip", "target", "drop")
 REG_GRADS = ("live", "released")
 
 
-# ═════════════════════════════════════════════════════════════════════════════
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 #  1. the sensitivity map
-# ═════════════════════════════════════════════════════════════════════════════
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 
 def window_std(x: torch.Tensor, dh: int, dw: int) -> torch.Tensor:
     r"""
@@ -256,7 +256,7 @@ def window_std(x: torch.Tensor, dh: int, dw: int) -> torch.Tensor:
 
         out[b,i,j] = mean_c std( x[b, c, i:i+dh, j:j+dw] )
 
-    with std the UNBIASED (n-1) estimator — torch's default, and what
+    with std the UNBIASED (n-1) estimator â€” torch's default, and what
     utils.py's `subset[0].std()` computes.
 
     THE REFERENCE IS A DOUBLE PYTHON LOOP over every pixel. At 224x224 that is
@@ -270,7 +270,7 @@ def window_std(x: torch.Tensor, dh: int, dw: int) -> torch.Tensor:
     a near-constant window it is catastrophic cancellation: S2 and S^2/n agree
     to six digits precisely where the map matters most (smooth regions, which
     is where sens is LARGE and the whole mechanism lives), and the fp32
-    difference is noise. The stack costs dh*dw views — 3 — and is exact.
+    difference is noise. The stack costs dh*dw views â€” 3 â€” and is exact.
     """
     if dh < 1 or dw < 1:
         raise ValueError(f"window must be at least 1x1, got {dh}x{dw}")
@@ -307,7 +307,7 @@ def _cuda_peak(device) -> Optional[int]:
 def _anchor(std: torch.Tensor, H: int, W: int) -> torch.Tensor:
     """
     Place a [B,h,w] window statistic at the window's TOP-LEFT pixel and leave
-    the remainder zero — utils.py's `stdten[i][j] = std` with i, j the loop
+    the remainder zero â€” utils.py's `stdten[i][j] = std` with i, j the loop
     variables. See D7 for what the zero band costs.
     """
     out = std.new_zeros(std.shape[0], H, W)
@@ -328,7 +328,7 @@ def sensitivity(x01: torch.Tensor, eps: float = SENS_EPS) -> torch.Tensor:
     scored as SENSITIVE. Perturbing along a clean edge is exactly what a human
     eye finds; perturbing inside foliage is not.
 
-    `x01` must be in [0,1] — the scale the reference works on and the scale eps
+    `x01` must be in [0,1] â€” the scale the reference works on and the scale eps
     = 1e-3 is calibrated for. Pass a denormalised image, never a mean/std
     normalised one, or eps becomes meaningless and the 1/eps ceiling moves.
     """
@@ -341,9 +341,9 @@ def sensitivity(x01: torch.Tensor, eps: float = SENS_EPS) -> torch.Tensor:
     return 1.0 / (torch.minimum(sx, sy).sqrt() + eps)
 
 
-# ═════════════════════════════════════════════════════════════════════════════
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 #  2. localisation
-# ═════════════════════════════════════════════════════════════════════════════
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 
 @torch.no_grad()
 def localise(cam: torch.Tensor, sens: torch.Tensor, p: int,
@@ -358,9 +358,9 @@ def localise(cam: torch.Tensor, sens: torch.Tensor, p: int,
            score='cam_over_sens'.
     score: 'cam'           argmax_window sum(J).           THE RELEASED CODE.
            'cam_over_sens' argmax_window sum(J/(sens+eps)). THE PAPER'S TEXT.
-           See D1 — they are not the same procedure and the two place the patch
+           See D1 â€” they are not the same procedure and the two place the patch
            differently on real images.
-           'center'        the image centre. NOT IAP — the localisation
+           'center'        the image centre. NOT IAP â€” the localisation
            ablation; see LOCALISE_SCORES.
 
     `p` must be given in every case, including 'center', because the centre of
@@ -394,9 +394,9 @@ def localise(cam: torch.Tensor, sens: torch.Tensor, p: int,
                                        margin=margin)
 
 
-# ═════════════════════════════════════════════════════════════════════════════
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 #  3. the perceptibility regulariser
-# ═════════════════════════════════════════════════════════════════════════════
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 
 def regulariser(delta: torch.Tensor, base: torch.Tensor,
                 sens_patch: torch.Tensor, reduce: str = "sum",
@@ -406,7 +406,7 @@ def regulariser(delta: torch.Tensor, base: torch.Tensor,
 
     the third term of IAP's loss, `3*(sens.detach()*torch.abs(delta-temp)).sum()`.
 
-    `sens` is detached — it is a property of the CLEAN image and never of the
+    `sens` is detached â€” it is a property of the CLEAN image and never of the
     patch, so a gradient through it would be a gradient through a constant that
     happens to be computed from a tensor.
 
@@ -415,7 +415,7 @@ def regulariser(delta: torch.Tensor, base: torch.Tensor,
     a few pixels and leave the rest at the base. Weighted by sens, those few
     pixels are the textured ones.
 
-    reduce : 'sum'    the released arithmetic. Scale depends on p**2 — see D3.
+    reduce : 'sum'    the released arithmetic. Scale depends on p**2 â€” see D3.
              'sum84'  sum * (side_ref/p)**2, so w3 keeps its published meaning
                       at a patch size the paper never ran.
              'mean'   scale-free, and NOT what IAP does. Here only so the
@@ -435,9 +435,9 @@ def regulariser(delta: torch.Tensor, base: torch.Tensor,
     return total
 
 
-# ═════════════════════════════════════════════════════════════════════════════
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 #  4. the colour-constant update
-# ═════════════════════════════════════════════════════════════════════════════
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 
 @torch.no_grad()
 def colour_constant_step_(param: torch.Tensor, sens_patch: torch.Tensor,
@@ -454,7 +454,7 @@ def colour_constant_step_(param: torch.Tensor, sens_patch: torch.Tensor,
     THREE FACTORS, EACH DOING ONE JOB.
 
     mean_c(grad)  every channel of a pixel gets the SAME update, so the pixel
-                  moves along the grey axis and its RGB ratios — its hue — are
+                  moves along the grey axis and its RGB ratios â€” its hue â€” are
                   preserved. This is the "colour constancy" of the paper's
                   title claim and the reason it is not Adam: Adam updates each
                   channel independently and recolours the patch, which is the
@@ -463,7 +463,7 @@ def colour_constant_step_(param: torch.Tensor, sens_patch: torch.Tensor,
     * param       the update is RELATIVE. A dark pixel moves little in absolute
                   terms, a bright one moves more, which is Weber's law and also
                   keeps the step small near 0. Note the consequence: a pixel at
-                  EXACTLY 0 is an absorbing state — its step is zero forever.
+                  EXACTLY 0 is an absorbing state â€” its step is zero forever.
                   Starting from image content (where true black is rare) this
                   is a corner case, but it is why param must never be
                   initialised to zeros.
@@ -474,7 +474,7 @@ def colour_constant_step_(param: torch.Tensor, sens_patch: torch.Tensor,
                   mechanism, and it is worth seeing what it does to the
                   regulariser: dR/d(delta) is proportional to sens, and this
                   factor divides by sens, so the regulariser's contribution to
-                  the step is sens-INDEPENDENT — a uniform relative pull of
+                  the step is sens-INDEPENDENT â€” a uniform relative pull of
                   rate lr*w3 back toward the base. The adversarial gradient is
                   the only term the texture gates. Invisibility is therefore
                   not bought by penalising harder in smooth regions; it is
@@ -482,14 +482,14 @@ def colour_constant_step_(param: torch.Tensor, sens_patch: torch.Tensor,
 
     `param` is the [3,p,p] parameter of a Patch in raw/direct mode, so the
     channel axis is -3 and the grad is read off `param.grad`. Clipping back
-    into [0,1] is the CALLER's job, via Patch.project() — see D6 — because that
+    into [0,1] is the CALLER's job, via Patch.project() â€” see D6 â€” because that
     is where this repository's projection lives and a second clamp here would
     fork the definition.
     """
     g = param.grad
     if g is None:
         raise RuntimeError(
-            "IAP step with param.grad = None — the graph never reached the "
+            "IAP step with param.grad = None â€” the graph never reached the "
             "patch. Check that the composite was built from the parameter "
             "(Patch.apply) and that backward() ran.")
     if not torch.isfinite(g).all():
@@ -502,9 +502,9 @@ def colour_constant_step_(param: torch.Tensor, sens_patch: torch.Tensor,
             "grad_absmean": float(g.abs().mean())}
 
 
-# ═════════════════════════════════════════════════════════════════════════════
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 #  the loss
-# ═════════════════════════════════════════════════════════════════════════════
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 
 class Objective:
     r"""
@@ -534,7 +534,7 @@ class Objective:
     untar : 'ce', 'cospgd', 'margin', 'cos_margin' or 'none'. The term away
           from the truth. 'ce' is IAP's literal -CE(pred, truth).
     'none' on either slot drops it. tar='none' makes the attack UNTARGETED,
-          which IAP never is — declare it as an extension, not as IAP.
+          which IAP never is â€” declare it as an extension, not as IAP.
     """
 
     def __init__(self, tar: str = "ipatch_cospgd", untar: str = "ce",
@@ -553,7 +553,7 @@ class Objective:
             raise ValueError(f"iap_untar_loss {untar!r} is not a loss in "
                              f"losses/adversarial.py")
         if tar == "none" and untar == "none":
-            raise ValueError("both adversarial terms are 'none' — that run "
+            raise ValueError("both adversarial terms are 'none' â€” that run "
                              "optimises the regulariser alone and converges "
                              "back to the clean image region")
         if untar in ("margin", "cos_margin") and margin_ref is None:
@@ -583,7 +583,7 @@ class Objective:
         """
         Forward the progress counter to whichever term is stateful.
 
-        NO TERM OFFERED HERE IS STATEFUL TODAY — tsallis is deliberately absent
+        NO TERM OFFERED HERE IS STATEFUL TODAY â€” tsallis is deliberately absent
         from the untargeted choices, because IAP's second term is a plain
         cross-entropy and a scheduled q would stack a second deviation on top
         of the port. The hook exists anyway, and that is what
@@ -602,7 +602,7 @@ class Objective:
         Every term separately, plus 'total'. Separately because a run whose
         regulariser is three orders of magnitude above its adversarial terms
         has not converged to an invisible patch, it has converged to the clean
-        image — and the only way to see that is to log the parts. D3 is exactly
+        image â€” and the only way to see that is to log the parts. D3 is exactly
         that failure waiting at a patch size the paper never ran.
         """
         out = {}
@@ -613,7 +613,7 @@ class Objective:
             # ignores the labels slot because it closed over margin_ref at
             # build time. So `label` is passed unconditionally and the
             # margin/cos_margin pair still scores against the clean
-            # prediction — there is nothing to substitute here.
+            # prediction â€” there is nothing to substitute here.
             lu = self._untar(logits, label, footprint, support)
             out["untar"] = float(lu)
             total = total + self.w2 * lu
@@ -633,9 +633,9 @@ class Objective:
         return out
 
 
-# ═════════════════════════════════════════════════════════════════════════════
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 #  the early stop
-# ═════════════════════════════════════════════════════════════════════════════
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 
 @torch.no_grad()
 def progress_rate(clean_logits, adv_logits, label, footprint,
@@ -651,8 +651,8 @@ def progress_rate(clean_logits, adv_logits, label, footprint,
     'drop'   remote mIoU points lost                             [0,100]
     'none'   0.0, i.e. never stops
 
-    All three come from the metrics this thesis already reports —
-    metrics/miou.attack_rates and single_image_miou — so a run that stopped
+    All three come from the metrics this thesis already reports â€”
+    metrics/miou.attack_rates and single_image_miou â€” so a run that stopped
     early stopped on a quantity that appears in the results table, not on a
     private criterion invented for the stop.
 
@@ -680,22 +680,22 @@ def progress_rate(clean_logits, adv_logits, label, footprint,
     return r[key] / 100.0
 
 
-# ═════════════════════════════════════════════════════════════════════════════
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 #  invisibility
-# ═════════════════════════════════════════════════════════════════════════════
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 
 def ssim_psnr(a: torch.Tensor, b: torch.Tensor,
-              data_range: float = 1.0) -> Tuple[float, float]:
+              data_range: float = 1.0) -> Tuple[float, Optional[float]]:
     """
     (SSIM, PSNR) for one [1,3,h,w] pair in [0,1], via torchmetrics with
-    data_range=1.0 — the reference's `SSIM(data_range=1.0)` and
+    data_range=1.0 â€” the reference's `SSIM(data_range=1.0)` and
     `PSNR(data_range=1.0)`.
 
     torchmetrics rather than a local implementation because the reference uses
     it and SSIM has enough free parameters (kernel size, sigma, which channels,
     whether the mean is over windows or pixels) that two "SSIM"s routinely
-    differ in the second decimal. The paper's broader invisibility suite —
-    LPIPS, CLIPScore, UIQ, SRE — is NOT computed here: scripts/lpips_eval.py
+    differ in the second decimal. The paper's broader invisibility suite â€”
+    LPIPS, CLIPScore, UIQ, SRE â€” is NOT computed here: scripts/lpips_eval.py
     already owns perceptual scoring in its own environment, and iap_attack.py
     writes the a_clean.png / c_patched.png pair that script discovers. One
     implementation of LPIPS in this repository, not two.
@@ -711,7 +711,20 @@ def ssim_psnr(a: torch.Tensor, b: torch.Tensor,
     dev = a.device
     ssim = StructuralSimilarityIndexMeasure(data_range=data_range).to(dev)
     psnr = PeakSignalNoiseRatio(data_range=data_range).to(dev)
-    return float(ssim(a, b)), float(psnr(a, b))
+    s, p = float(ssim(a, b)), float(psnr(a, b))
+
+    # PSNR IS +inf ON IDENTICAL FRAMES (MSE = 0), AND THAT IS REACHABLE HERE,
+    # not a contrived edge case. The patch is initialised to the image region,
+    # the reported patch is the one with the largest drop, and a run whose
+    # regulariser dominates — which is the D3/limit-cycle failure mode — never
+    # beats its own step-1 drop. Its best patch IS the clean content.
+    #
+    # Reported as None rather than inf, because json.dump writes a bare
+    # `Infinity` token that is not valid JSON: Python reads it back, jq and
+    # most other parsers do not, and results.json is read by things outside
+    # this repository. SSIM already says 1.0, which carries the same fact
+    # without leaving the grammar, and _invisibility_stats skips None.
+    return s, (None if p == float("inf") else p)
 
 
 def invisibility(clean01: torch.Tensor, adv01: torch.Tensor,
@@ -737,9 +750,9 @@ def invisibility(clean01: torch.Tensor, adv01: torch.Tensor,
             "ssim_image": s_glb, "psnr_image": p_glb}
 
 
-# ═════════════════════════════════════════════════════════════════════════════
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 #  the procedure
-# ═════════════════════════════════════════════════════════════════════════════
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 
 def prepare(model, img, patch, *, mean_t, std_t, label, cam,
             score: str = "cam", margin: int = 0, cam_untiled: bool = False,
@@ -792,7 +805,7 @@ def prepare(model, img, patch, *, mean_t, std_t, label, cam,
 
     if score == "center":
         # The localisation ablation. No CAM is built, so no backward pass is
-        # paid for a map nothing reads — and `cam` is allowed to be None,
+        # paid for a map nothing reads â€” and `cam` is allowed to be None,
         # rather than being built and ignored, so a run cannot claim a CAM it
         # never computed.
         with torch.no_grad():
@@ -806,8 +819,8 @@ def prepare(model, img, patch, *, mean_t, std_t, label, cam,
                 f"for the localisation ablation. Centring silently here would "
                 f"report an IAP-localised run that was never localised.")
         if cam_untiled:
-            # D10. The CAM is running on a DIFFERENT model from the attack —
-            # the un-tiled whole-frame one — so its logits must be THROWN AWAY
+            # D10. The CAM is running on a DIFFERENT model from the attack â€”
+            # the un-tiled whole-frame one â€” so its logits must be THROWN AWAY
             # and the clean baseline taken from the attack's own model.
             #
             # THIS IS THE WHOLE TRAP IN D10. Everywhere else prepare() reuses
@@ -817,7 +830,7 @@ def prepare(model, img, patch, *, mean_t, std_t, label, cam,
             # the attacked frame under SLIDE, so every drop in the run would be
             # the difference of two different inference modes. That is a
             # plausible number for a measurement nobody made, and it would be
-            # invisible — a slide run's clean mIoU and a whole run's differ by
+            # invisible â€” a slide run's clean mIoU and a whole run's differ by
             # a point or two, not by an obvious factor.
             if img.device.type == "cuda":
                 torch.cuda.reset_peak_memory_stats(img.device)
@@ -830,7 +843,7 @@ def prepare(model, img, patch, *, mean_t, std_t, label, cam,
                     "the whole-frame Grad-CAM pass ran out of memory (D10). "
                     "That pass is one un-tiled forward AND backward at the "
                     "full input size, which the 2026-09-21 log entry flags as "
-                    "memory-bound at native resolution — it is the attack "
+                    "memory-bound at native resolution â€” it is the attack "
                     "loop that slide + --slide_checkpoint makes cheap, not "
                     "this. Either drop to --iap_locate center, which builds "
                     "no CAM at all and keeps the slide attack, or run the "
@@ -855,7 +868,7 @@ def prepare(model, img, patch, *, mean_t, std_t, label, cam,
     # RECORDED AS 'fixed', with the window's own centre, so that reloading the
     # checkpoint re-resolves to exactly this window instead of silently
     # centring. What CHOSE the window is recorded separately as iap_locate in
-    # the result — placement_policy alone would under-report it.
+    # the result â€” placement_policy alone would under-report it.
     patch.cfg.placement = "fixed"
     patch.cfg.placement_xy = ((top + p / 2) / H, (left + p / 2) / W)
     patch.placement = (int(top), int(left))
@@ -883,7 +896,7 @@ def _rung(model, img, label, patch, prepared, objective, lr, steps, *,
           stop, stop_thresh, target_class, num_classes, exclude_footprint,
           classes, clamp, clean_remote, log_every, verbose, log) -> dict:
     r"""
-    ONE learning rate, from a fresh delta — the reference's inner
+    ONE learning rate, from a fresh delta â€” the reference's inner
     `for t in range(iterations)` loop.
 
     `best_param` is kept in MEMORY, not written to disk: the ladder does not
@@ -902,10 +915,11 @@ def _rung(model, img, label, patch, prepared, objective, lr, steps, *,
 
     for step in range(1, steps + 1):
         # `step` is 1-BASED here, so step-1 is the 0-based progress counter a
-        # schedule is defined on — the same convention optimise.attack_image
+        # schedule is defined on â€” the same convention optimise.attack_image
         # uses, so a stateful loss cannot mean one thing in one loop and
         # another in the other.
         objective.on_step_begin(step - 1, steps)
+        will_log = (step % log_every == 0 or step == 1)
         if patch.param.grad is not None:
             patch.param.grad = None
         patched, fp = patch.apply(img)
@@ -934,7 +948,7 @@ def _rung(model, img, label, patch, prepared, objective, lr, steps, *,
             # THE STOPPING PATCH IS THE RESULT, overriding best-by-drop. The
             # criterion IS the success definition for this rung, so reporting
             # a different (earlier, higher-drop) patch would leave
-            # iap_stopped_at naming a step whose patch is not the one saved —
+            # iap_stopped_at naming a step whose patch is not the one saved â€”
             # the exact clean/attacked mismatch the 2026-10-05 best.pt entry
             # exists to prevent, one level up. The break happens BEFORE the
             # update, so param is still the patch that met the bar.
@@ -948,16 +962,31 @@ def _rung(model, img, label, patch, prepared, objective, lr, steps, *,
                     f"drop {best_drop:+.2f})")
             break
 
+        # THE PATCH `logits` DESCRIBE, snapshotted BEFORE the update.
+        #
+        # OFF-BY-ONE, AND IT IS NOT COSMETIC HERE. `cur` below is computed from
+        # `logits`, which came from the forward pass above â€” i.e. from the
+        # parameter as it stands NOW. The update then changes the parameter, so
+        # cloning it after the step credits this step's measured drop to a
+        # DIFFERENT patch. optimise.attack_image has the same pattern and gets
+        # away with it, because Adam under a cosine schedule moves the patch by
+        # ~lr per coordinate and the two are near-identical. IAP's update is
+        # multiplicative and, at lr*w3 >= 0.1, a limit cycle: measured on a
+        # real run, best_drop_remote came out +12.17 while the saved parameter
+        # measured +5.13. One clone per logged step is the whole cost.
+        cand = patch.param.detach().clone() if will_log else None
+
         total.backward()
         st = colour_constant_step_(patch.param, sens_patch, lr)
         if clamp:
-            patch.project()                   # [0,1] — PGD's own projection
+            patch.project()                   # [0,1] â€” PGD's own projection
 
-        if step % log_every == 0 or step == 1:
+        if will_log:
             with torch.no_grad():
                 cur = single_image_miou(logits.detach(), label, num_classes,
                                         exclude=fp, classes=classes)
-                drift = float((patch.render() - base).abs().mean())
+                # the drift OF THE MEASURED PATCH, for the same reason
+                drift = float((cand - base).abs().mean())
             row = {"step": step, "miou_remote": cur, "drift_mean_abs": drift,
                    **last, **st}
             history.append(row)
@@ -969,7 +998,7 @@ def _rung(model, img, label, patch, prepared, objective, lr, steps, *,
                     + f"  |d|={drift:.4f}  {stop}={row['rate']:.3f}")
             if clean_remote - cur > best_drop:
                 best_drop = clean_remote - cur
-                best_param = patch.param.detach().clone()
+                best_param = cand          # the patch `cur` was measured on
 
     # The rung's END state, measured once, outside the loop.
     with torch.no_grad():
@@ -1014,14 +1043,14 @@ def attack_image(model, img, label, patch, *, mean_t, std_t, cam,
     The whole IAP procedure against ONE image. Returns the result record.
 
     The RECORD SCHEMA deliberately matches optimise.attack_image's for every
-    key the two share — clean/final/drop, remote and all, the attack rates, the
-    placement block — so analysis/build_index.py indexes an IAP run beside a
+    key the two share â€” clean/final/drop, remote and all, the attack rates, the
+    placement block â€” so analysis/build_index.py indexes an IAP run beside a
     csf run with no special case, and a table can put them in adjacent rows.
     Everything IAP-specific is prefixed `iap_`.
 
     THE LADDER. `lrs` is tried in order and stops at the first rung meeting the
     stop criterion; absent a success every rung runs and the one with the
-    largest best remote drop is the headline. See D4 — the released code's
+    largest best remote drop is the headline. See D4 â€” the released code's
     failure branch reports stale values from the previous rung, and that cannot
     simply be ported.
 
@@ -1065,7 +1094,7 @@ def attack_image(model, img, label, patch, *, mean_t, std_t, cam,
             f"<- remote is the baseline that matters")
         log(f"[iap  ] loss      : {objective!r}")
         if reg_grad == "released":
-            log(f"[iap  ] reg grad  : RELEASED — the regulariser is reported "
+            log(f"[iap  ] reg grad  : RELEASED â€” the regulariser is reported "
                 f"and optimises NOTHING (D9).\n"
                 f"                   w3 cannot affect this run; that is the "
                 f"point of the arm.")
@@ -1105,7 +1134,7 @@ def attack_image(model, img, label, patch, *, mean_t, std_t, cam,
     with torch.no_grad():
         patch.param.data.copy_(win["best_param"])
 
-    # ── the winner's own measurement, on the parameter now loaded ────────────
+    # â”€â”€ the winner's own measurement, on the parameter now loaded â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     with torch.no_grad():
         patched, fp = patch.apply(img)
         adv_logits = upsample_to(model(patched), hw)
@@ -1148,7 +1177,7 @@ def attack_image(model, img, label, patch, *, mean_t, std_t, cam,
     ctop, cleft = (hw[0] - p) // 2, (hw[1] - p) // 2
     H, W = hw
     record = {
-        # ── the shared schema (see optimise.attack_image) ────────────────────
+        # â”€â”€ the shared schema (see optimise.attack_image) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         "clean_all": clean_all, "clean_remote": clean_rem,
         "final_all": final_all, "final_remote": final_rem,
         "drop_all": clean_all - final_all,
@@ -1165,7 +1194,7 @@ def attack_image(model, img, label, patch, *, mean_t, std_t, cam,
         "pixel_param": patch.cfg.pixel_param,
         "lr_schedule": "iap_ladder",
         **rates,
-        # ── IAP's own ────────────────────────────────────────────────────────
+        # â”€â”€ IAP's own â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         "iap_locate": locate,
         # THE MODE PAIR, so a row always says which combination produced it.
         # Under D10 the localisation map and the attack see different model

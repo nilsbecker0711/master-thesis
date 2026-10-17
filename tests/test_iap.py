@@ -911,3 +911,111 @@ def test_cam_untiled_is_recorded_in_the_result():
             log=lambda *_: None)
         assert rec["iap_cam_untiled"] is flag
         assert rec["iap_cam_inference"] == want
+
+
+def test_best_drop_is_reproducible_from_the_saved_patch():
+    r"""
+    THE INVARIANT: the drop a run REPORTS must be the drop its saved patch
+    ACHIEVES. Anything else makes the headline number unverifiable.
+
+    This failed before. `cur` is computed from the forward pass's logits — the
+    parameter as it stands BEFORE the update — while `best_param` used to be
+    cloned AFTER it, so each logged step credited its measured drop to a
+    different patch. Harmless under Adam + cosine, where consecutive patches
+    are near-identical, and that is why optimise.attack_image carried the same
+    pattern unnoticed. Not harmless under IAP's multiplicative update, which is
+    a limit cycle at lr*w3 >= 0.1: a real 1000-step run reported
+    best_drop_remote +12.17 while its saved parameter measured +5.13.
+
+    Forced here with a deliberately unstable lr*w3, so consecutive patches are
+    far apart and an off-by-one cannot hide inside the tolerance.
+    """
+    import torch.nn as nn
+
+    H, W, P = 48, 96, 12
+
+    class Stub(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.c = nn.Conv2d(3, K, 5, padding=2)
+            for p in self.parameters():
+                p.requires_grad_(False)
+
+        def forward(self, x):
+            return self.c(x)
+
+    class CamStub:
+        n_degenerate = 0
+
+        def __init__(self, m):
+            self.m = m
+
+        def __call__(self, i, l):
+            c = torch.zeros(1, 1, H, W)
+            c[:, :, 8:28, 40:70] = 1.0
+            with torch.no_grad():
+                return c, self.m(i)
+
+        def close(self):
+            pass
+
+    from patchreach.data.cityscapes import norm_tensors, upsample_to
+    from patchreach.metrics.miou import single_image_miou
+    from patchreach.patch.spec import Patch, PatchConfig
+
+    torch.manual_seed(5)
+    dev = torch.device("cpu")
+    m_t, s_t = norm_tensors(dev)
+    model = Stub().eval()
+    x01 = torch.rand(1, 3, H, W).clamp(0.05, 0.95)
+    img = (x01 - m_t) / s_t
+    label = torch.randint(0, K, (1, H, W))
+
+    cfg = PatchConfig(mode="raw", pixel_param="direct", size=P, scale=P / H,
+                      placement="center")
+
+    # ── the DISCRIMINATING check ────────────────────────────────────────────
+    # At step 1 the forward pass saw the patch BEFORE any update, and the patch
+    # is initialised to the image region, so the drift the history reports for
+    # step 1 must be EXACTLY zero. Under the off-by-one it is the drift after
+    # one update instead, which a large lr makes large. This is what makes the
+    # test non-vacuous: the end-to-end assertion below passes either way on a
+    # stub, because the post-loop best/final comparison overwrites the
+    # candidate when the drop is flat.
+    patch0 = Patch(cfg, dev, m_t, s_t)
+    prep = iap.prepare(model, img, patch0, mean_t=m_t, std_t=s_t, label=label,
+                       cam=CamStub(model), score="cam", log=lambda *_: None)
+    obj = iap.Objective(tar="ipatch_cospgd", untar="ce", target_class=16,
+                        w3=3.0)
+    r1 = iap._rung(model, img, label, patch0, prep, obj, 0.5, 1,
+                   stop="none", stop_thresh=2.0, target_class=16,
+                   num_classes=K, exclude_footprint=True, classes="gt",
+                   clamp=True, clean_remote=float(prep["clean_logits"].new_zeros(())),
+                   log_every=1, verbose=False, log=lambda *_: None)
+    assert r1["history"][0]["drift_mean_abs"] == pytest.approx(0.0, abs=1e-9), (
+        "step 1's history row reports a non-zero drift, so it describes the "
+        "patch AFTER the first update while its mIoU was measured BEFORE it")
+    assert torch.allclose(r1["best_param"], prep["base"], atol=1e-6), (
+        "step 1's best_param is not the initial patch its drop was measured on")
+
+    patch = Patch(cfg, dev, m_t, s_t)
+    rec = iap.attack_image(
+        model, img, label, patch, mean_t=m_t, std_t=s_t, cam=CamStub(model),
+        num_classes=K, lrs=(0.5,), steps=40,        # lr*w3 = 1.5: unstable
+        w3=3.0, stop="none", log_every=4, verbose=False, log=lambda *_: None)
+
+    # attack_image leaves the WINNING BEST parameter in the patch, so
+    # recomputing the remote mIoU from it must reproduce best_drop_remote.
+    with torch.no_grad():
+        patched, fp = patch.apply(img)
+        adv = upsample_to(model(patched), (H, W))
+        remote = single_image_miou(adv, label, K, exclude=fp, classes="gt")
+
+    assert rec["best_drop_remote"] == pytest.approx(
+        rec["clean_remote"] - remote, abs=1e-4), (
+        f"reported best_drop_remote {rec['best_drop_remote']:+.4f} but the "
+        f"saved patch achieves {rec['clean_remote'] - remote:+.4f} — the "
+        f"best parameter is off by one update from the drop it is credited "
+        f"with")
+    # and final_remote, measured on that same patch, must agree with it
+    assert rec["final_remote"] == pytest.approx(remote, abs=1e-4)
