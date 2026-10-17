@@ -225,22 +225,13 @@ def check_args(a, p):
             f"three of its four parts describe a different signal. Set "
             f"--patch_size {side}, or --patch_scale "
             f"{a.patch_size / a.img_h:g}.")
-    # CONDITIONAL ON THE CAM, and the first version of this was not — it
-    # refused --slide_checkpoint outright, which blocked the one combination
-    # that actually works at native resolution. The conflict is Grad-CAM's
-    # alone: it reaches the features with torch.autograd.grad, which the
-    # reentrant checkpoint in SlidingWindowSegModel does not support. Under
-    # --iap_locate center no CAM is built at all, so nothing calls
-    # autograd.grad and the checkpoint is free to do its job.
-    if a.slide_checkpoint and a.iap_locate != "center":
-        p.error(
-            f"--slide_checkpoint cannot be combined with --iap_locate "
-            f"{a.iap_locate!r}: localisation needs Grad-CAM, which reaches the "
-            f"features with torch.autograd.grad, and the reentrant checkpoint "
-            f"in SlidingWindowSegModel does not support that (see its "
-            f"docstring, and the 2026-09-21 experiment_log entry). Either "
-            f"--iap_locate center, which builds no CAM and runs under slide "
-            f"with checkpointing, or --inference whole, which keeps the CAM.")
+    # NO --slide_checkpoint REFUSAL, and the history is worth keeping. It began
+    # as a blanket refusal, which blocked the one combination that works at
+    # native resolution; then as conditional on --iap_locate. Both are now
+    # obsolete: under D10 the CAM runs on the UN-TILED model, so nothing ever
+    # calls autograd.grad through a checkpointed window, whatever --iap_locate
+    # says. The combination that does not work — a CAM on the tiled model —
+    # cannot be expressed any more, because SegmentationCAM refuses it.
     if a.cam_objective == "attack" and a.iap_locate != "center":
         if a.iap_untar_loss in ("ce", "cospgd"):
             a.cam_objective = a.iap_untar_loss
@@ -315,30 +306,30 @@ def _run(a, out_dir: Path):
     device = get_device()
     model, n_ch, n_act, spec = setup_model(a)
 
-    # CHECKED HERE, NOT IN check_args, because --inference auto only becomes
-    # slide once the checkpoint's test_cfg has been read, which needs the model
-    # built. Grad-CAM cannot run on a tiled model at all: SegmentationCAM hooks
-    # the backbone, the hook fires ONCE PER WINDOW, and self._feats ends up
-    # holding the last window's feature map while the gradient and the upsample
-    # target are frame-shaped. Measured on a stub slide model: AttributeError
-    # on the dotted path, or a tensor-size RuntimeError once past it. The CAM
-    # refuses this itself now; this check exists to name the two flags the user
-    # typed rather than to let them read it off a constructor.
+    # D10. RESOLVED HERE, NOT IN check_args, because --inference auto only
+    # becomes slide once the checkpoint's test_cfg has been read, which needs
+    # the model built.
+    #
+    # A tiled model has no frame-shaped feature map to weight (the backbone is
+    # called once per window), so SegmentationCAM refuses one outright. The CAM
+    # is a pre-optimisation artefact, though — one pass, before the loop, to
+    # choose the window — so it is built on the UN-TILED model the slide
+    # wrapper holds, while every attack step stays tiled. See D10 in
+    # patchreach/patch/iap.py for the argument and for what it costs.
     from patchreach.models.wrapper import SlidingWindowSegModel
+    cam_model, cam_untiled = model, False
     if isinstance(model, SlidingWindowSegModel) and a.iap_locate != "center":
-        raise SystemExit(
-            f"--inference {a.inference} resolved to SLIDE for {a.arch}, and "
-            f"--iap_locate {a.iap_locate!r} needs Grad-CAM, which cannot run "
-            f"on a tiled model (one feature map per window, no frame-shaped "
-            f"map).\n"
-            f"  Either --iap_locate center  — IAP's loss and update rule at "
-            f"centre placement, which is what every csf arm here is placed at "
-            f"anyway, and runs under slide (add --slide_checkpoint);\n"
-            f"  or     --inference whole    — keeps IAP's localisation.\n"
-            f"  Note that for SegFormer/Swin (crop 1024) slide and whole are "
-            f"the SAME computation at 1024x1024 and below — one window clamped "
-            f"to the frame — so the choice only bites on the full-width "
-            f"1024x2048 frame.")
+        # .model is SlidingWindowSegModel's own documented attribute, not a
+        # guess — but assert it rather than assume, because reaching blindly
+        # through a wrapper is how a run ends up attacking a different model
+        # from the one it reports.
+        inner = getattr(model, "model", None)
+        if inner is None or isinstance(inner, SlidingWindowSegModel):
+            raise SystemExit(
+                "--iap_locate needs a Grad-CAM and the model is tiled, but "
+                "the un-tiled model could not be recovered from it. Use "
+                "--iap_locate center, or --inference whole.")
+        cam_model, cam_untiled = inner, True
 
     mean_t, std_t = norm_tensors(device)
 
@@ -351,6 +342,9 @@ def _run(a, out_dir: Path):
     lrs = [float(x) for x in str(a.iap_lrs).replace(",", " ").split()]
     with open(out_dir / "config.json", "w") as f:
         json.dump({**vars(a), "images": idxs, "iap_lr_ladder": lrs,
+                   # D10's mode pair, in the config as well as in every
+                   # record, so a directory can be read without its rows.
+                   "iap_cam_untiled": cam_untiled,
                    "bracket": spec.bracket, "backbone_channels": n_ch,
                    "backbone_active_channels": n_act}, f, indent=2)
 
@@ -372,10 +366,16 @@ def _run(a, out_dir: Path):
         print("[cam ] none       : --iap_locate center, the localisation "
               "ablation")
     else:
-        cam = segmentation_cam.build(model, a.cam_objective, a.target_class,
-                                     a.cam_layer, a.cam_module, a.cam_target)
+        cam = segmentation_cam.build(cam_model, a.cam_objective,
+                                     a.target_class, a.cam_layer,
+                                     a.cam_module, a.cam_target)
         print(f"[cam ] objective  : {a.cam_objective}  target: {a.cam_target}"
               f"  layer {a.cam_layer} of {a.cam_module}")
+        if cam_untiled:
+            print(f"[cam ] D10        : map from a WHOLE-FRAME pass on the "
+                  f"un-tiled model, attack runs SLIDE.")
+            print(f"                    The two see different model "
+                  f"behaviour — quote the pair, not just the drop.")
 
     pop = pop_mod.Population(a.num_classes, device=device,
                              target_class=(a.target_class
@@ -402,7 +402,7 @@ def _run(a, out_dir: Path):
             tar_loss=a.iap_tar_loss, untar_loss=a.iap_untar_loss,
             w1=a.iap_w1, w2=a.iap_w2, w3=a.iap_w3,
             reg_reduce=a.iap_reg_reduce, reg_grad=a.iap_reg_grad,
-            locate=a.iap_locate,
+            locate=a.iap_locate, cam_untiled=cam_untiled,
             lrs=lrs, steps=a.iap_steps,
             stop=a.iap_stop, stop_thresh=a.iap_stop_thresh,
             margin_kappa=a.margin_kappa,

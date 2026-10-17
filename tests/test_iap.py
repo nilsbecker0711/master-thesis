@@ -745,25 +745,31 @@ def test_the_cam_refuses_a_tiled_model():
     cam.close()
 
 
-def test_slide_checkpoint_is_refused_only_when_a_cam_is_built():
-    """
-    The first version of this guard refused --slide_checkpoint outright, which
-    blocked the ONE combination that works at native resolution: centre
-    placement builds no CAM, so nothing calls autograd.grad and the reentrant
-    checkpoint is free to do its job. A guard that over-refuses is as wrong as
-    one that under-refuses — it sends the run to a mode the baseline is not in.
+def test_slide_checkpoint_is_no_longer_refused_for_any_localisation():
+    r"""
+    THE HISTORY MATTERS HERE, because this guard has been wrong twice.
+
+      v1  refused --slide_checkpoint outright. That blocked the one
+          combination that works at native resolution, since centre placement
+          builds no CAM at all.
+      v2  conditional on --iap_locate, refusing it for cam / cam_over_sens.
+      v3  (D10) no refusal. The CAM runs on the UN-TILED model, so nothing
+          calls autograd.grad through a checkpointed window whatever
+          --iap_locate says.
+
+    A guard that over-refuses is as wrong as one that under-refuses: it sends
+    the run to a mode the baseline is not in. The combination that genuinely
+    cannot work — a CAM on the tiled model — is no longer expressible, because
+    SegmentationCAM refuses it (see above).
     """
     _scripts_on_path()
     import iap_attack as S
 
     p = S.build_parser()
     base = ["--cityscapes_root", "X", "--slide_checkpoint"]
-
-    with pytest.raises(SystemExit):
-        S.check_args(p.parse_args(base + ["--iap_locate", "cam"]), p)
-
-    a = S.check_args(p.parse_args(base + ["--iap_locate", "center"]), p)
-    assert a.slide_checkpoint and a.iap_locate == "center"
+    for loc in ("cam", "cam_over_sens", "center"):
+        a = S.check_args(p.parse_args(base + ["--iap_locate", loc]), p)
+        assert a.slide_checkpoint and a.iap_locate == loc
 
 
 def _scripts_on_path():
@@ -772,3 +778,136 @@ def _scripts_on_path():
     d = str(Path(__file__).resolve().parents[1] / "scripts")
     if d not in sys.path:
         sys.path.insert(0, d)
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+#  D10 — a whole-frame CAM while the attack runs tiled
+# ═════════════════════════════════════════════════════════════════════════════
+
+def test_cam_untiled_takes_the_clean_baseline_from_the_attack_model():
+    r"""
+    THE SILENT TRAP IN D10. Everywhere else prepare() reuses the CAM's own
+    logits to save a forward, which is free when the CAM and the attack share a
+    model. Under cam_untiled they do NOT: the CAM runs whole-frame and the
+    attack runs tiled, so reusing them would measure clean mIoU under one
+    inference mode and the attacked frame under the other, making every drop in
+    the run the difference of two procedures. Off by a point or two — i.e.
+    invisible.
+
+    Pinned by giving the two models DELIBERATELY DIFFERENT outputs and
+    asserting the clean logits came from the attack model.
+    """
+    import torch.nn as nn
+
+    H, W, P = 32, 64, 8
+
+    class Flat(nn.Module):
+        """Constant logits, so which model answered is unambiguous."""
+        def __init__(self, hot):
+            super().__init__()
+            self.hot = hot
+            self.p = nn.Parameter(torch.zeros(1), requires_grad=False)
+
+        def forward(self, x):
+            lg = torch.zeros(x.shape[0], K, *x.shape[-2:])
+            lg[:, self.hot] = 10.0
+            return lg + 0.0 * x.sum()      # keep x in the graph
+
+    class CamStub:
+        n_degenerate = 0
+
+        def __call__(self, imgs, labels):
+            m = torch.zeros(1, 1, H, W)
+            m[:, :, :, W // 2:] = 1.0
+            # logits that must be IGNORED: a different class from the attack
+            # model's, so reusing them would be visible in clean_remote.
+            lg = torch.zeros(1, K, H, W)
+            lg[:, 7] = 10.0
+            return m, lg
+
+        def close(self):
+            pass
+
+    from patchreach.data.cityscapes import norm_tensors
+    from patchreach.patch.spec import Patch, PatchConfig
+
+    dev = torch.device("cpu")
+    m_t, s_t = norm_tensors(dev)
+    attack_model = Flat(hot=3)
+    img = torch.rand(1, 3, H, W)
+    label = torch.full((1, H, W), 3, dtype=torch.long)     # matches hot=3
+
+    cfg = PatchConfig(mode="raw", pixel_param="direct", size=P,
+                      scale=P / H, placement="center")
+    patch = Patch(cfg, dev, m_t, s_t)
+    prep = iap.prepare(attack_model, img, patch, mean_t=m_t, std_t=s_t,
+                       label=label, cam=CamStub(), score="cam",
+                       cam_untiled=True, log=lambda *_: None)
+
+    pred = prep["clean_logits"].argmax(1)
+    assert int(pred.unique().item()) == 3, (
+        "clean_logits came from the CAM (class 7) rather than from the attack "
+        "model (class 3) — the baseline and the attacked frame would then be "
+        "measured under different inference modes")
+
+    # and with cam_untiled=False the CAM's logits ARE reused, as before
+    patch2 = Patch(cfg, dev, m_t, s_t)
+    prep2 = iap.prepare(attack_model, img, patch2, mean_t=m_t, std_t=s_t,
+                        label=label, cam=CamStub(), score="cam",
+                        cam_untiled=False, log=lambda *_: None)
+    assert int(prep2["clean_logits"].argmax(1).unique().item()) == 7
+
+
+def test_cam_untiled_is_recorded_in_the_result():
+    """
+    D10 changes what a drop MEANS, so a row that does not say whether the map
+    was whole-frame is not interpretable. Both keys, both ways.
+    """
+    import torch.nn as nn
+
+    H, W, P = 32, 64, 8
+
+    class Stub(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.c = nn.Conv2d(3, K, 3, padding=1)
+            for p in self.parameters():
+                p.requires_grad_(False)
+
+        def forward(self, x):
+            return self.c(x)
+
+    class CamStub:
+        n_degenerate = 0
+
+        def __init__(self, m):
+            self.m = m
+
+        def __call__(self, i, l):
+            c = torch.zeros(1, 1, H, W)
+            c[:, :, :, W // 2:] = 1.0
+            with torch.no_grad():
+                return c, self.m(i)
+
+        def close(self):
+            pass
+
+    from patchreach.data.cityscapes import norm_tensors
+    from patchreach.patch.spec import Patch, PatchConfig
+
+    dev = torch.device("cpu")
+    m_t, s_t = norm_tensors(dev)
+    model = Stub().eval()
+    img = torch.rand(1, 3, H, W)
+    label = torch.randint(0, K, (1, H, W))
+
+    for flag, want in ((True, "whole"), (False, "same_as_attack")):
+        cfg = PatchConfig(mode="raw", pixel_param="direct", size=P,
+                          scale=P / H, placement="center")
+        rec = iap.attack_image(
+            model, img, label, Patch(cfg, dev, m_t, s_t), mean_t=m_t,
+            std_t=s_t, cam=CamStub(model), num_classes=K, lrs=(0.1,), steps=2,
+            stop="none", cam_untiled=flag, log_every=10 ** 6, verbose=False,
+            log=lambda *_: None)
+        assert rec["iap_cam_untiled"] is flag
+        assert rec["iap_cam_inference"] == want
