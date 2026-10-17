@@ -524,13 +524,20 @@ class Objective:
     term, with its explicit minus, IS adversarial.ce_loss, and the port is a
     substitution rather than a rearrangement.
 
-    tar : 'ipatch_cospgd' or 'none'. The targeted term. This repository has no
-          plain targeted CE and one is not added here: ipatch_cospgd IS its
-          targeted objective, every targeted number in the thesis is measured
-          under it, and introducing a second targeted loss purely to match
-          IAP's would make the IAP column incomparable to every other column.
-          The deviation is the cosine weight (1 - cos to target), which
-          de-emphasises pixels already converted.
+    tar : 'ipatch_cospgd' or 'none'. The targeted term, and despite the
+          identifier it is TARGETED COSPGD — Agnihotri et al., ICML 2024,
+          Eq. 8 — not a local combination; see losses/adversarial.py. This
+          repository has no plain targeted CE and one is not added here:
+          targeted CosPGD is its targeted objective, every targeted number in
+          the thesis is measured under it, and introducing a second targeted
+          loss purely to match IAP's would make the IAP column incomparable to
+          every other column.
+
+          THE DEVIATION FROM IAP is therefore the (1 - cos to target) weight,
+          which de-emphasises pixels already converted where IAP's first term
+          is a plain CE. Note what that deviation is NOT: it is not an ad-hoc
+          weight invented here, it is one published objective substituted for
+          another, which is the honest form for a comparison arm to take.
     untar : 'ce', 'cospgd', 'margin', 'cos_margin' or 'none'. The term away
           from the truth. 'ce' is IAP's literal -CE(pred, truth).
     'none' on either slot drops it. tar='none' makes the attack UNTARGETED,

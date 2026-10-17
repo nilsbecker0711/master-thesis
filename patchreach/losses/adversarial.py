@@ -4,8 +4,12 @@ Adversarial objectives.
   ce            untargeted, -CE(logits, GT)
   cospgd        untargeted, cos(pred,GT).detach() * CE, maximised
                 (Agnihotri et al., ICML 2024)
-  ipatch_cospgd TARGETED, drives every scored pixel toward target_class
-                (IPatch objective + targeted CosPGD weighting)
+  ipatch_cospgd TARGETED CosPGD — Agnihotri et al.'s own Eq. 8, not a local
+                combination. Drives every scored pixel toward target_class.
+                THE IDENTIFIER IS A MISNOMER AND IS KEPT ANYWAY: every
+                config.json and directory tag on record spells it this way,
+                and the repo does not move names past runs recorded. Cite it
+                as targeted CosPGD.
   tsallis       untargeted, -L_q(p_y), maximised — CE carrying a per-pixel
                 gradient weight p^(1-q), with q optionally scheduled across
                 the run. Defined in tsallis.py because it is stateful; build()
@@ -100,18 +104,41 @@ def ipatch_cospgd_loss(logits, target_class: int,
                        footprint: Optional[torch.Tensor] = None,
                        support: Optional[torch.Tensor] = None):
     r"""
-    IPatch objective + targeted CosPGD weighting:
+    TARGETED COSPGD — Agnihotri et al., ICML 2024, Eq. 8:
 
         L = mean_i [ (1 - cos(softmax(f(x)_i), onehot(t))) * CE(f(x)_i, t) ]
 
-    IPatch's KL(onehot(Y_t), Y) reduces exactly to CE(logits, t) and never
-    references the ground truth. Every scored pixel is pushed toward the SAME
-    class, so per-pixel gradients ALIGN and add — unlike untargeted objectives
-    where pixel A says "not-road", pixel B says "not-sky", and the two cancel.
+    CITE IT AS TARGETED COSPGD. This is the paper's own construct, introduced
+    there as "the targeted CosPGD update step ... in analogy to Eqn 5": the
+    cosine is taken against the TARGET one-hot rather than the ground truth,
+    the weight is (1 - cos) rather than cos, and the step DESCENDS. An earlier
+    version of this docstring described it as "IPatch objective + targeted
+    CosPGD weighting", which understated it — the weight and the
+    cross-entropy it scales are both Eq. 8, and neither is a local
+    combination. The function name predates that identification; see the
+    module header for why it is not being renamed.
 
-    The CosPGD weight FLIPS for targeted attacks: (1 - cos_to_target), so
-    already-converted pixels are de-emphasised and effort concentrates on the
-    stubborn remainder.
+    The IPatch connection is a true aside, not the attribution: IPatch's
+    KL(onehot(Y_t), Y) reduces to CE(logits, t) exactly, because KL from a
+    one-hot is -log p_t. So the objective is simultaneously IPatch's, which is
+    worth one sentence when motivating a REMOTE targeted patch, but the loss
+    needs no second citation.
+
+    WHY TARGETED AT ALL, for segmentation: every scored pixel is pushed toward
+    the SAME class, so per-pixel gradients ALIGN and add — unlike untargeted
+    objectives where pixel A says "not-road", pixel B says "not-sky", and the
+    two partly cancel. The (1 - cos) weight de-emphasises pixels already
+    converted, so effort concentrates on the stubborn remainder.
+
+    THREE DEVIATIONS FROM EQ. 8, all to be declared wherever this is quoted:
+      * the cosine is DETACHED here; the paper lets the gradient flow through
+        the whole product (same deviation cospgd_loss documents);
+      * the paper SUMS over pixels and this MEANS over them. Under the
+        paper's sign() update the scale is irrelevant; under Adam or IAP's
+        multiplicative rule it is absorbed into lr, so an lr is not
+        transferable between the two conventions;
+      * no sign-SGD and no epsilon-ball — a patch is not an epsilon-ball
+        perturbation. `footprint` exclusion below is also ours, not Eq. 8's.
 
     `footprint` is MANDATORY. Leave the patch region in the loss and the
     cheapest win is to make the PATCH look like target_class: loss collapses,
