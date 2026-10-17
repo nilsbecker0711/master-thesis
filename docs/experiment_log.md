@@ -299,3 +299,120 @@ in the caption: it is the patch the attack found, `final.pt` is where the optimi
 happened to stop, and the `delta` column in the printed table is the difference. The
 white-box diagonal in `transfer_matrix_new.py` already reads `best_drop_remote`, so
 this makes the overfit table and the transfer matrix describe the same patch.
+
+## 2026-10-16: IAP (ICCV 2025) as a comparison arm — the procedure, ported to segmentation
+
+**Why.** IAP (Dutta & Zhang, *Invisible Adversarial Patch Attack through
+Perceptibility-Aware Localization and Perturbation Optimization*, ICCV 2025;
+[arXiv:2507.06856](https://arxiv.org/abs/2507.06856), code
+[subratkishoredutta/IAP](https://github.com/subratkishoredutta/IAP)) is the closest
+published neighbour to `--patch_mode csf`. Both bound how visible the patch is with a
+per-pixel visibility model rather than an epsilon-ball, and both start the patch FROM
+the content it replaces. They differ in the model: csf uses a contrast sensitivity
+function over spatial frequency, IAP a local-texture sensitivity map with no frequency
+axis at all. Measuring both under one dataset, one set of architectures and one
+geometry turns "our patch is less visible than IAP's" from a cross-paper claim into a
+measurement.
+
+**What was ported.** All four parts of the procedure, from the released code rather
+than from the paper's prose where the two disagree:
+
+1. the sensitivity map `sens = 1/(sqrt(min(std_x, std_y)) + 1e-3)` over 1x3 and 3x1
+   neighbourhoods, channel-averaged;
+2. localisation by the p x p window maximising a Grad-CAM response;
+3. the perceptibility-regularised loss `w1*(toward target) + w2*(away from truth)
+   + w3*sum(sens*|delta - base|)`, weights 1.5 / 1.0 / 3;
+4. the colour-constant update `delta <- delta - lr*mean_c(grad)*delta/sens`,
+   plus the `(0.05, 0.09, 0.2)` restart ladder at 1000 steps per rung and the
+   early stop on attack success.
+
+**What changed, and nothing else did.** The two adversarial terms. IAP's are
+classification cross-entropies on one logit vector; here they are this repository's
+own segmentation objectives from `losses/adversarial.py`, scored over every remote
+pixel — `ipatch_cospgd` for the targeted term, `ce` for the term away from the truth.
+The signs line up without a negation, because every loss in that module is already
+defined so that minimising it strengthens the attack, which makes IAP's explicit
+`- CE(pred, truth)` literally `ce_loss`. Parts 1, 2 and 4 are pixel-space operations
+and are task-blind; they are ported unchanged.
+
+IAP's parameterisation is this repository's `--patch_mode raw --pixel_param direct`
+(the parameter IS the pixel, projected back into [0,1] after the step), so no new
+`PatchConfig` mode was added — what IAP contributes is a step rule and a regulariser,
+not a new patch object. `pixel_param sigmoid` is **refused**: the update multiplies by
+`delta` itself, which under a sigmoid parameterisation is a logit, negative for any
+pixel below 0.5, so the step would reverse sign for half the patch and the run would
+still complete.
+
+**Eight declared deviations**, each named in `patchreach/patch/iap.py` as D1-D8 and
+each belonging in the write-up. The two that change numbers rather than mechanics:
+
+- **D1 — the paper and the code localise differently.** The paper scores a window by
+  `J_y / Sens`; `utils.py` computes exactly that as `perturbPrior` and then calls
+  `find_location` with the **raw CAM**, so the released localisation is Grad-CAM
+  alone. Both are available (`--iap_locate cam | cam_over_sens`); the default is the
+  released behaviour, because that is the procedure the published numbers came from.
+  A test pins that the two place the patch differently on real maps, so the flag
+  cannot quietly stop doing anything.
+- **D3 — `w3 = 3` is not transferable to a 256px patch.** The regulariser is a SUM
+  over patch elements and the patch grew from 84x84 to 256x256, so at equal mean
+  `|delta - base|` the term is **9.3x larger** against adversarial losses that are
+  per-pixel means and have not changed scale. `--iap_reg_reduce sum84` rescales by
+  `(84/p)**2` to restore the published operating point; `iap.sh` sweeps `--iap_w3`
+  across 0.3-30 rather than inheriting 3. This was visible in the first smoke run at
+  p=16: the regulariser reached 77 while both adversarial terms stayed near 2.7, i.e.
+  the loss was optimising the patch back to the clean image.
+
+The rest: D2 Grad-CAM (segmentation CAM in place of a classification logit; the
+reference's `eigen_smooth`/`aug_smooth` are not reproduced), D4 the ladder's failure
+branch (the released code reports stale values from the previous rung when every rung
+fails; here every rung is recorded and the best by remote drop is the headline), D5 the
+early stop (`argmax == target and softmax >= 0.9` has no single-label analogue, so the
+criteria are built on `metrics/miou.attack_rates`, and all of them are strictly harder
+to satisfy than a one-label flip), D6 clipping (the paper says it clips, the code never
+does; clipping is on by default via `Patch.project()` and `--iap_no_clamp` reproduces
+the code), D7 the sensitivity map's two-pixel border band at `sens = 1000`
+(reproduced, not fixed), D8 footprint exclusion from both adversarial terms (mandatory
+for segmentation or the cheapest win is to paint the patch itself in the target class).
+
+**Where the numbers come from.** `scripts/iap_attack.py`, one patch per image over
+`--images`, the per-image threat model. The right neighbour for these rows is
+`overfit_population.py`, **not** `train.py` — a universal patch is a different and
+much harder threat model, and the two sets of rows must not be merged. The record
+schema matches `optimise.attack_image`'s for every shared key, so
+`analysis/build_index.py` indexes an IAP run beside a csf run with no special case.
+
+**Stealthiness.** SSIM and PSNR, footprint and whole frame, are computed in-run
+because the reference computes them. The rest of the paper's suite (LPIPS, CLIPScore,
+UIQ, SRE) comes from `scripts/lpips_eval.py`, which already quotes IAP as its reason
+for reporting LPIPS over the patch region: the run writes its `a_clean.png` /
+`c_patched.png` panels and per-image `best.pt` / `final.pt` in the layout that
+script's `png` and `checkpoint` sources already discover, so no new plumbing.
+
+**Cost.** Three rungs x 1000 steps, restarted per rung, and the early stop almost never
+fires in segmentation (D5) — so budget ~3000 full-resolution forward+backward passes
+per image at 1024x2048, tens of minutes each. `--iap_steps` and `--iap_lrs` cut it and
+then the run is no longer IAP's own setting; say which was used.
+
+**Environment.** `envs/iap.yml`, a separate env as the lpips_eval arm is. It needs
+exactly one package the attack env does not — `torchmetrics`, for the reference's SSIM
+and PSNR — and deliberately none of `pytorch_grad_cam`, `opencv` or `timm`: the
+reference's Grad-CAM is built for a Swin classifier with a `reshape_transform` and
+there is no classification logit in a segmentor, so localisation goes through
+`patch/segmentation_cam.py`. The reliable route is a clone of the attack env plus that
+one package; building the torch 1.11 / mmcv 1.x / mmseg 0.x triple from scratch is a
+solve-time gamble and the two mmcv/mmseg pins in the file must be confirmed against
+the working env. `--arch internimage_*` is unavailable there (it needs `mmseg_custom`
+and a compiled `ops_dcnv3`).
+
+**Verification.** `tests/test_iap.py`, 37 tests. The reference's double Python loops
+are transcribed verbatim in structure and the vectorised port is held equal to them —
+the sensitivity map (including on near-constant content, where the sum-of-squares
+shortcut for variance is fp32 noise and the stacked form is exact), the window search
+(the reference maximises a sum, `find_max_response_placement` a mean; equal argmax only
+because the window size is constant), the regulariser, and the update rule (the
+reference's channel axis is 1 on `[1,3,p,p]`, this repository's is -3 on `[3,p,p]`, and
+a mean over the wrong axis still runs). Colour constancy is pinned as an invariant:
+`step/value` must be identical across the three channels. The two documented corners of
+the multiplicative update are pinned too — a pixel at exactly 0 is frozen for ever, and
+a flat neighbourhood moves by ~1e-3 of what a textured one does under the same
+gradient. **No IAP run has been launched yet**; the numbers are not in `results/`.
