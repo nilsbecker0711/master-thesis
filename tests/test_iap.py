@@ -708,17 +708,24 @@ def _stub_segmentor():
 
 def test_the_cam_refuses_a_tiled_model():
     r"""
-    THE FAILURE THIS REPLACES was not a refusal but a crash three frames deep.
-    SlidingWindowSegModel calls the segmentor once per window, so the CAM's
-    forward hook fires n_windows times and keeps only the LAST window's feature
-    map, while the gradient and the upsample target are frame-shaped. Measured
-    on this stub before the guard: module='backbone' raised AttributeError (the
-    wrapper shifts the dotted path), and module='model.backbone' resolved and
-    then died with "The size of tensor a (128) must match the size of tensor b
-    (80)".
+    THE FAILURE THIS REPLACES WAS SILENT, not a crash. SlidingWindowSegModel
+    calls the segmentor once per window, so the CAM's forward hook fires
+    n_windows times and `self._feats = out` ASSIGNS rather than appends: only
+    the LAST window's feature map survives. Everything downstream then
+    describes the whole frame, and nothing checks the two agree.
 
-    This also covers overfit.py's `--placement gradcam --inference auto`, which
-    had the same latent bug and no flag refusing it.
+    Measured on a tiled model whose encode_decode returns input-sized logits,
+    as mmseg's does: a 4-D backbone yields a CAM built from one tile and
+    stretched across the full frame (0.055 mean abs away from the whole-frame
+    map, no error), and a token backbone is worse still — _token_grid
+    factorises the WINDOW's token count against the FRAME's dimensions, finds a
+    grid that is not the real one, and reshapes the tokens into a transposed
+    map. Also no error.
+
+    So this guard converts a plausible-but-wrong placement into a refusal,
+    which is the failure class segmentation_cam.py's own header exists to
+    prevent. It also covers overfit.py / overfit_population.py, which accept
+    `--placement gradcam --inference auto` with nothing refusing the pair.
     """
     from patchreach.models.wrapper import (SlidingWindowSegModel,
                                            WrappedSegModel)

@@ -139,16 +139,38 @@ class SegmentationCAM:
         if target not in ("gt", "pred"):
             raise ValueError(f"cam_target must be 'gt' or 'pred', got {target!r}")
 
-        # A TILED MODEL CANNOT PRODUCE A CAM, and before this check it failed
-        # late and unrecognisably. SlidingWindowSegModel runs the segmentor
-        # once per window, so the forward hook below fires n_windows times and
-        # self._feats keeps only the LAST window's feature map — a 1024x1024
-        # tile's worth — while `grads`, as_spatial's (H, W) and the upsample
-        # target all describe the whole frame. Measured on a stub slide model:
-        # with module='backbone' the dotted path raises AttributeError (the
-        # wrapper shifts it, the segmentor is at .model), and with
-        # 'model.backbone' it resolves and then dies in the weighted sum with
-        # "The size of tensor a (128) must match the size of tensor b (80)".
+        # A TILED MODEL CANNOT PRODUCE A CAM, AND IT DOES NOT SAY SO.
+        # SlidingWindowSegModel runs the segmentor once per window, so the
+        # forward hook below fires n_windows times and `self._feats = out`
+        # ASSIGNS rather than appends: what survives is the LAST window's
+        # feature map — the bottom-right tile, since slide_windows yields
+        # row-major. Everything downstream then describes the whole frame.
+        #
+        # MEASURED, on a hand-rolled tiled model whose encode_decode returns
+        # input-sized logits as mmseg's does, at 64x256 with a 64-crop (5
+        # windows). It does NOT raise:
+        #
+        #   4-D backbone (SegFormer's MiT, ConvNeXt): the hooked map is one
+        #     window's [1,8,16,16], as_spatial passes a 4-D tensor through
+        #     untouched, and F.interpolate stretches the tile's CAM across the
+        #     full [1,1,64,256]. Mean abs disagreement with the whole-frame
+        #     map: 0.055 on a min-max normalised map. No error.
+        #   token backbone [B,N,D]: WORSE. _token_grid factorises the WINDOW's
+        #     256 tokens against the FRAME's 64x256 and finds stride 8 ->
+        #     (8, 32), which is not the real (16, 16) grid, so the tokens are
+        #     reshaped into a transposed, meaningless map. Also no error.
+        #
+        # So the pre-guard behaviour was a plausible map of the wrong region,
+        # which is the failure class this module's own header exists to prevent
+        # ("a plausible number for a placement policy that never ran"). An
+        # earlier version of this comment claimed a RuntimeError in the
+        # weighted sum; that was an artefact of a stub whose encode_decode did
+        # not resize logits to the input, and it understated the problem.
+        #
+        # AUDIT NOTE: --placement gradcam with --inference slide/auto and
+        # WITHOUT --slide_checkpoint therefore produced a silently wrong
+        # placement. With --slide_checkpoint it failed instead, because the
+        # reentrant checkpoint does not support autograd.grad through a window.
         #
         # Stitching per-window CAMs is not a fix to make quietly: the windows
         # overlap, each one's min-max normalisation is local, and the result

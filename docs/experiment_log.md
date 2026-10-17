@@ -498,3 +498,55 @@ invisibility metrics must be scored against that same round-tripped frame, or th
 6e-8 is attributed to the patch — which is invisible at any real drop but moves PSNR
 by 0.03 dB at 138 dB, where the stub patch has barely moved and the metric is
 measuring float noise.
+
+## 2026-10-17 (correction): Grad-CAM under slide inference failed SILENTLY, not loudly
+
+**Correcting the same day's claim.** The `df0bbc4` commit message and the first version
+of the guard in `patchreach/patch/segmentation_cam.py` both stated that a CAM on a
+tiled model dies with `RuntimeError: The size of tensor a (128) must match the size of
+tensor b (80)`. **That was wrong**, and it understated the problem. The RuntimeError
+came from a stub whose `encode_decode` did not resize logits back to the input size;
+every real mmseg `EncoderDecoder` does, so the padding arithmetic in
+`SlidingWindowSegModel.forward` is consistent and nothing raises.
+
+**What actually happens.** `SlidingWindowSegModel` calls the segmentor once per window.
+`SegmentationCAM._hook` does `self._feats = out` — an **assignment, not an append** —
+so after a tiled forward only the **last** window's feature map survives, which is the
+bottom-right tile because `slide_windows` yields row-major. The rest of `__call__` then
+proceeds as if that map described the whole frame:
+
+- `autograd.grad(score, A)` succeeds — the last window *is* in the graph, so this is
+  the gradient of a whole-frame scalar with respect to one tile's activations;
+- `as_spatial(A, H, W)` passes a 4-D tensor through untouched, so the map stays
+  window-sized;
+- `F.interpolate(cam, size=(H, W))` stretches the tile's CAM across the full frame;
+- per-sample min-max normalisation then makes it look like any other map.
+
+Measured on a hand-rolled tiled model at 64x256 with a 64-crop / 48-stride (5 windows):
+the 4-D path returns a map that is **0.055 mean absolute distance** from the whole-frame
+map on a `[0,1]` normalised scale, with no error. The token path is worse: `_token_grid`
+factorises the **window's** 256 tokens against the **frame's** 64x256, finds stride 8 ->
+`(8, 32)` instead of the true `(16, 16)`, and reshapes the tokens into a transposed,
+meaningless map — again with no error. This is exactly the failure `_token_grid`'s own
+docstring warns about, one level up.
+
+So the pre-guard behaviour was a **plausible map of the wrong region**, which is the
+failure class `segmentation_cam.py`'s header exists to prevent, and the guard added in
+`df0bbc4` is worth more than its commit message claimed: it converts a silent wrong
+result into a refusal.
+
+**AUDIT ITEM.** `--placement gradcam` with `--inference slide` or `auto`, and **without**
+`--slide_checkpoint`, produced a silently wrong patch placement: the window was chosen
+from a stretched bottom-right tile rather than from the frame. Any such run on record
+has a `placement` that does not mean what `placement_policy: gradcam` says it does, and
+its `placement_dist_from_centre` is not interpretable. `overfit.py`,
+`overfit_population.py` and `train_conditional_generator.py` all accept the combination
+and nothing refused it. With `--slide_checkpoint` the run failed instead, because the
+reentrant checkpoint does not support `autograd.grad` through a window — so only the
+un-checkpointed slide runs are affected. Check `config.json` for
+`placement: "gradcam"` together with `inference` in `("slide", "auto")` and
+`slide_checkpoint: false` before quoting any such run.
+
+Nothing else changes: `--inference whole` was always correct, and for SegFormer/Swin
+slide and whole are the same computation at 1024x1024 and below, so only full-width
+native-resolution gradcam runs could be affected.
