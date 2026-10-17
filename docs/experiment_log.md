@@ -416,3 +416,85 @@ a mean over the wrong axis still runs). Colour constancy is pinned as an invaria
 the multiplicative update are pinned too — a pixel at exactly 0 is frozen for ever, and
 a flat neighbourhood moves by ~1e-3 of what a textured one does under the same
 gradient. **No IAP run has been launched yet**; the numbers are not in `results/`.
+
+## 2026-10-17: IAP's released regulariser has no gradient (deviation D9)
+
+**Found by a step-by-step verification of the port**, not by the unit tests — the
+tests pin each of IAP's four parts in isolation, and this is a property of how the
+reference's *loop* is wired.
+
+**What the reference does.** `src/IAP.py` builds the patch and its reference as
+
+```python
+delta = torch.nn.Parameter(delta)
+temp  = delta.clone()
+```
+
+`Tensor.clone()` on a leaf that requires grad is **differentiable**: `temp` carries
+`grad_fn=CloneBackward0` back to `delta`. So for the perceptibility term
+`R = sum(sens * |delta - temp|)` autograd walks two paths into one leaf,
+
+```
+dR/d(delta) through delta = + sens * sign(delta - temp)
+dR/d(delta) through temp  = - sens * sign(delta - temp)
+```
+
+and they cancel **exactly, elementwise, at every step**. Verified numerically on the
+reference's own expression, transcribed verbatim: with `|delta - temp|` held at 0.1
+the term is worth 2542.7 and what reaches `delta.grad` is `0.000e+00`.
+
+**What that means.** The perceptibility regulariser changes the *reported* loss — it
+is the paper's "human distance" column — and changes the *optimisation* not at all.
+Whatever invisibility the released code achieves comes from the `1/sens` factor in
+the colour-constant update and from initialising at the image region, i.e. from
+parts 1 and 4 of the procedure, not from part 3. A direct consequence: **under the
+released code `w3` cannot affect the result**, so a `w3` ablation run against it is a
+null experiment by construction. `iap_attack.py` refuses `--iap_reg_grad released`
+together with a non-default `--iap_w3` for that reason, rather than producing
+identical runs under different directory names.
+
+**The choice made.** The default is the **paper**: `base` is detached, so the
+gradient is live and equals `w3 * sens * sign(delta - base)`. This is the one place
+the port deliberately prefers the paper over the released code, and the reason is
+that the alternative is to reproduce a method whose central regularisation term
+provably does nothing — which is not what "IAP" denotes in the literature and not
+how a reviewer would read the name. Note the contrast with **D1**, which goes the
+other way, to the released code: there both branches are coherent procedures, while
+here one of them is a silently dropped term.
+
+`--iap_reg_grad released` reproduces the cancellation exactly, by adding the term's
+value to the loss **detached** — identical value, identical (zero) gradient. So "the
+regulariser contributes nothing" becomes a measured row rather than an argument, and
+the two arms stay comparable on the human-distance column. `iap.sh` carries the arm.
+
+**Pinned by three tests**, one of them on the reference's own expression so the
+finding survives independently of anything in `patchreach/patch/iap.py`:
+`test_the_released_regulariser_has_no_gradient`,
+`test_the_ported_regulariser_does_have_a_gradient`,
+`test_reg_grad_released_reports_the_value_but_not_the_gradient`.
+
+**The rest of the verification passed**, 16 checks, and three are worth recording
+because nothing else in the suite covers them:
+
+- the `_rung` trajectory is **bit-identical** to a literal reference-structure loop
+  over five steps (max `|param_mine - param_ref|` = 0.000e+00 at every step), holding
+  the objective fixed so only the mechanics are under test — paste, channel-mean
+  gradient, multiplicative step, `1/sens` scaling, and the order of grad-zero,
+  stop-check, backward and update;
+- `Patch.apply`'s normalised composite equals `norm()` of the reference's in-place
+  slice paste to 0.0 — the `F.pad` + mask construction and the in-place assignment
+  agree exactly, so the gradient path through `1/std` is the same on both sides;
+- the record's `final_remote`, `ssim_patch` and `psnr_image` are all measured on the
+  patch the object is left holding, which is the parameter written to `best.pt` —
+  the 2026-10-05 best/final invariant, now also true one level up across the rung
+  ladder. A stop that fires overrides best-by-drop for that rung, so
+  `iap_stopped_at` and the saved patch cannot disagree.
+
+Two apparent failures in the first verification run were artefacts of the verifier
+itself and are noted so they are not rediscovered: `prepare()` recovers `[0,1]` by
+un-normalising, which round-trips through float32 and lands ~6e-8 from the original
+frame, so the sensitivity map needs `allclose` rather than `equal`; and the
+invisibility metrics must be scored against that same round-tripped frame, or the
+6e-8 is attributed to the patch — which is invisible at any real drop but moves PSNR
+by 0.03 dB at 138 dB, where the stub patch has barely moved and the metric is
+measuring float noise.

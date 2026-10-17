@@ -108,6 +108,45 @@ D8  THE FOOTPRINT IS EXCLUDED from both adversarial terms. Classification has
     loss is to paint the patch itself in the target class — loss collapses,
     remote effect stays zero. See losses/adversarial.ipatch_cospgd_loss.
 
+D9  IN THE RELEASED CODE THE REGULARISER HAS NO GRADIENT AT ALL, and this is
+    the largest discrepancy in the port. IAP.py builds its reference patch as
+
+        delta = torch.nn.Parameter(delta)
+        temp  = delta.clone()
+
+    and Tensor.clone() on a leaf that requires grad is DIFFERENTIABLE: temp
+    carries grad_fn=CloneBackward0 back to delta. So for
+    R = sum(sens * |delta - temp|) autograd walks two paths into one leaf,
+
+        dR/d(delta) through delta = + sens * sign(delta - temp)
+        dR/d(delta) through temp  = - sens * sign(delta - temp)
+
+    and they cancel EXACTLY, elementwise, at every step. Verified numerically
+    on the reference's own expression: with |delta - temp| held at 0.1 the term
+    is worth 2542.7 and what reaches delta.grad is 0.000e+00.
+
+    So the perceptibility regulariser changes the REPORTED loss — it is the
+    paper's "human distance" column — and changes the OPTIMISATION not at all.
+    Whatever invisibility the released code achieves comes from the 1/sens
+    factor in the update rule and from starting at the image region, i.e. from
+    parts 1 and 4, and not from part 3. A direct consequence worth stating in
+    the write-up: under the released code w3 cannot affect the result, so a w3
+    ablation against it is a null experiment by construction.
+
+    THE DEFAULT HERE IS THE PAPER, not the released code. `base` is detached,
+    so the gradient is live and equals w3 * sens * sign(delta - base). This is
+    the one place the port deliberately prefers the paper, and the reason is
+    that the alternative is to reproduce a method whose central regularisation
+    term provably does nothing — which is not what "IAP" denotes in the
+    literature and not how a reviewer would read the name. D1 goes the other
+    way, to the released code, because there BOTH branches are coherent
+    procedures; here one of them is a dropped term.
+
+    reg_grad='released' reproduces the cancellation exactly, by adding the
+    term's value to the loss detached: identical value, identical (zero)
+    gradient. So the two can be measured against each other instead of
+    argued about, and "the regulariser contributes nothing" becomes a row.
+
 WHAT THIS MODULE IS NOT
 -----------------------
 It is not a PatchConfig mode. IAP's parameterisation IS this repository's
@@ -155,6 +194,10 @@ REG_REDUCTIONS = ("sum", "sum84", "mean")
 # to make, stated as a measurement.
 LOCALISE_SCORES = ("cam", "cam_over_sens", "center")
 STOP_CRITERIA = ("none", "flip", "target", "drop")
+# D9. 'live' is the paper's regulariser and the default; 'released' reproduces
+# the released code's exact gradient cancellation, where the term is reported
+# and optimises nothing.
+REG_GRADS = ("live", "released")
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -435,9 +478,12 @@ class Objective:
     def __init__(self, tar: str = "ipatch_cospgd", untar: str = "ce",
                  target_class: int = 8,
                  w1: float = IAP_W1, w2: float = IAP_W2, w3: float = IAP_W3,
-                 reg_reduce: str = "sum",
+                 reg_reduce: str = "sum", reg_grad: str = "live",
                  margin_ref: Optional[torch.Tensor] = None,
                  margin_kappa: float = 5.0):
+        if reg_grad not in REG_GRADS:
+            raise ValueError(f"reg_grad must be one of {REG_GRADS}, "
+                             f"got {reg_grad!r}")
         if tar not in ("ipatch_cospgd", "none"):
             raise ValueError(
                 f"iap_tar_loss must be 'ipatch_cospgd' or 'none', got {tar!r}")
@@ -454,6 +500,7 @@ class Objective:
         self.tar_name, self.untar_name = tar, untar
         self.w1, self.w2, self.w3 = float(w1), float(w2), float(w3)
         self.reg_reduce = reg_reduce
+        self.reg_grad = reg_grad
         self.margin_ref = margin_ref
         self._tar = (None if tar == "none"
                      else adversarial.build(tar, target_class))
@@ -466,8 +513,9 @@ class Objective:
             self._untar = adversarial.build(untar, target_class)
 
     def __repr__(self):
+        g = "" if self.reg_grad == "live" else ",NO GRADIENT"
         return (f"IAP({self.w1:g}*{self.tar_name} + {self.w2:g}*"
-                f"{self.untar_name} + {self.w3:g}*reg[{self.reg_reduce}])")
+                f"{self.untar_name} + {self.w3:g}*reg[{self.reg_reduce}{g}])")
 
     def on_step_begin(self, step: int, total: int):
         """
@@ -513,7 +561,12 @@ class Objective:
             total = total + self.w1 * lt
         r = regulariser(delta, base, sens_patch, self.reg_reduce)
         out["reg"] = float(r)
-        total = total + self.w3 * r
+        # D9. Detached, the term has the SAME VALUE and a ZERO gradient, which
+        # is exactly what the released code's two cancelling paths produce. The
+        # reported `reg` is the undetached value either way, so the two modes
+        # are comparable on the column the paper calls "human distance".
+        total = total + self.w3 * (r.detach() if self.reg_grad == "released"
+                                   else r)
         out["total"] = total
         return out
 
@@ -839,7 +892,7 @@ def attack_image(model, img, label, patch, *, mean_t, std_t, cam,
                  tar_loss: str = "ipatch_cospgd",
                  untar_loss: str = "ce",
                  w1: float = IAP_W1, w2: float = IAP_W2, w3: float = IAP_W3,
-                 reg_reduce: str = "sum",
+                 reg_reduce: str = "sum", reg_grad: str = "live",
                  locate: str = "cam",
                  lrs: Sequence[float] = IAP_LRS,
                  steps: int = IAP_STEPS,
@@ -901,12 +954,17 @@ def attack_image(model, img, label, patch, *, mean_t, std_t, cam,
 
     objective = Objective(tar=tar_loss, untar=untar_loss,
                           target_class=target_class, w1=w1, w2=w2, w3=w3,
-                          reg_reduce=reg_reduce, margin_ref=margin_ref,
-                          margin_kappa=margin_kappa)
+                          reg_reduce=reg_reduce, reg_grad=reg_grad,
+                          margin_ref=margin_ref, margin_kappa=margin_kappa)
     if verbose:
         log(f"[clean] all {clean_all:.2f} | remote {clean_rem:.2f}  "
             f"<- remote is the baseline that matters")
         log(f"[iap  ] loss      : {objective!r}")
+        if reg_grad == "released":
+            log(f"[iap  ] reg grad  : RELEASED — the regulariser is reported "
+                f"and optimises NOTHING (D9).\n"
+                f"                   w3 cannot affect this run; that is the "
+                f"point of the arm.")
         log(f"[iap  ] ladder    : lr {', '.join(f'{x:g}' for x in lrs)}  "
             f"x {steps} steps, stop on {stop} >= {stop_thresh:g}")
         if reg_reduce == "sum":
@@ -1012,7 +1070,7 @@ def attack_image(model, img, label, patch, *, mean_t, std_t, cam,
         "iap_stop": stop, "iap_stop_thresh": stop_thresh,
         "iap_steps_run": sum(r["steps_run"] for r in rungs),
         "iap_w1": w1, "iap_w2": w2, "iap_w3": w3,
-        "iap_reg_reduce": reg_reduce,
+        "iap_reg_reduce": reg_reduce, "iap_reg_grad": reg_grad,
         "iap_tar_loss": tar_loss, "iap_untar_loss": untar_loss,
         "iap_clamp": bool(clamp),
         "iap_reg_final": reg_final,

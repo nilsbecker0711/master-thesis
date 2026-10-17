@@ -275,6 +275,89 @@ def test_regulariser_carries_a_gradient_to_delta_only():
     assert s.grad is None
 
 
+def test_the_released_regulariser_has_no_gradient():
+    r"""
+    D9, AND THE LARGEST DISCREPANCY IN THE PORT. The reference builds its
+    reference patch as
+
+        delta = torch.nn.Parameter(delta)
+        temp  = delta.clone()
+
+    and clone() on a grad-requiring leaf is DIFFERENTIABLE, so autograd walks
+    two paths into delta — `+sens*sign(d-t)` through delta and `-sens*sign(d-t)`
+    through temp — which cancel exactly. The term is reported (it is the
+    paper's "human distance") and optimises nothing.
+
+    This test holds the finding on the REFERENCE'S OWN EXPRESSION, so it stays
+    true independently of anything in iap.py and cannot be explained away as a
+    porting artefact.
+    """
+    torch.manual_seed(11)
+    base = torch.rand(1, 3, 8, 8)
+    sens = torch.rand(8, 8) * 20 + 1
+
+    delta = torch.nn.Parameter(base.clone())
+    temp = delta.clone()                       # the reference, verbatim
+    assert temp.requires_grad and temp.grad_fn is not None
+    delta.data.add_(0.1)                       # so sign(d - t) = +1, not 0
+    r = 3 * (sens.detach() * torch.abs(delta - temp)).sum()
+    r.backward()
+
+    assert float(r) > 0                        # the term is worth something
+    assert float(delta.grad.abs().sum()) == 0.0    # and none of it is gradient
+
+
+def test_the_ported_regulariser_does_have_a_gradient():
+    """The other side of D9: a DETACHED base leaves the paper's gradient."""
+    torch.manual_seed(11)
+    base = torch.rand(3, 8, 8)
+    sens = torch.rand(8, 8) * 20 + 1
+    delta = (base + 0.1).clone().requires_grad_(True)
+    (3 * iap.regulariser(delta, base, sens, "sum")).backward()
+    assert torch.allclose(delta.grad, 3 * sens * torch.ones(3, 8, 8),
+                          atol=1e-5)
+
+
+def test_reg_grad_released_reports_the_value_but_not_the_gradient():
+    """
+    The reproduction must match the released code on BOTH counts: identical
+    loss value, zero gradient. A mode that simply dropped the term would match
+    the gradient and not the value, and the "human distance" column would stop
+    being comparable between the two arms.
+    """
+    logits, label, fp = _scene()
+    sup = ~fp
+    # The adversarial terms need a graph of their own, or detaching the
+    # regulariser leaves the total with no grad_fn and backward() raises. In
+    # the real loop the patch IS upstream of the logits; here the two are
+    # independent on purpose, so `d.grad` isolates the regulariser's path.
+    logits = logits.clone().requires_grad_(True)
+    b = torch.rand(3, 6, 6)
+    s = torch.rand(6, 6) * 10 + 1
+
+    val, total, grad = {}, {}, {}
+    for mode in ("live", "released"):
+        d = (b + 0.1).clone().requires_grad_(True)
+        o = iap.Objective(tar="ipatch_cospgd", untar="ce", target_class=16,
+                          reg_grad=mode)
+        parts = o(logits, label, fp, sup, d, b, s)
+        parts["total"].backward()
+        val[mode], total[mode], grad[mode] = (parts["reg"],
+                                              float(parts["total"]), d.grad)
+
+    assert val["live"] == pytest.approx(val["released"])      # same value
+    assert total["live"] == pytest.approx(total["released"])  # same total
+    # live: the paper's gradient. released: NOTHING reached the patch.
+    assert torch.allclose(grad["live"],
+                          iap.IAP_W3 * s * torch.ones(3, 6, 6), atol=1e-4)
+    assert grad["released"] is None
+
+
+def test_reg_grad_rejects_an_unknown_mode():
+    with pytest.raises(ValueError, match="reg_grad must be one of"):
+        iap.Objective(reg_grad="detached")
+
+
 def test_regulariser_rejects_an_unknown_reduction():
     with pytest.raises(ValueError, match="reduce must be one of"):
         iap.regulariser(torch.rand(3, 4, 4), torch.rand(3, 4, 4),

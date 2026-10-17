@@ -125,6 +125,17 @@ def build_parser():
                         "with p**2; 'sum84' rescales by (84/p)**2 so w3 keeps "
                         "its published meaning at 256px; 'mean' is scale-free "
                         "and is not IAP.")
+    g.add_argument("--iap_reg_grad", default="live",
+                   choices=list(iap_mod.REG_GRADS),
+                   help="D9, and the port's one deliberate preference for the "
+                        "PAPER over the released code. 'live' (default): the "
+                        "regulariser's gradient is w3*sens*sign(delta-base). "
+                        "'released': the released code builds its reference as "
+                        "temp = delta.clone(), which is differentiable, so the "
+                        "term's two gradient paths cancel EXACTLY and it "
+                        "optimises nothing while still being reported. Under "
+                        "'released' w3 cannot affect the result at all — that "
+                        "is the measurement, not a bug in this script.")
     g.add_argument("--iap_locate", default="cam",
                    choices=list(iap_mod.LOCALISE_SCORES),
                    help="window score. 'cam' is the RELEASED code (Grad-CAM "
@@ -246,7 +257,19 @@ def check_args(a, p):
     if a.iap_stop == "target" and a.iap_tar_loss == "none":
         p.error("--iap_stop target needs a targeted run; pass "
                 "--iap_stop flip (or drop) with --iap_tar_loss none.")
-    if a.iap_reg_reduce == "sum" and a.patch_size != want:
+    if a.iap_reg_grad == "released" and a.iap_w3 != iap_mod.IAP_W3:
+        p.error(
+            f"--iap_reg_grad released with --iap_w3 {a.iap_w3:g}: under the "
+            f"released code the regulariser's gradient cancels exactly (D9), "
+            f"so w3 cannot change the optimisation and a swept value would "
+            f"produce identical runs under different directory names. Leave "
+            f"w3 at {iap_mod.IAP_W3:g}, or use --iap_reg_grad live to sweep "
+            f"it.")
+    # Only under 'live'. Under 'released' the regulariser has no gradient at
+    # all, so advice about its scale against the adversarial terms would be
+    # advice about a term that is not in the optimisation.
+    if (a.iap_reg_reduce == "sum" and a.patch_size != want
+            and a.iap_reg_grad == "live"):
         print(f"\n  NOTE (D3): --iap_reg_reduce sum at {a.patch_size}px sums "
               f"{(a.patch_size / want) ** 2:.1f}x more elements than the "
               f"{want}px patch\n        the published w3="
@@ -263,6 +286,7 @@ def main():
     arm = "_".join(x for x in
                    ["" if a.iap_locate == "cam" else a.iap_locate,
                     "" if a.iap_reg_reduce == "sum" else a.iap_reg_reduce,
+                    "" if a.iap_reg_grad == "live" else "reggrad-released",
                     "" if a.iap_tar_loss != "none" else "untargeted",
                     "" if a.iap_clamp else "noclamp"] if x)
     tag = "_".join(x for x in [a.arch, "iap", a.iap_untar_loss,
@@ -342,7 +366,8 @@ def _run(a, out_dir: Path):
             target_class=a.target_class,
             tar_loss=a.iap_tar_loss, untar_loss=a.iap_untar_loss,
             w1=a.iap_w1, w2=a.iap_w2, w3=a.iap_w3,
-            reg_reduce=a.iap_reg_reduce, locate=a.iap_locate,
+            reg_reduce=a.iap_reg_reduce, reg_grad=a.iap_reg_grad,
+            locate=a.iap_locate,
             lrs=lrs, steps=a.iap_steps,
             stop=a.iap_stop, stop_thresh=a.iap_stop_thresh,
             margin_kappa=a.margin_kappa,
