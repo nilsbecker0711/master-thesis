@@ -28,6 +28,7 @@ FILL THESE IN, or pass --cfg_path / --weights on every call.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Optional
 
 BRACKETS = {
@@ -53,6 +54,15 @@ class ArchSpec:
 _W = "/pfs/work9/workspace/scratch/ma_nilbecke-thesis"
 _M = f"{_W}/checkpoints"
 #/pfs/work9/workspace/scratch/ma_nilbecke-thesis/master-thesis
+
+# Configs that are SOURCE, not a download. Every entry above takes its config
+# from _M, because the mmseg zoo ships one next to each checkpoint. PIDNet's
+# does not work here — the zoo config is mmseg 1.x — so configs/mmseg/*.py are
+# hand-written 0.x configs that declare patchreach's own PIDNet/PIDHead. They
+# are version-controlled with the code that implements them and resolved
+# relative to this file, so a fresh clone runs without copying anything into
+# the workspace. Only the .pth still has to be downloaded into _M.
+_CFG = Path(__file__).resolve().parents[2] / "configs" / "mmseg"
 
 REGISTRY = {
 
@@ -108,6 +118,38 @@ REGISTRY = {
         weights=f"{_M}/deeplabv3plus_r18-d8_512x1024_80k_cityscapes_20201226_080942-cff257fe.pth",
         note="Dilated ResNet-18, BasicBlock, 512-channel output — the head "
             "dims differ from r50/r101, so this is not a pure depth ablation."),
+
+    # ── PIDNet: three-branch CNN, no attention ───────────────────────────────
+    # The only entries whose cfg comes from the REPO rather than from _M: the
+    # mmseg zoo config is 1.x-only, so configs/mmseg/pidnet_*.py are 0.x
+    # configs declaring patchreach/models/pidnet.py's vendored PIDNet/PIDHead.
+    # Weights are the unmodified zoo checkpoints; the download URLs are in each
+    # config's docstring.
+    #
+    # ENTRY STRIDE 2 — the gap in the lineup, between UNet's 1 and the three
+    # DeepLabs' 8, with setr_pup at 16. Output stride is 8, like DeepLab's.
+    # Clean mIoU 78.74 / 80.22 / 80.89 is the top of the no-attention bracket
+    # (every DeepLab and UNet is below it, segformer_b5's ~82 above), so a
+    # robustness result here cannot be waved away as a weak model.
+    "pidnet_s": ArchSpec("pidnet_s", "none",
+        cfg=str(_CFG / "pidnet_s.py"),
+        weights=f"{_M}/pidnet-s_2xb6-120k_1024x1024-cityscapes_20230302_191700-bb8e3bcc.pth",
+        note="Smallest variant, clean mIoU 78.74. PAPPM + LightBag."),
+
+    "pidnet_m": ArchSpec("pidnet_m", "none",
+        cfg=str(_CFG / "pidnet_m.py"),
+        weights=f"{_M}/pidnet-m_2xb6-120k_1024x1024-cityscapes_20230301_143452-f9bcdbf3.pth",
+        note="PIDNet-S widened 32->64 channels, clean mIoU 80.22. Same graph "
+             "as S (PAPPM + LightBag) — the pure WIDTH ablation within the "
+             "family, with depth and module types held constant."),
+
+    "pidnet_l": ArchSpec("pidnet_l", "none",
+        cfg=str(_CFG / "pidnet_l.py"),
+        weights=f"{_M}/pidnet-l_2xb6-120k_1024x1024-cityscapes_20230303_114514-0783ca6b.pth",
+        note="Clean mIoU 80.89 — the value Maag & Fischer (arXiv:2408.10021) "
+             "Table 1 report for 'PIDNet', so this is the variant that makes "
+             "docs/experiment_log.md's protocol comparison exact. Not just a "
+             "wider M: num_stem_blocks=3 swaps PAPPM/LightBag for DAPPM/Bag."),
 }
 
     # ── Swin windowed attention ──────────────────────────────────────────────
@@ -143,6 +185,10 @@ REGISTRY["unet"] = REGISTRY["unet_s5d16"]
 REGISTRY["deeplab_101"] = REGISTRY["deeplabv3plus_r101"]
 REGISTRY["deeplab_50"] = REGISTRY["deeplabv3plus_r50"]
 REGISTRY["deeplab_18"] = REGISTRY["deeplabv3plus_r18"]
+# pidnet -> L, NOT the smallest variant: 80.89 is the number Maag & Fischer
+# Table 1 print as "PIDNet", and the short name should mean the same model the
+# protocol citation in docs/experiment_log.md leans on.
+REGISTRY["pidnet"] = REGISTRY["pidnet_l"]
 
 
 def resolve(name: str, cfg_override=None, weights_override=None):
@@ -200,6 +246,14 @@ def load_segmentor(cfg_path: str, weights_path: str):
                 f"    exactly the model Yuan et al. Table 1 used for it (5.86).\n"
                 f"    All three give a valid ERF comparison without DCNv3."
             ) from e
+
+    # Same gate, vendored in-tree rather than out: the import REGISTERS PIDNet
+    # and PIDHead into mmseg's BACKBONES/HEADS, and mmseg 0.x has neither.
+    # Needs no custom CUDA op, so unlike InternImage it cannot fail for a
+    # missing build — only for a missing mmseg, which build_segmentor needs
+    # anyway.
+    if backbone == "PIDNet":
+        import patchreach.models.pidnet            # noqa: F401
 
     print(f"[model] backbone={backbone}  head={head}  "
           f"num_classes={cfg.model.decode_head.get('num_classes')}")
