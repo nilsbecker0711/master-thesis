@@ -27,7 +27,12 @@ FILL THESE IN, or pass --cfg_path / --weights on every call.
 """
 from __future__ import annotations
 
+import sys
+import types
+from contextlib import contextmanager
 from dataclasses import dataclass
+from importlib.abc import Loader, MetaPathFinder
+from importlib.util import spec_from_loader
 from pathlib import Path
 from typing import Optional
 
@@ -208,6 +213,112 @@ def resolve(name: str, cfg_override=None, weights_override=None):
     return cfg, weights, spec
 
 
+class _StubLoader(Loader):
+    """Produces a module whose every attribute is a fresh dict subclass."""
+
+    def create_module(self, spec):
+        mod = types.ModuleType(spec.name)
+        mod.__path__ = []                  # so `mmengine.logging.x` resolves
+        return mod
+
+    def exec_module(self, module):
+        def __getattr__(name):             # PEP 562 module-level __getattr__
+            if name.startswith("__"):
+                raise AttributeError(name)
+            # __module__ must name the STUB module, not this one. type()
+            # otherwise stamps the class with wherever the call site lives
+            # (patchreach.models.registry), where pickle cannot find it again
+            # -- harmless for a one-way unpickle, but it makes the synthesized
+            # classes unpicklable and the reprs lie about where they came from.
+            cls = type(name, (dict,), {"__module__": module.__name__})
+            setattr(module, name, cls)
+            return cls
+        module.__getattr__ = __getattr__
+
+
+class _StubFinder(MetaPathFinder):
+    def find_spec(self, fullname, path=None, target=None):
+        if fullname == "mmengine" or fullname.startswith("mmengine."):
+            return spec_from_loader(fullname, _StubLoader())
+        return None
+
+
+@contextmanager
+def _mmengine_stub():
+    r"""
+    Let torch.load unpickle an mmseg **1.x** checkpoint inside an mmseg 0.x
+    environment, by standing in a fake `mmengine` package for the duration.
+
+    WHY THIS IS NEEDED. A checkpoint is a pickle of `{'state_dict': ...,
+    'meta': ...}`, and torch.load unpickles the WHOLE file -- meta included --
+    before mmcv ever looks at the weights. mmseg 1.x writes its meta through
+    mmengine, so the stream carries `mmengine.config.config.ConfigDict` and
+    `mmengine.logging.history_buffer.HistoryBuffer` instances. In this
+    project's env (mmcv 1.x + mmseg 0.x) there is no mmengine, so the load
+    dies with `ModuleNotFoundError: No module named 'mmengine'` -- AFTER
+    printing "load checkpoint from local path", which makes it look like a
+    corrupt file rather than a version artifact. The PIDNet zoo checkpoints
+    are 1.x-era and hit this; every other arch in the registry predates
+    mmengine and never touches this path.
+
+    THE WEIGHTS ARE UNAFFECTED. Tensors unpickle through torch's own
+    persistent-load machinery and know nothing about mmengine; only the meta's
+    bookkeeping objects need a class to land in, and they become plain dicts.
+    That costs the `meta['CLASSES']`/`meta['PALETTE']` convenience attributes,
+    which 1.x checkpoints do not carry under those names anyway (it is
+    `dataset_meta` there, mapped below) and which nothing in this repo reads
+    -- every palette and class name comes from patchreach.data.cityscapes.
+
+    SCOPED, so a real mmengine (if one is ever installed beside us) is not
+    shadowed: the finder is removed and every module it created is dropped
+    from sys.modules on the way out.
+    """
+    finder = _StubFinder()
+    sys.meta_path.insert(0, finder)
+    try:
+        yield
+    finally:
+        try:
+            sys.meta_path.remove(finder)
+        except ValueError:
+            pass
+        for name in [m for m in sys.modules
+                     if m == "mmengine" or m.startswith("mmengine.")]:
+            if isinstance(getattr(sys.modules[name], "__loader__", None),
+                          _StubLoader):
+                del sys.modules[name]
+
+
+def _is_mmengine_missing(exc: ModuleNotFoundError) -> bool:
+    """
+    Is this the 1.x-meta pickle failure, or a genuinely absent dependency?
+
+    Gated on the EXCEPTION, not on the arch: what decides it is which mmseg
+    WROTE the file, and --weights can point anywhere. Anything that is not
+    mmengine -- a missing mmseg_custom, a missing ops_dcnv3 -- is a real
+    install problem and must keep propagating.
+    """
+    return str(getattr(exc, "name", "") or "").split(".")[0] == "mmengine"
+
+
+def _load_weights(model, weights_path: str):
+    """
+    mmcv's load_checkpoint, retried under the mmengine stub if the pickle
+    needs it. Returns the checkpoint dict.
+    """
+    from mmcv.runner import load_checkpoint
+
+    try:
+        return load_checkpoint(model, weights_path, map_location="cpu")
+    except ModuleNotFoundError as e:
+        if not _is_mmengine_missing(e):
+            raise
+        print(f"[ckpt] mmseg 1.x-era checkpoint: stubbing out its mmengine "
+              f"meta ({e.name}). Weights are unaffected.")
+        with _mmengine_stub():
+            return load_checkpoint(model, weights_path, map_location="cpu")
+
+
 def load_segmentor(cfg_path: str, weights_path: str):
     """
     Build + load any mmseg EncoderDecoder. Returns (model, backbone_type).
@@ -219,7 +330,7 @@ def load_segmentor(cfg_path: str, weights_path: str):
     type='InternImage' — that has happened in this project.
     """
     from mmcv import Config
-    from mmcv.runner import load_checkpoint, wrap_fp16_model
+    from mmcv.runner import wrap_fp16_model
     from mmseg.models import build_segmentor
 
     cfg = Config.fromfile(cfg_path)
@@ -262,8 +373,19 @@ def load_segmentor(cfg_path: str, weights_path: str):
     model = build_segmentor(cfg.model, test_cfg=cfg.get("test_cfg"))
     if cfg.get("fp16", None) is not None:
         wrap_fp16_model(model)
-    ck = load_checkpoint(model, weights_path, map_location="cpu")
+    ck = _load_weights(model, weights_path)
+    meta = ck.get("meta", {}) or {}
     for k in ("CLASSES", "PALETTE"):
-        if k in ck.get("meta", {}):
-            setattr(model, k, ck["meta"][k])
+        if k in meta:
+            setattr(model, k, meta[k])
+    # mmseg 1.x spells the same thing `dataset_meta={'classes':..,'palette':..}`.
+    # Carried over so the attributes mean the same for a 1.x-era checkpoint;
+    # the stub may have flattened dataset_meta to a plain dict, hence the
+    # defensive .get rather than attribute access.
+    ds = meta.get("dataset_meta") or {}
+    if isinstance(ds, dict):
+        if not hasattr(model, "CLASSES") and ds.get("classes"):
+            model.CLASSES = ds["classes"]
+        if not hasattr(model, "PALETTE") and ds.get("palette"):
+            model.PALETTE = ds["palette"]
     return model, backbone
