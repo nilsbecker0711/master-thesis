@@ -668,3 +668,100 @@ def test_invisibility_is_perfect_on_an_unchanged_frame():
     v = iap.invisibility(clean, clean.clone(), (4, 4, 16))
     assert v["ssim_patch"] == pytest.approx(1.0, abs=1e-5)
     assert v["ssim_image"] == pytest.approx(1.0, abs=1e-5)
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+#  slide inference — what IAP can and cannot do under a tiled model
+# ═════════════════════════════════════════════════════════════════════════════
+
+def _stub_segmentor():
+    """
+    An mmseg-shaped segmentor: a .backbone returning a TUPLE of feature maps,
+    and encode_decode(x, metas). Enough for WrappedSegModel and
+    SlidingWindowSegModel to wrap, and for the CAM to try to hook.
+    """
+    import torch.nn as nn
+
+    class Backbone(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.c = nn.Conv2d(3, 16, 3, stride=4, padding=1)
+            self.n_calls = 0
+
+        def forward(self, x):
+            self.n_calls += 1
+            return (self.c(x),)
+
+    class Seg(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.backbone = Backbone()
+            self.head = nn.Conv2d(16, K, 1)
+            self.test_cfg = {"mode": "slide", "crop_size": (64, 64),
+                             "stride": (48, 48)}
+
+        def encode_decode(self, x, metas):
+            return self.head(self.backbone(x)[0])
+
+    return Seg()
+
+
+def test_the_cam_refuses_a_tiled_model():
+    r"""
+    THE FAILURE THIS REPLACES was not a refusal but a crash three frames deep.
+    SlidingWindowSegModel calls the segmentor once per window, so the CAM's
+    forward hook fires n_windows times and keeps only the LAST window's feature
+    map, while the gradient and the upsample target are frame-shaped. Measured
+    on this stub before the guard: module='backbone' raised AttributeError (the
+    wrapper shifts the dotted path), and module='model.backbone' resolved and
+    then died with "The size of tensor a (128) must match the size of tensor b
+    (80)".
+
+    This also covers overfit.py's `--placement gradcam --inference auto`, which
+    had the same latent bug and no flag refusing it.
+    """
+    from patchreach.models.wrapper import (SlidingWindowSegModel,
+                                           WrappedSegModel)
+    from patchreach.patch import segmentation_cam
+
+    whole = WrappedSegModel(_stub_segmentor())
+    tiled = SlidingWindowSegModel(whole, (64, 64), (48, 48), K)
+
+    with pytest.raises(ValueError, match="cannot run on a SlidingWindowSegModel"):
+        segmentation_cam.build(tiled, "ce")
+
+    # ... and the un-tiled model is still fine, so the guard is not a blanket.
+    cam = segmentation_cam.build(whole, "ce")
+    m, logits = cam(torch.rand(1, 3, 64, 128),
+                    torch.randint(0, K, (1, 64, 128)))
+    assert m.shape == (1, 1, 64, 128)
+    cam.close()
+
+
+def test_slide_checkpoint_is_refused_only_when_a_cam_is_built():
+    """
+    The first version of this guard refused --slide_checkpoint outright, which
+    blocked the ONE combination that works at native resolution: centre
+    placement builds no CAM, so nothing calls autograd.grad and the reentrant
+    checkpoint is free to do its job. A guard that over-refuses is as wrong as
+    one that under-refuses — it sends the run to a mode the baseline is not in.
+    """
+    _scripts_on_path()
+    import iap_attack as S
+
+    p = S.build_parser()
+    base = ["--cityscapes_root", "X", "--slide_checkpoint"]
+
+    with pytest.raises(SystemExit):
+        S.check_args(p.parse_args(base + ["--iap_locate", "cam"]), p)
+
+    a = S.check_args(p.parse_args(base + ["--iap_locate", "center"]), p)
+    assert a.slide_checkpoint and a.iap_locate == "center"
+
+
+def _scripts_on_path():
+    import sys
+    from pathlib import Path
+    d = str(Path(__file__).resolve().parents[1] / "scripts")
+    if d not in sys.path:
+        sys.path.insert(0, d)

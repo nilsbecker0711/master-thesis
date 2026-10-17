@@ -225,13 +225,22 @@ def check_args(a, p):
             f"three of its four parts describe a different signal. Set "
             f"--patch_size {side}, or --patch_scale "
             f"{a.patch_size / a.img_h:g}.")
-    if a.slide_checkpoint:
+    # CONDITIONAL ON THE CAM, and the first version of this was not — it
+    # refused --slide_checkpoint outright, which blocked the one combination
+    # that actually works at native resolution. The conflict is Grad-CAM's
+    # alone: it reaches the features with torch.autograd.grad, which the
+    # reentrant checkpoint in SlidingWindowSegModel does not support. Under
+    # --iap_locate center no CAM is built at all, so nothing calls
+    # autograd.grad and the checkpoint is free to do its job.
+    if a.slide_checkpoint and a.iap_locate != "center":
         p.error(
-            "--slide_checkpoint cannot be combined with IAP. Localisation "
-            "needs Grad-CAM, which reaches the features with "
-            "torch.autograd.grad, and the reentrant checkpoint in "
-            "SlidingWindowSegModel does not support that (see its docstring). "
-            "Use --inference whole, or slide without checkpointing.")
+            f"--slide_checkpoint cannot be combined with --iap_locate "
+            f"{a.iap_locate!r}: localisation needs Grad-CAM, which reaches the "
+            f"features with torch.autograd.grad, and the reentrant checkpoint "
+            f"in SlidingWindowSegModel does not support that (see its "
+            f"docstring, and the 2026-09-21 experiment_log entry). Either "
+            f"--iap_locate center, which builds no CAM and runs under slide "
+            f"with checkpointing, or --inference whole, which keeps the CAM.")
     if a.cam_objective == "attack" and a.iap_locate != "center":
         if a.iap_untar_loss in ("ce", "cospgd"):
             a.cam_objective = a.iap_untar_loss
@@ -305,6 +314,32 @@ def _run(a, out_dir: Path):
     seed_everything(a.seed)
     device = get_device()
     model, n_ch, n_act, spec = setup_model(a)
+
+    # CHECKED HERE, NOT IN check_args, because --inference auto only becomes
+    # slide once the checkpoint's test_cfg has been read, which needs the model
+    # built. Grad-CAM cannot run on a tiled model at all: SegmentationCAM hooks
+    # the backbone, the hook fires ONCE PER WINDOW, and self._feats ends up
+    # holding the last window's feature map while the gradient and the upsample
+    # target are frame-shaped. Measured on a stub slide model: AttributeError
+    # on the dotted path, or a tensor-size RuntimeError once past it. The CAM
+    # refuses this itself now; this check exists to name the two flags the user
+    # typed rather than to let them read it off a constructor.
+    from patchreach.models.wrapper import SlidingWindowSegModel
+    if isinstance(model, SlidingWindowSegModel) and a.iap_locate != "center":
+        raise SystemExit(
+            f"--inference {a.inference} resolved to SLIDE for {a.arch}, and "
+            f"--iap_locate {a.iap_locate!r} needs Grad-CAM, which cannot run "
+            f"on a tiled model (one feature map per window, no frame-shaped "
+            f"map).\n"
+            f"  Either --iap_locate center  — IAP's loss and update rule at "
+            f"centre placement, which is what every csf arm here is placed at "
+            f"anyway, and runs under slide (add --slide_checkpoint);\n"
+            f"  or     --inference whole    — keeps IAP's localisation.\n"
+            f"  Note that for SegFormer/Swin (crop 1024) slide and whole are "
+            f"the SAME computation at 1024x1024 and below — one window clamped "
+            f"to the frame — so the choice only bites on the full-width "
+            f"1024x2048 frame.")
+
     mean_t, std_t = norm_tensors(device)
 
     ds = make_dataset(a, "val")

@@ -139,6 +139,37 @@ class SegmentationCAM:
         if target not in ("gt", "pred"):
             raise ValueError(f"cam_target must be 'gt' or 'pred', got {target!r}")
 
+        # A TILED MODEL CANNOT PRODUCE A CAM, and before this check it failed
+        # late and unrecognisably. SlidingWindowSegModel runs the segmentor
+        # once per window, so the forward hook below fires n_windows times and
+        # self._feats keeps only the LAST window's feature map — a 1024x1024
+        # tile's worth — while `grads`, as_spatial's (H, W) and the upsample
+        # target all describe the whole frame. Measured on a stub slide model:
+        # with module='backbone' the dotted path raises AttributeError (the
+        # wrapper shifts it, the segmentor is at .model), and with
+        # 'model.backbone' it resolves and then dies in the weighted sum with
+        # "The size of tensor a (128) must match the size of tensor b (80)".
+        #
+        # Stitching per-window CAMs is not a fix to make quietly: the windows
+        # overlap, each one's min-max normalisation is local, and the result
+        # would be a different quantity from the whole-frame map every existing
+        # gradcam run was measured with. Refuse, and name the two ways out.
+        # Imported locally and by TYPE rather than by class name: wrapper.py
+        # imports nothing from patchreach, so there is no cycle, and a name
+        # comparison would miss a subclass and break on a rename.
+        from ..models.wrapper import SlidingWindowSegModel
+        if isinstance(model, SlidingWindowSegModel):
+            raise ValueError(
+                "SegmentationCAM cannot run on a SlidingWindowSegModel: the "
+                "backbone is called once per window, so there is no "
+                "frame-shaped feature map to weight. Build the CAM on the "
+                "un-tiled model (the WrappedSegModel at .model) if a "
+                "whole-frame map is acceptable alongside tiled inference — "
+                "state it as a deviation, the map and the attack then see "
+                "different model behaviour — or use --inference whole. For "
+                "SegFormer/Swin the two coincide at 1024x1024 and below, "
+                "where the crop clamps to a single window.")
+
         self.module = self._resolve(model, module)
         self._feats: Optional[Sequence[torch.Tensor]] = None
         self._handle = self.module.register_forward_hook(self._hook)
