@@ -275,6 +275,89 @@ def test_regulariser_carries_a_gradient_to_delta_only():
     assert s.grad is None
 
 
+def test_the_released_regulariser_has_no_gradient():
+    r"""
+    D9, AND THE LARGEST DISCREPANCY IN THE PORT. The reference builds its
+    reference patch as
+
+        delta = torch.nn.Parameter(delta)
+        temp  = delta.clone()
+
+    and clone() on a grad-requiring leaf is DIFFERENTIABLE, so autograd walks
+    two paths into delta — `+sens*sign(d-t)` through delta and `-sens*sign(d-t)`
+    through temp — which cancel exactly. The term is reported (it is the
+    paper's "human distance") and optimises nothing.
+
+    This test holds the finding on the REFERENCE'S OWN EXPRESSION, so it stays
+    true independently of anything in iap.py and cannot be explained away as a
+    porting artefact.
+    """
+    torch.manual_seed(11)
+    base = torch.rand(1, 3, 8, 8)
+    sens = torch.rand(8, 8) * 20 + 1
+
+    delta = torch.nn.Parameter(base.clone())
+    temp = delta.clone()                       # the reference, verbatim
+    assert temp.requires_grad and temp.grad_fn is not None
+    delta.data.add_(0.1)                       # so sign(d - t) = +1, not 0
+    r = 3 * (sens.detach() * torch.abs(delta - temp)).sum()
+    r.backward()
+
+    assert float(r) > 0                        # the term is worth something
+    assert float(delta.grad.abs().sum()) == 0.0    # and none of it is gradient
+
+
+def test_the_ported_regulariser_does_have_a_gradient():
+    """The other side of D9: a DETACHED base leaves the paper's gradient."""
+    torch.manual_seed(11)
+    base = torch.rand(3, 8, 8)
+    sens = torch.rand(8, 8) * 20 + 1
+    delta = (base + 0.1).clone().requires_grad_(True)
+    (3 * iap.regulariser(delta, base, sens, "sum")).backward()
+    assert torch.allclose(delta.grad, 3 * sens * torch.ones(3, 8, 8),
+                          atol=1e-5)
+
+
+def test_reg_grad_released_reports_the_value_but_not_the_gradient():
+    """
+    The reproduction must match the released code on BOTH counts: identical
+    loss value, zero gradient. A mode that simply dropped the term would match
+    the gradient and not the value, and the "human distance" column would stop
+    being comparable between the two arms.
+    """
+    logits, label, fp = _scene()
+    sup = ~fp
+    # The adversarial terms need a graph of their own, or detaching the
+    # regulariser leaves the total with no grad_fn and backward() raises. In
+    # the real loop the patch IS upstream of the logits; here the two are
+    # independent on purpose, so `d.grad` isolates the regulariser's path.
+    logits = logits.clone().requires_grad_(True)
+    b = torch.rand(3, 6, 6)
+    s = torch.rand(6, 6) * 10 + 1
+
+    val, total, grad = {}, {}, {}
+    for mode in ("live", "released"):
+        d = (b + 0.1).clone().requires_grad_(True)
+        o = iap.Objective(tar="ipatch_cospgd", untar="ce", target_class=16,
+                          reg_grad=mode)
+        parts = o(logits, label, fp, sup, d, b, s)
+        parts["total"].backward()
+        val[mode], total[mode], grad[mode] = (parts["reg"],
+                                              float(parts["total"]), d.grad)
+
+    assert val["live"] == pytest.approx(val["released"])      # same value
+    assert total["live"] == pytest.approx(total["released"])  # same total
+    # live: the paper's gradient. released: NOTHING reached the patch.
+    assert torch.allclose(grad["live"],
+                          iap.IAP_W3 * s * torch.ones(3, 6, 6), atol=1e-4)
+    assert grad["released"] is None
+
+
+def test_reg_grad_rejects_an_unknown_mode():
+    with pytest.raises(ValueError, match="reg_grad must be one of"):
+        iap.Objective(reg_grad="detached")
+
+
 def test_regulariser_rejects_an_unknown_reduction():
     with pytest.raises(ValueError, match="reduce must be one of"):
         iap.regulariser(torch.rand(3, 4, 4), torch.rand(3, 4, 4),
@@ -585,3 +668,100 @@ def test_invisibility_is_perfect_on_an_unchanged_frame():
     v = iap.invisibility(clean, clean.clone(), (4, 4, 16))
     assert v["ssim_patch"] == pytest.approx(1.0, abs=1e-5)
     assert v["ssim_image"] == pytest.approx(1.0, abs=1e-5)
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+#  slide inference — what IAP can and cannot do under a tiled model
+# ═════════════════════════════════════════════════════════════════════════════
+
+def _stub_segmentor():
+    """
+    An mmseg-shaped segmentor: a .backbone returning a TUPLE of feature maps,
+    and encode_decode(x, metas). Enough for WrappedSegModel and
+    SlidingWindowSegModel to wrap, and for the CAM to try to hook.
+    """
+    import torch.nn as nn
+
+    class Backbone(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.c = nn.Conv2d(3, 16, 3, stride=4, padding=1)
+            self.n_calls = 0
+
+        def forward(self, x):
+            self.n_calls += 1
+            return (self.c(x),)
+
+    class Seg(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.backbone = Backbone()
+            self.head = nn.Conv2d(16, K, 1)
+            self.test_cfg = {"mode": "slide", "crop_size": (64, 64),
+                             "stride": (48, 48)}
+
+        def encode_decode(self, x, metas):
+            return self.head(self.backbone(x)[0])
+
+    return Seg()
+
+
+def test_the_cam_refuses_a_tiled_model():
+    r"""
+    THE FAILURE THIS REPLACES was not a refusal but a crash three frames deep.
+    SlidingWindowSegModel calls the segmentor once per window, so the CAM's
+    forward hook fires n_windows times and keeps only the LAST window's feature
+    map, while the gradient and the upsample target are frame-shaped. Measured
+    on this stub before the guard: module='backbone' raised AttributeError (the
+    wrapper shifts the dotted path), and module='model.backbone' resolved and
+    then died with "The size of tensor a (128) must match the size of tensor b
+    (80)".
+
+    This also covers overfit.py's `--placement gradcam --inference auto`, which
+    had the same latent bug and no flag refusing it.
+    """
+    from patchreach.models.wrapper import (SlidingWindowSegModel,
+                                           WrappedSegModel)
+    from patchreach.patch import segmentation_cam
+
+    whole = WrappedSegModel(_stub_segmentor())
+    tiled = SlidingWindowSegModel(whole, (64, 64), (48, 48), K)
+
+    with pytest.raises(ValueError, match="cannot run on a SlidingWindowSegModel"):
+        segmentation_cam.build(tiled, "ce")
+
+    # ... and the un-tiled model is still fine, so the guard is not a blanket.
+    cam = segmentation_cam.build(whole, "ce")
+    m, logits = cam(torch.rand(1, 3, 64, 128),
+                    torch.randint(0, K, (1, 64, 128)))
+    assert m.shape == (1, 1, 64, 128)
+    cam.close()
+
+
+def test_slide_checkpoint_is_refused_only_when_a_cam_is_built():
+    """
+    The first version of this guard refused --slide_checkpoint outright, which
+    blocked the ONE combination that works at native resolution: centre
+    placement builds no CAM, so nothing calls autograd.grad and the reentrant
+    checkpoint is free to do its job. A guard that over-refuses is as wrong as
+    one that under-refuses — it sends the run to a mode the baseline is not in.
+    """
+    _scripts_on_path()
+    import iap_attack as S
+
+    p = S.build_parser()
+    base = ["--cityscapes_root", "X", "--slide_checkpoint"]
+
+    with pytest.raises(SystemExit):
+        S.check_args(p.parse_args(base + ["--iap_locate", "cam"]), p)
+
+    a = S.check_args(p.parse_args(base + ["--iap_locate", "center"]), p)
+    assert a.slide_checkpoint and a.iap_locate == "center"
+
+
+def _scripts_on_path():
+    import sys
+    from pathlib import Path
+    d = str(Path(__file__).resolve().parents[1] / "scripts")
+    if d not in sys.path:
+        sys.path.insert(0, d)

@@ -125,6 +125,17 @@ def build_parser():
                         "with p**2; 'sum84' rescales by (84/p)**2 so w3 keeps "
                         "its published meaning at 256px; 'mean' is scale-free "
                         "and is not IAP.")
+    g.add_argument("--iap_reg_grad", default="live",
+                   choices=list(iap_mod.REG_GRADS),
+                   help="D9, and the port's one deliberate preference for the "
+                        "PAPER over the released code. 'live' (default): the "
+                        "regulariser's gradient is w3*sens*sign(delta-base). "
+                        "'released': the released code builds its reference as "
+                        "temp = delta.clone(), which is differentiable, so the "
+                        "term's two gradient paths cancel EXACTLY and it "
+                        "optimises nothing while still being reported. Under "
+                        "'released' w3 cannot affect the result at all — that "
+                        "is the measurement, not a bug in this script.")
     g.add_argument("--iap_locate", default="cam",
                    choices=list(iap_mod.LOCALISE_SCORES),
                    help="window score. 'cam' is the RELEASED code (Grad-CAM "
@@ -214,13 +225,22 @@ def check_args(a, p):
             f"three of its four parts describe a different signal. Set "
             f"--patch_size {side}, or --patch_scale "
             f"{a.patch_size / a.img_h:g}.")
-    if a.slide_checkpoint:
+    # CONDITIONAL ON THE CAM, and the first version of this was not — it
+    # refused --slide_checkpoint outright, which blocked the one combination
+    # that actually works at native resolution. The conflict is Grad-CAM's
+    # alone: it reaches the features with torch.autograd.grad, which the
+    # reentrant checkpoint in SlidingWindowSegModel does not support. Under
+    # --iap_locate center no CAM is built at all, so nothing calls
+    # autograd.grad and the checkpoint is free to do its job.
+    if a.slide_checkpoint and a.iap_locate != "center":
         p.error(
-            "--slide_checkpoint cannot be combined with IAP. Localisation "
-            "needs Grad-CAM, which reaches the features with "
-            "torch.autograd.grad, and the reentrant checkpoint in "
-            "SlidingWindowSegModel does not support that (see its docstring). "
-            "Use --inference whole, or slide without checkpointing.")
+            f"--slide_checkpoint cannot be combined with --iap_locate "
+            f"{a.iap_locate!r}: localisation needs Grad-CAM, which reaches the "
+            f"features with torch.autograd.grad, and the reentrant checkpoint "
+            f"in SlidingWindowSegModel does not support that (see its "
+            f"docstring, and the 2026-09-21 experiment_log entry). Either "
+            f"--iap_locate center, which builds no CAM and runs under slide "
+            f"with checkpointing, or --inference whole, which keeps the CAM.")
     if a.cam_objective == "attack" and a.iap_locate != "center":
         if a.iap_untar_loss in ("ce", "cospgd"):
             a.cam_objective = a.iap_untar_loss
@@ -246,7 +266,19 @@ def check_args(a, p):
     if a.iap_stop == "target" and a.iap_tar_loss == "none":
         p.error("--iap_stop target needs a targeted run; pass "
                 "--iap_stop flip (or drop) with --iap_tar_loss none.")
-    if a.iap_reg_reduce == "sum" and a.patch_size != want:
+    if a.iap_reg_grad == "released" and a.iap_w3 != iap_mod.IAP_W3:
+        p.error(
+            f"--iap_reg_grad released with --iap_w3 {a.iap_w3:g}: under the "
+            f"released code the regulariser's gradient cancels exactly (D9), "
+            f"so w3 cannot change the optimisation and a swept value would "
+            f"produce identical runs under different directory names. Leave "
+            f"w3 at {iap_mod.IAP_W3:g}, or use --iap_reg_grad live to sweep "
+            f"it.")
+    # Only under 'live'. Under 'released' the regulariser has no gradient at
+    # all, so advice about its scale against the adversarial terms would be
+    # advice about a term that is not in the optimisation.
+    if (a.iap_reg_reduce == "sum" and a.patch_size != want
+            and a.iap_reg_grad == "live"):
         print(f"\n  NOTE (D3): --iap_reg_reduce sum at {a.patch_size}px sums "
               f"{(a.patch_size / want) ** 2:.1f}x more elements than the "
               f"{want}px patch\n        the published w3="
@@ -263,6 +295,7 @@ def main():
     arm = "_".join(x for x in
                    ["" if a.iap_locate == "cam" else a.iap_locate,
                     "" if a.iap_reg_reduce == "sum" else a.iap_reg_reduce,
+                    "" if a.iap_reg_grad == "live" else "reggrad-released",
                     "" if a.iap_tar_loss != "none" else "untargeted",
                     "" if a.iap_clamp else "noclamp"] if x)
     tag = "_".join(x for x in [a.arch, "iap", a.iap_untar_loss,
@@ -281,6 +314,32 @@ def _run(a, out_dir: Path):
     seed_everything(a.seed)
     device = get_device()
     model, n_ch, n_act, spec = setup_model(a)
+
+    # CHECKED HERE, NOT IN check_args, because --inference auto only becomes
+    # slide once the checkpoint's test_cfg has been read, which needs the model
+    # built. Grad-CAM cannot run on a tiled model at all: SegmentationCAM hooks
+    # the backbone, the hook fires ONCE PER WINDOW, and self._feats ends up
+    # holding the last window's feature map while the gradient and the upsample
+    # target are frame-shaped. Measured on a stub slide model: AttributeError
+    # on the dotted path, or a tensor-size RuntimeError once past it. The CAM
+    # refuses this itself now; this check exists to name the two flags the user
+    # typed rather than to let them read it off a constructor.
+    from patchreach.models.wrapper import SlidingWindowSegModel
+    if isinstance(model, SlidingWindowSegModel) and a.iap_locate != "center":
+        raise SystemExit(
+            f"--inference {a.inference} resolved to SLIDE for {a.arch}, and "
+            f"--iap_locate {a.iap_locate!r} needs Grad-CAM, which cannot run "
+            f"on a tiled model (one feature map per window, no frame-shaped "
+            f"map).\n"
+            f"  Either --iap_locate center  — IAP's loss and update rule at "
+            f"centre placement, which is what every csf arm here is placed at "
+            f"anyway, and runs under slide (add --slide_checkpoint);\n"
+            f"  or     --inference whole    — keeps IAP's localisation.\n"
+            f"  Note that for SegFormer/Swin (crop 1024) slide and whole are "
+            f"the SAME computation at 1024x1024 and below — one window clamped "
+            f"to the frame — so the choice only bites on the full-width "
+            f"1024x2048 frame.")
+
     mean_t, std_t = norm_tensors(device)
 
     ds = make_dataset(a, "val")
@@ -342,7 +401,8 @@ def _run(a, out_dir: Path):
             target_class=a.target_class,
             tar_loss=a.iap_tar_loss, untar_loss=a.iap_untar_loss,
             w1=a.iap_w1, w2=a.iap_w2, w3=a.iap_w3,
-            reg_reduce=a.iap_reg_reduce, locate=a.iap_locate,
+            reg_reduce=a.iap_reg_reduce, reg_grad=a.iap_reg_grad,
+            locate=a.iap_locate,
             lrs=lrs, steps=a.iap_steps,
             stop=a.iap_stop, stop_thresh=a.iap_stop_thresh,
             margin_kappa=a.margin_kappa,

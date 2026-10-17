@@ -43,6 +43,15 @@ for W3 in 0.3 1.0 3.0 9.0 30.0; do
 done
 python scripts/iap_attack.py $BASE $GEOM $POP --iap_reg_reduce sum84 --tag sum84
 
+# ── does the regulariser do anything at all? ─────────────────────────────────
+# D9: the released code builds its reference as temp = delta.clone(), which is
+# differentiable, so the regulariser's two gradient paths cancel exactly and
+# the term optimises nothing. This arm reproduces that. If it matches the
+# w3=3 'released' run above, the regulariser is inert at this operating point
+# and the invisibility comes from the 1/sens update rule alone.
+python scripts/iap_attack.py $BASE $GEOM $POP --iap_reg_grad released \
+    --tag reggrad_released
+
 # ── the two localisation scores, and the centred control ─────────────────────
 # D1: the paper's J/Sens and the released code's J are different procedures.
 # --iap_locate center isolates what localisation contributes at all.
