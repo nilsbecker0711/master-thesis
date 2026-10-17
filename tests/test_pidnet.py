@@ -120,6 +120,61 @@ def test_bottleneck_expansion_is_two():
     assert Bottleneck.expansion == 2
 
 
+def test_mmengine_era_checkpoint_unpickles_under_the_stub(tmp_path):
+    r"""
+    The PIDNet zoo checkpoints were written by mmseg 1.x, so their `meta`
+    pickles mmengine objects (ConfigDict, HistoryBuffer). torch.load unpickles
+    the WHOLE file before mmcv looks at the weights, so in this mmseg 0.x env
+    the load died with `ModuleNotFoundError: No module named 'mmengine'` --
+    after printing "load checkpoint from local path", which made it look like
+    a corrupt download rather than a version artifact. Cost a cluster job.
+
+    Builds a checkpoint carrying exactly that kind of object, so the test
+    needs no 170 MB download: the stub is used to MINT the pickle, then the
+    real assertion is that a plain load fails and a stubbed one does not.
+    """
+    torch = pytest.importorskip("torch")
+    from patchreach.models.registry import _mmengine_stub
+
+    with _mmengine_stub():
+        import mmengine.logging.history_buffer as hb
+        obj = hb.HistoryBuffer()
+        obj["count"] = 7
+        payload = {"state_dict": {"w": torch.ones(2, 2)},
+                   "meta": {"mmengine_version": "0.10.3",
+                            "message_hub": obj,
+                            "dataset_meta": {"classes": ("road", "car"),
+                                             "palette": [[1, 2, 3], [4, 5, 6]]}}}
+        torch.save(payload, tmp_path / "ck.pth")
+
+    # Exactly the cluster's failure.
+    with pytest.raises(ModuleNotFoundError) as ei:
+        torch.load(tmp_path / "ck.pth", map_location="cpu")
+    assert ei.value.name.split(".")[0] == "mmengine"
+
+    with _mmengine_stub():
+        ck = torch.load(tmp_path / "ck.pth", map_location="cpu")
+    assert torch.equal(ck["state_dict"]["w"], torch.ones(2, 2))
+    assert ck["meta"]["dataset_meta"]["classes"] == ("road", "car")
+
+    # Scoped: no stub module and no finder may outlive the context, or a real
+    # mmengine installed beside us would be permanently shadowed.
+    assert not [m for m in sys.modules if m.startswith("mmengine")]
+
+
+def test_only_mmengine_triggers_the_retry():
+    """
+    A missing mmseg_custom or ops_dcnv3 is a real install problem and must
+    keep propagating -- the stub must not become a catch-all for ImportError.
+    """
+    from patchreach.models.registry import _is_mmengine_missing
+    assert _is_mmengine_missing(ModuleNotFoundError(name="mmengine"))
+    assert _is_mmengine_missing(
+        ModuleNotFoundError(name="mmengine.logging.history_buffer"))
+    for other in ("mmseg_custom", "ops_dcnv3", "mmengine_extra", "", None):
+        assert not _is_mmengine_missing(ModuleNotFoundError(name=other))
+
+
 @pytest.mark.parametrize("arch", [v[0] for v in VARIANTS])
 def test_builds_and_emits_19_channels_at_input_resolution(arch):
     """
