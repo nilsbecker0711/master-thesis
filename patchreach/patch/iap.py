@@ -147,6 +147,51 @@ D9  IN THE RELEASED CODE THE REGULARISER HAS NO GRADIENT AT ALL, and this is
     gradient. So the two can be measured against each other instead of
     argued about, and "the regulariser contributes nothing" becomes a row.
 
+D10 UNDER SLIDE INFERENCE THE LOCALISATION MAP IS WHOLE-FRAME WHILE THE ATTACK
+    IS TILED, and that pair must be stated wherever such a number is quoted.
+
+    A tiled model has no frame-shaped feature map to weight. mmseg's slide
+    inference calls the segmentor once per window, so a forward hook on the
+    backbone fires n_windows times; SegmentationCAM._hook assigns rather than
+    appends, so only the last window's activations survive, and the rest of the
+    CAM then treats one tile as the frame. It does not raise — a 4-D backbone
+    yields a tile's CAM stretched over the whole frame, and a token backbone
+    has the window's token count mis-factorised against the frame's dimensions
+    into a transposed map. Measured; see tests/verify_cam_rejects_tiled.py.
+    SegmentationCAM therefore REFUSES a SlidingWindowSegModel outright.
+
+    The way out is that the CAM is a PRE-OPTIMISATION artefact: it runs once,
+    before the loop, purely to choose the window. Nothing requires it to share
+    the attack's inference mode. So under `cam_untiled` the map is computed
+    from one whole-frame forward on the un-tiled model (the WrappedSegModel the
+    slide wrapper holds), while every attack step runs tiled, with
+    --slide_checkpoint, as the rest of this thesis's full-resolution corpus
+    does.
+
+    ARGUE IT BOTH WAYS, because it genuinely cuts both ways. In favour: the
+    whole-frame map is the better localisation signal — it is not truncated at
+    tile boundaries, and a tiled map would be an artefact of the tiling grid
+    rather than of the model's sensitivity. Against: the map and the attack no
+    longer see the same model behaviour, so "IAP localised this patch" and "the
+    attack achieved this drop" are statements about two different forward
+    procedures. The record carries iap_cam_untiled and iap_cam_inference so no
+    row can hide which pair it came from.
+
+    WHAT IT COSTS, and the reason it is not the default: one un-tiled forward
+    AND backward at the full input size, per image. That is precisely what the
+    2026-09-21 log entry calls memory-bound at native resolution — slide +
+    checkpointing makes the attack LOOP cheap, not this pass. prepare() resets
+    the CUDA peak counter around it, reports the figure, and converts an OOM
+    into a message naming --iap_locate center as the fallback.
+
+    AND THE TRAP INSIDE IT: the CAM's own logits must be DISCARDED. Everywhere
+    else prepare() reuses them to save a forward, which is free when the CAM
+    and the attack share a model. Here they do not, so the clean baseline is
+    taken from the attack's model in a separate pass. Reusing them would
+    measure clean mIoU under whole-frame inference and the attacked frame under
+    slide, making every drop in the run the difference of two inference modes —
+    off by a point or two, i.e. invisible.
+
 WHAT THIS MODULE IS NOT
 -----------------------
 It is not a PatchConfig mode. IAP's parameterisation IS this repository's
@@ -240,6 +285,23 @@ def window_std(x: torch.Tensor, dh: int, dw: int) -> torch.Tensor:
         # std of one sample is undefined; the reference never asks for it.
         raise ValueError("window must contain at least two pixels")
     return sl.std(dim=-1, unbiased=True).mean(dim=1)
+
+
+def _cuda_peak(device) -> Optional[int]:
+    """
+    Peak CUDA allocation since the counter was last reset, or None on CPU.
+
+    Used to REPORT what the whole-frame CAM pass of D10 costs, because the
+    2026-09-21 experiment_log entry calls whole-frame inference at native
+    resolution "memory-bound (untested)" and D10 is the thing that tests it.
+    A number in the log beats a retrospective guess at why a job died.
+    """
+    if device.type != "cuda":
+        return None
+    try:
+        return int(torch.cuda.max_memory_allocated(device))
+    except Exception:                                      # pragma: no cover
+        return None
 
 
 def _anchor(std: torch.Tensor, H: int, W: int) -> torch.Tensor:
@@ -680,7 +742,8 @@ def invisibility(clean01: torch.Tensor, adv01: torch.Tensor,
 # ═════════════════════════════════════════════════════════════════════════════
 
 def prepare(model, img, patch, *, mean_t, std_t, label, cam,
-            score: str = "cam", margin: int = 0, log=print) -> dict:
+            score: str = "cam", margin: int = 0, cam_untiled: bool = False,
+            log=print) -> dict:
     r"""
     Everything IAP does BEFORE its first optimisation step, in the one order
     that works:
@@ -742,10 +805,50 @@ def prepare(model, img, patch, *, mean_t, std_t, label, cam,
                 f"segmentation_cam.build(model, ...), or pass score='center' "
                 f"for the localisation ablation. Centring silently here would "
                 f"report an IAP-localised run that was never localised.")
-        # The CAM's forward pass returns the clean logits too, so the clean
-        # pass costs ONE backward rather than an extra forward.
-        cam_map, clean_logits = cam(img, label)
-        clean_logits = upsample_to(clean_logits, label.shape[-2:])
+        if cam_untiled:
+            # D10. The CAM is running on a DIFFERENT model from the attack —
+            # the un-tiled whole-frame one — so its logits must be THROWN AWAY
+            # and the clean baseline taken from the attack's own model.
+            #
+            # THIS IS THE WHOLE TRAP IN D10. Everywhere else prepare() reuses
+            # the CAM's logits to save a forward pass, which is free when the
+            # two are the same model. Here they are not: reusing them would
+            # measure clean_all / clean_remote under WHOLE-frame inference and
+            # the attacked frame under SLIDE, so every drop in the run would be
+            # the difference of two different inference modes. That is a
+            # plausible number for a measurement nobody made, and it would be
+            # invisible — a slide run's clean mIoU and a whole run's differ by
+            # a point or two, not by an obvious factor.
+            if img.device.type == "cuda":
+                torch.cuda.reset_peak_memory_stats(img.device)
+            try:
+                cam_map, _ = cam(img, label)
+            except RuntimeError as e:
+                if "out of memory" not in str(e).lower():
+                    raise
+                raise RuntimeError(
+                    "the whole-frame Grad-CAM pass ran out of memory (D10). "
+                    "That pass is one un-tiled forward AND backward at the "
+                    "full input size, which the 2026-09-21 log entry flags as "
+                    "memory-bound at native resolution — it is the attack "
+                    "loop that slide + --slide_checkpoint makes cheap, not "
+                    "this. Either drop to --iap_locate center, which builds "
+                    "no CAM at all and keeps the slide attack, or run the "
+                    "whole arm at a resolution where the frame fits "
+                    "(for SegFormer/Swin, slide and whole are the same "
+                    "computation at 1024x1024 and below anyway)."
+                ) from e
+            peak = _cuda_peak(img.device)
+            with torch.no_grad():
+                clean_logits = upsample_to(model(img), label.shape[-2:])
+            if peak is not None:
+                log(f"[iap  ] cam pass  : whole-frame on the un-tiled model, "
+                    f"peak {peak / 2 ** 30:.2f} GiB (D10)")
+        else:
+            # The CAM's forward pass returns the clean logits too, so the clean
+            # pass costs ONE backward rather than an extra forward.
+            cam_map, clean_logits = cam(img, label)
+            clean_logits = upsample_to(clean_logits, label.shape[-2:])
     top, left = localise(None if cam_map is None else cam_map[0, 0],
                          sens_full[0], p, score=score, margin=margin)
 
@@ -893,7 +996,7 @@ def attack_image(model, img, label, patch, *, mean_t, std_t, cam,
                  untar_loss: str = "ce",
                  w1: float = IAP_W1, w2: float = IAP_W2, w3: float = IAP_W3,
                  reg_reduce: str = "sum", reg_grad: str = "live",
-                 locate: str = "cam",
+                 locate: str = "cam", cam_untiled: bool = False,
                  lrs: Sequence[float] = IAP_LRS,
                  steps: int = IAP_STEPS,
                  stop: str = "target", stop_thresh: float = 0.9,
@@ -935,7 +1038,8 @@ def attack_image(model, img, label, patch, *, mean_t, std_t, cam,
 
     prepared = prepare(model, img, patch, mean_t=mean_t, std_t=std_t,
                        label=label, cam=cam, score=locate,
-                       margin=placement_margin, log=log)
+                       margin=placement_margin, cam_untiled=cam_untiled,
+                       log=log)
     clean_logits = prepared["clean_logits"]
     _, fp0 = patch.apply(img)
     clean_all = single_image_miou(clean_logits, label, num_classes,
@@ -1063,6 +1167,11 @@ def attack_image(model, img, label, patch, *, mean_t, std_t, cam,
         **rates,
         # ── IAP's own ────────────────────────────────────────────────────────
         "iap_locate": locate,
+        # THE MODE PAIR, so a row always says which combination produced it.
+        # Under D10 the localisation map and the attack see different model
+        # behaviour, and a drop quoted without this is not interpretable.
+        "iap_cam_untiled": bool(cam_untiled),
+        "iap_cam_inference": ("whole" if cam_untiled else "same_as_attack"),
         "iap_lr": win["lr"],
         "iap_lr_ladder": [float(x) for x in lrs],
         "iap_rung_index": i_win,

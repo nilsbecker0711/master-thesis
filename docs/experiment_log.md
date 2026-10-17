@@ -550,3 +550,65 @@ un-checkpointed slide runs are affected. Check `config.json` for
 Nothing else changes: `--inference whole` was always correct, and for SegFormer/Swin
 slide and whole are the same computation at 1024x1024 and below, so only full-width
 native-resolution gradcam runs could be affected.
+
+## 2026-10-17: D10 — Grad-CAM localisation under slide inference
+
+**Why it was blocked.** A tiled model has no frame-shaped feature map to weight.
+`SlidingWindowSegModel` calls the segmentor once per window, so a forward hook on the
+backbone fires `n_windows` times and `SegmentationCAM._hook` assigns rather than
+appends — only the last window's activations survive, and the rest of the CAM treats
+one tile as the frame. It does not raise; see the correction entry above for the
+measured behaviour. `SegmentationCAM` now refuses a `SlidingWindowSegModel` outright.
+
+**The way out.** The CAM is a **pre-optimisation artefact**: `iap.prepare()` calls it
+exactly once, before the loop, purely to choose the `p x p` window. Nothing requires it
+to share the attack's inference mode. So the map is now computed from one whole-frame
+forward on the **un-tiled** model (the `WrappedSegModel` the slide wrapper holds at
+`.model`), while every attack step runs tiled, with `--slide_checkpoint`, exactly as the
+rest of the full-resolution corpus does. `scripts/iap_attack.py` resolves this after
+`setup_model` — `--inference auto` only becomes slide once the checkpoint's `test_cfg`
+has been read — and asserts the un-tiled model rather than reaching blindly through a
+wrapper.
+
+This means `--iap_locate cam` now works at native 1024x2048 against the published slide
+protocol, which is what makes the IAP arm comparable to the existing csf corpus on
+**resolution, patch size, inference mode and localisation** at once. The
+`--slide_checkpoint` refusal is gone entirely: it has been wrong twice (first blanket,
+then conditional on `--iap_locate`) and is now unnecessary, because nothing calls
+`autograd.grad` through a checkpointed window any more. The combination that genuinely
+cannot work is no longer expressible.
+
+**State it both ways, because it cuts both ways.** In favour: the whole-frame map is the
+better localisation signal — it is not truncated at tile boundaries, and a tiled map
+would be an artefact of the tiling grid rather than of the model's sensitivity. Against:
+the map and the attack no longer see the same model behaviour, so "IAP localised this
+patch" and "the attack achieved this drop" are statements about two different forward
+procedures. The record carries `iap_cam_untiled` and `iap_cam_inference`
+(`whole` / `same_as_attack`), and `config.json` carries the former, so no row or
+directory can hide which pair produced it. **Quote the pair, not just the drop.**
+
+**The trap inside it, and the test that holds it.** The CAM's own logits must be
+**discarded**. Everywhere else `prepare()` reuses them to save a forward, which is free
+when the CAM and the attack share a model. Here they do not: reusing them would measure
+`clean_all` / `clean_remote` under whole-frame inference and the attacked frame under
+slide, making every drop in the run the difference of two inference modes. A slide
+clean mIoU and a whole clean mIoU differ by a point or two, so the error would be
+invisible rather than obvious. `prepare()` therefore runs a separate clean forward on
+the attack's model, and
+`test_cam_untiled_takes_the_clean_baseline_from_the_attack_model` pins it by giving the
+two models deliberately different constant outputs and asserting which one answered.
+
+**Cost, and what is NOT yet measured.** One un-tiled forward *and* backward at the full
+input size, per image — precisely what the 2026-09-21 entry calls memory-bound at
+native resolution. Slide plus checkpointing makes the attack *loop* cheap, not this
+pass. `prepare()` resets the CUDA peak counter around the CAM call, logs the figure as
+`[iap  ] cam pass  : whole-frame ... peak N.NN GiB (D10)`, and converts an OOM into a
+message naming `--iap_locate center` as the fallback. **No GPU number exists yet** — all
+of this was developed and tested on CPU with stub segmentors, so the first native run is
+also the first measurement of whether the pass fits. Read that log line before trusting
+a sweep, and if it does not fit for the larger backbones, record that here and keep
+`--iap_locate center` for them rather than assuming b0 generalises.
+
+Tests: 45 in `tests/test_iap.py`, 498 in the suite
+(`test_core.py::test_tv_zero_on_constant` was already failing and is unrelated), and
+both standalone verifiers still pass.
