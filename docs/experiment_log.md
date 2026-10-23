@@ -787,3 +787,46 @@ for.
   about IAP worth stating, and it is inseparable from D3: the regulariser's scale grows
   with patch area, so the published `lr * w3` lands in a different regime at 256px than
   at 84px.
+
+### Correction, same day: the instability is NOT patch-size dependent, and D3 does not cause it
+
+The paragraph above claimed the published `lr * w3` "lands in a different regime at 256px
+than at 84px", on the grounds that the regulariser is a sum whose scale grows with patch
+area. **That reasoning is wrong.** `R = SUM_i sens_i |delta_i - base_i|`, so
+`dR/d(delta_j) = sens_j * sign(delta_j - base_j)` — the gradient with respect to one
+element does not depend on how many elements the sum has. The per-pixel kick is
+`lr * w3 * sign(...)` at every patch size.
+
+Measured, reg-only, same `lr 0.1` and `w3 3` at four sizes:
+
+| P | elements | &#124;d&#124; @ step 1 / 2 / 3 / 10 | swing (last 50) |
+|---|---|---|---|
+| 32 | 3,072 | 0.1146 / 0.0199 / 0.0648 / 0.0915 | 0.0307 |
+| 64 | 12,288 | 0.1155 / 0.0202 / 0.0661 / 0.0932 | 0.0293 |
+| 128 | 49,152 | 0.1152 / 0.0201 / 0.0648 / 0.0937 | 0.0294 |
+| 256 | 196,608 | 0.1153 / 0.0201 / 0.0650 / 0.0931 | 0.0291 |
+
+Identical to the resolution of the different random draws. And `sum84` at P=84 is a
+no-op by construction (`(84/84)**2 = 1`, effective `w3` still 3.0, still a limit cycle);
+it settles at P=256 only because it scales the term down by 0.1076, i.e. it is a `w3`
+change wearing a patch-size costume.
+
+**What this does to the finding.** It makes it stronger and simpler. The instability is
+not an artefact of running IAP at a patch size it was not tuned for — it is a property of
+the paper's loss at the paper's own weights and the paper's own learning-rate ladder, at
+**any** patch size including 84x84. Every rung of that ladder gives `lr * w3` between 0.15
+and 0.60 against a stability boundary near 0.03.
+
+**And it connects to D9 rather than to D3.** The released code's `temp = delta.clone()`
+zeroes the regulariser's gradient entirely, so the released implementation *cannot*
+oscillate — and cannot regularise either. The two findings are consistent and explain
+each other: the instability is exactly what a live version of that term produces at those
+weights, and the released code has it inert. The paper's stated method and its released
+method are different methods, and only one of them runs.
+
+**D3 stands, but narrowed.** The regulariser's VALUE does grow with patch area, 9.3x from
+84x84 to 256x256, so the logged `reg` number is not comparable across patch sizes and
+dwarfs the mean-reduced adversarial terms in the printed loss. That is a reporting and
+loss-balance observation. It is not the dynamics, and the phrase "not the same operating
+point" in D3 should be read as being about the term's weight in the total, not about
+stability — for which the operating point is `lr * w3`, full stop.
