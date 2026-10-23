@@ -703,3 +703,87 @@ is read outside this repository. `ssim_psnr` now returns `None` there; SSIM alre
 reports 1.0, which carries the same fact without leaving the grammar, and
 `_invisibility_stats` skips None. That failure mode is not contrived — it is exactly what
 a too-large `w3` produces.
+
+## 2026-10-23: IAP's training dynamics are a 40-step limit cycle, and the early stop hides it
+
+Measured on the `log_every=10` run (segformer_b0, whole inference, image 464, 1024x2048,
+`lr 0.1`, `w3 3`, `--iap_stop target 0.9`, stopped at step 592 reporting **+48.99**).
+This supersedes the impression that the run is merely "noisy": it is a **deterministic,
+periodic collapse-and-rebuild**, and the number a run reports depends on where in the
+cycle it stops.
+
+### The signature
+
+| | reg | mean &#124;delta-base&#124; |
+|---|---|---|
+| logged steps with drop > 35 (n=13) | 2.7e5 | 0.0407 |
+| collapsed steps (n=10) | 7.1e5 | 0.0173 |
+
+`corr(reg, |d|) = -0.758`, `corr(reg, drop) = -0.493`, `corr(reg, target) = -0.522`.
+So a collapse is **2.6x the regulariser at 0.42x the drift** — the perturbation has not
+merely shrunk, it has moved into the high-`sens` (flat) pixels where it buys nothing and
+costs everything. The patch's own targeted loss returns to **~19**, which is its value at
+step 1: the attack is being undone completely and rebuilt from scratch.
+
+### The period, and why it is exactly what the mechanism predicts
+
+Collapsed logged steps, once the attack has exceeded +20: 260, 300, 310, 350, 390, 430,
+470, 510, 520, 560 — spacings `[40, 10, 40, 40, 40, 40, 40, 10, 40]`, i.e. a **40-step
+period** with the two 10s being the two-row-wide floors of the same trough. The
+`|d|` value at successive collapses walks 0.0051, 0.0099, 0.0149, 0.0198, 0.0245, 0.0292
+and then wraps to 0.0054 — a slow beat on top of the 40-step cycle, so it is
+quasi-periodic rather than a clean period-40 orbit.
+
+The width of the collapse matches the mechanism arithmetically. From the 2026-10-17
+entry, the regulariser's contribution to the multiplicative update is sens-independent
+and equal to `lr * w3 * sign(delta - base)` per step, so with consistent sign the
+perturbation is multiplied by `(1 - 0.3) = 0.7` each step:
+
+```
+0.7 ** 10 = 0.028      ten steps remove 97% of the accumulated perturbation
+```
+
+Ten steps is exactly the observed collapse width, and the ~30 remaining steps of each
+cycle are the attack rebuilding against a 30%-per-step headwind. Duty cycle predicted
+~25% collapsed; measured 10 of 30 logged steps after step 300 are below +10, i.e. 33%.
+
+### Why this makes the reported number a biased estimator
+
+Over the logged steps from 300 onward:
+
+```
+min +4.27   max +46.51   range 42.24 mIoU points   sd 16.84   median +33.62
+```
+
+A run with `--iap_stop none` would report **wherever the sawtooth happened to be at step
+1000** — a 42-point coin flip, and below +10 a third of the time. That is exactly what
+the slide run did: final +5.13 against a best of +12.17.
+
+With `--iap_stop target 0.9` the run instead stops **the first time the cycle crosses the
+threshold**, so it reports a peak *by construction* and can never report a trough. The
+early stop is therefore doing load-bearing work, not saving compute, and `+48.99` is not
+"the attack's strength" — it is "the first peak that crossed 0.9". `best_drop_remote`
+carries the same upward bias, being a max over logged samples of a cycle.
+
+**So for an oscillating run there is no unbiased summary**, and the three candidates fail
+differently: the final is cycle phase, the best is a max over samples, and the
+stop-based number is a defined-but-biased operating point. The fix is not to pick one but
+to leave the regime: **keep `lr * w3` at or below ~0.03**, where the reg-only dynamic
+settles (swing 3e-4 against 2.3e-2 at 0.3). `--iap_reg_reduce sum84` does it at an
+effective `w3 = 0.32`, which is also what D3's patch-size rescaling independently asks
+for.
+
+### What to re-run, and what to report
+
+- Re-run the arm at `lr * w3 <= 0.03` and check the log is monotone-ish rather than
+  sawtoothed before quoting anything.
+- Where an oscillating run must be quoted (e.g. to document this failure), report the
+  stop step, the threshold, AND the spread of the logged drops over the last few hundred
+  steps. A single number from a limit cycle is not a measurement.
+- The instability is a property of **IAP's own update rule at its own published
+  weights**, not of this port: `w3 = 3` is the paper's value, and `lr 0.1` is within its
+  published ladder (0.05, 0.09, 0.2 all give `lr * w3` of 0.15-0.6, i.e. every rung of
+  the released ladder is in the limit-cycle regime at this patch size). That is a result
+  about IAP worth stating, and it is inseparable from D3: the regulariser's scale grows
+  with patch area, so the published `lr * w3` lands in a different regime at 256px than
+  at 84px.

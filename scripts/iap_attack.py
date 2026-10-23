@@ -20,7 +20,7 @@ everything around it is this repository's: the segmentors, Cityscapes at
 1024x2048, a 256px patch, remote mIoU outside the footprint, the attack-rate
 metrics, and the segmentation objectives from losses/adversarial.py in place of
 IAP's classification cross-entropies. patchreach/patch/iap.py carries the
-procedure and names all eight deviations (D1-D8); read that before quoting a
+procedure and names all ten deviations (D1-D10); read that before quoting a
 number from here.
 
 ONE PATCH PER IMAGE. IAP is a per-image attack and this is its population
@@ -354,7 +354,7 @@ def _run(a, out_dir: Path):
     print(f" {a.arch} ({spec.bracket} attention) at {a.img_h}x{a.img_w}, "
           f"{a.patch_size}px patch "
           f"({100 * a.patch_size ** 2 / (a.img_h * a.img_w):.2f}% of frame)")
-    print(f" procedure: patchreach/patch/iap.py — read D1-D8 before quoting "
+    print(f" procedure: patchreach/patch/iap.py — read D1-D10 before quoting "
           f"these numbers")
     print(f"{'=' * 72}")
 
