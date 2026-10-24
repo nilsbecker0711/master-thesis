@@ -17,6 +17,12 @@ the renderer resizes it — so the full transfer matrix is evaluation-only.
 The OFF-DIAGONAL is the result: the diagonal says patches work, the
 off-diagonal says whether they TRANSFER, and those are different claims.
 
+--patch_png EVALUATES A PNG instead of the checkpoint's parameter, for
+mode='raw' only, where the PNG is exactly what render() produced. The
+checkpoint is still required and still supplies size, scale, scale_ref, shape
+and the resolved placement; only the parameter is replaced, and the deviation
+from the checkpoint's own render -- the 8-bit quantisation -- is printed.
+
 Evaluation is cheap and training is not, so evaluate every configuration on the
 same fixed images rather than training more.
 """
@@ -62,6 +68,16 @@ def main():
                         "the base falls back to flat grey and the patch is a "
                         "visible square with an invisible texture.")
 
+    p.add_argument("--patch_png", default=None,
+                   help="evaluate THE PIXELS OF THIS PNG instead of the "
+                        "checkpoint's parameter; mode='raw' only. The "
+                        "checkpoint is still required and still supplies "
+                        "size, scale, scale_ref, shape and the resolved "
+                        "placement -- only the parameter is replaced. The "
+                        "numbers then carry 8-bit quantisation, and the "
+                        "deviation from the checkpoint's own render is "
+                        "printed so it can be read rather than assumed.")
+
     p.add_argument("--out_root", default="results/eval")
     p.add_argument("--tag", default="")
     a = p.parse_args()
@@ -102,17 +118,32 @@ def main():
             "square with an invisible texture, and drop_remote describes that\n"
             "square rather than the residual under test.\n")
 
+    # BEFORE describe(), so every line it logs describes the patch actually
+    # evaluated. Patch.param_from_png refuses any mode but 'raw', where the
+    # PNG is the whole patch.
+    png_delta = patch.param_from_png(a.patch_png) if a.patch_png else None
+
     loss_fn = a.loss_fn or "cospgd"
     tgt = a.target_class
 
     print(f"\n[patch] loaded {a.checkpoint}")
+    if png_delta is not None:
+        # PRINTED rather than asserted against a bound: it is the 8-bit
+        # quantisation of the render, and it belongs in the log next to the
+        # drop it produced.
+        print(f"[patch] parameter REPLACED by the pixels of {a.patch_png}")
+        print(f"[patch] max |png - checkpoint render| {png_delta:.6f}  "
+              f"(one 8-bit step is 1/255 = {1 / 255:.6f})")
     patch.describe(a.img_h, a.img_w)
 
     ds = make_dataset(a, "val")
     idxs = image_indices(a.images, len(ds))
 
+    # 'png' in the tag so a PNG-sourced run never lands in the same
+    # directory as the checkpoint-sourced run it is compared against.
     tag = "_".join(x for x in [Path(a.checkpoint).parent.name,
-                               f"eval{a.img_h}x{a.img_w}", a.tag] if x)
+                               f"eval{a.img_h}x{a.img_w}",
+                               "png" if a.patch_png else "", a.tag] if x)
     out_dir = Path(increment_path(Path(a.out_root) / tag))
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -193,7 +224,12 @@ def main():
     print(f"{'='*66}")
 
     with open(out_dir / "results.json", "w") as f:
-        json.dump({"checkpoint": a.checkpoint, "config": vars(a),
+        json.dump({"checkpoint": a.checkpoint,
+                   # which file the PARAMETER came from.
+                   # patch_config below is the checkpoint's either
+                   # way, because that is where it came from.
+                   "param_source": a.patch_png or a.checkpoint,
+                   "config": vars(a),
                    "patch_config": pcfg, "aggregate": agg,
                    "drop_remote_mean": float(drops.mean()),
                    "drop_remote_std": float(drops.std()),

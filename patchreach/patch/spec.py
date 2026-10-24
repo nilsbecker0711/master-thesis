@@ -1156,6 +1156,58 @@ class Patch:
         obj.placement = ck.get("placement")
         return obj
 
+    def param_from_png(self, path) -> float:
+        """
+        Re-parameterise this patch from the PIXELS OF A PNG — the rendered
+        patch read back off disk, as `best_patch.png` stores it. Returns the
+        max abs deviation from the render it replaces, which is the 8-bit
+        quantisation error and nothing else when the two agree.
+
+        mode='raw' ONLY, and that is not a tidiness restriction. There the PNG
+        IS render()'s output, so a direct pixel parameter reproduces the same
+        patch to within that quantisation. Under 'csf' the PNG is base+residual
+        FUSED for one image and the base is not in the checkpoint to subtract
+        back out; under 'universal_csf' it is the residual drawn on mid grey,
+        which apply() never uses. Pasting either as a raw patch would measure
+        an opaque visible square instead of the patch under test — the same
+        failure evaluate.py's --from_image check refuses.
+
+        The parameterisation is forced to 'direct' because render() otherwise
+        puts the parameter through a sigmoid, and sigmoid(pixels) is not
+        pixels: a patch read back under 'sigmoid' would land inside
+        [0.5, 0.73] with all of its contrast compressed. Nothing else about
+        the patch moves — size, scale, scale_ref, shape and the RESOLVED
+        placement all stay as the checkpoint stored them, which is why this
+        rides on top of a loaded checkpoint rather than replacing one.
+        """
+        from PIL import Image
+        import numpy as np
+
+        if self.cfg.mode != "raw":
+            raise ValueError(
+                f"param_from_png needs mode='raw', got {self.cfg.mode!r}. "
+                "A PNG only round-trips when it is the whole patch; for "
+                "'csf'/'universal_csf' it is not, and for 'lap'/'gan'/"
+                "'raw_ganinit' this path is simply not covered yet.")
+
+        arr = np.asarray(Image.open(path).convert("RGB"), dtype=np.float32)
+        px = torch.from_numpy(arr / 255.0).permute(2, 0, 1).to(self.device)
+        if px.shape[-2:] != (self.cfg.size, self.cfg.size):
+            raise ValueError(
+                f"{Path(path).name} is {tuple(px.shape[-2:])}, but the "
+                f"checkpoint's parameter is {self.cfg.size}x{self.cfg.size}. "
+                "optimise.py writes the PNG at the parameter resolution, so a "
+                "mismatch means this PNG belongs to a different run — "
+                "resizing it here would silently change the patch.")
+
+        with torch.no_grad():
+            before = self.render().detach()
+        self.cfg.pixel_param = "direct"
+        self.param = px.clone().requires_grad_(True)
+        with torch.no_grad():
+            delta = float((self.render().detach() - before).abs().max())
+        return delta
+
     def describe(self, H: int, W: int, log=print):
         c = self.cfg
         p = self.side(H, W)
