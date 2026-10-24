@@ -1208,6 +1208,51 @@ class Patch:
             delta = float((self.render().detach() - before).abs().max())
         return delta
 
+    @classmethod
+    def from_png(cls, path, device, mean_t, std_t, img_h: int, scale=None):
+        """
+        Build a patch from A PNG ALONE, with no checkpoint. For the one case
+        that genuinely needs nothing else: a SQUARE patch in pixel space,
+        pasted at the centre. There the PNG carries the parameter and the only
+        other facts the paste needs are how big in the frame and where, and
+        both have answers that do not come from a file — its own pixel size,
+        and the middle.
+
+        `scale` defaults to S/img_h, which pastes the patch at EXACTLY its own
+        pixel size, so nothing is resampled at this img_h. It is an argument
+        rather than a constant because the paste side is int(H*scale) at
+        whatever resolution the caller evaluates: holding pixel size and
+        holding frame fraction are different claims across resolutions, and
+        the off-diagonal of the transfer matrix is where they come apart.
+
+        NON-SQUARE IS REFUSED, and that is the one real trap in this path.
+        A cutout patch's silhouette lives in shape_mask, derived from the
+        reference image, and `best_patch.png` is the RGB render with no alpha.
+        Accepting one here would paste the whole bounding box opaque — more
+        adversarial surface than was trained, a larger footprint, and a
+        different remote-mIoU denominator, all without a word in the log.
+        """
+        from PIL import Image
+        import numpy as np
+
+        arr = np.asarray(Image.open(path).convert("RGB"), dtype=np.float32)
+        px = torch.from_numpy(arr / 255.0).permute(2, 0, 1)
+        h, w = px.shape[-2:]
+        if h != w:
+            raise ValueError(
+                f"{Path(path).name} is {w}x{h}, not square. This path builds "
+                "a square patch pasted at the centre; a cutout needs its "
+                "silhouette, which an RGB render does not carry, and a "
+                "figure-style PNG (axes, two panels) is not a patch at all.")
+
+        cfg = PatchConfig(mode="raw", size=h,
+                          scale=(h / img_h) if scale is None else float(scale),
+                          scale_ref="height", pixel_param="direct",
+                          placement="center")
+        obj = cls(cfg, device, mean_t, std_t)
+        obj.param = px.to(device).clone().requires_grad_(True)
+        return obj
+
     def describe(self, H: int, W: int, log=print):
         c = self.cfg
         p = self.side(H, W)
