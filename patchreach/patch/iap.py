@@ -68,11 +68,26 @@ D2  GRAD-CAM. Classification Grad-CAM differentiates one logit; there is no
 
 D3  THE REGULARISER IS A SUM over patch elements, and the patch grew from
     84x84 to 256x256 — 9.3x more elements. At equal mean |delta - base| the
-    term is therefore 9.3x larger against adversarial losses that are per-pixel
-    MEANS and have not changed scale. w3 = 3 is consequently NOT the same
-    operating point it was in the paper. `reduce='sum'` is the released
-    arithmetic and the default; `reduce='sum84'` rescales by (84/p)**2 so that
-    w3 means at 256px what it meant at 84px. Sweep w3; do not inherit it.
+    term's VALUE is therefore 9.3x larger against adversarial losses that are
+    per-pixel MEANS and have not changed scale, so the logged `reg` number is
+    not comparable across patch sizes and dwarfs `tar` and `untar` in the
+    printed loss. `reduce='sum'` is the released arithmetic and the default;
+    `reduce='sum84'` rescales by (84/p)**2. Sweep w3; do not inherit it.
+
+    READ THIS AS LOSS BALANCE AND REPORTING, NOT AS STABILITY. An earlier
+    version of this paragraph said w3 = 3 "is not the same operating point" at
+    256px, and that was then allowed to stand as the explanation for the
+    oscillation measured on real runs. It is not the explanation:
+    dR/d(delta_j) = sens_j * sign(delta_j - base_j) has no dependence on how
+    many terms the sum has, so the per-pixel kick is lr * w3 at EVERY patch
+    size. Measured identical at p = 32, 64, 128 and 256 — see
+    tests/verify_iap_stability_size.py. sum84 settles a 256px run only because
+    it scales the term down to an effective w3 of 0.32; it is a w3 change
+    wearing a patch-size costume, and at p = 84 it is a no-op.
+
+    The stability parameter is lr * w3, and the boundary is near 0.03. What
+    that means for IAP's own published settings is in D9, because the released
+    code's regulariser has no gradient at all.
 
 D4  THE LADDER'S FAILURE BRANCH. The released code tries lr in
     (0.05, 0.09, 0.2), breaks on success, and on failure reports whatever
@@ -146,6 +161,23 @@ D9  IN THE RELEASED CODE THE REGULARISER HAS NO GRADIENT AT ALL, and this is
     term's value to the loss detached: identical value, identical (zero)
     gradient. So the two can be measured against each other instead of
     argued about, and "the regulariser contributes nothing" becomes a row.
+
+    AND THIS IS WHY THE PAPER'S VERSION IS UNSTABLE WITHOUT ANYONE NOTICING.
+    With the gradient live, the regulariser's contribution to the
+    colour-constant step is sens-INDEPENDENT (its dR/d(delta) is proportional
+    to sens and the step divides by sens), leaving a relative kick of
+    lr * w3 * sign(delta - base) per step. The boundary between settling and a
+    limit cycle sits near lr * w3 = 0.03, measured, and it does not move with
+    patch size. Every rung of IAP's published ladder is far past it at the
+    published w3 = 3: 0.05 -> 0.15, 0.09 -> 0.27, 0.2 -> 0.60.
+
+    So the paper's loss and the released loss are not two implementations of
+    one method; they are two different methods, and only one of them runs. In
+    the released code the term is inert, which is also why its weights could
+    carry an lr ladder that the term, had it been live, would have made
+    oscillate. State this as a finding about IAP, not about this port — and
+    note what it does NOT say: nothing here tests IAP's classification
+    results, which were produced by the released code with the term inert.
 
 D10 UNDER SLIDE INFERENCE THE LOCALISATION MAP IS WHOLE-FRAME WHILE THE ATTACK
     IS TILED, and that pair must be stated wherever such a number is quoted.
@@ -243,6 +275,12 @@ STOP_CRITERIA = ("none", "flip", "target", "drop")
 # the released code's exact gradient cancellation, where the term is reported
 # and optimises nothing.
 REG_GRADS = ("live", "released")
+# The targeted slot. 'ce_target' is IAP's own plain per-pixel CE and the
+# default; 'ipatch_cospgd' is targeted CosPGD, this repository's own targeted
+# objective, kept as the arm that makes the IAP row comparable to every other
+# targeted row; 'none' drops the term, which IAP never does.
+TAR_LOSSES = ("ce_target", "ipatch_cospgd", "none")
+UNTAR_LOSSES = ("ce", "cospgd", "margin", "cos_margin", "none")
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -524,20 +562,37 @@ class Objective:
     term, with its explicit minus, IS adversarial.ce_loss, and the port is a
     substitution rather than a rearrangement.
 
-    tar : 'ipatch_cospgd' or 'none'. The targeted term. This repository has no
-          plain targeted CE and one is not added here: ipatch_cospgd IS its
-          targeted objective, every targeted number in the thesis is measured
-          under it, and introducing a second targeted loss purely to match
-          IAP's would make the IAP column incomparable to every other column.
-          The deviation is the cosine weight (1 - cos to target), which
-          de-emphasises pixels already converted.
+    tar : 'ce_target' (DEFAULT), 'ipatch_cospgd', or 'none'.
+
+          'ce_target' is IAP'S OWN OBJECTIVE: a plain per-pixel CE toward the
+          target class, no weighting. IAP uses `nn.CrossEntropyLoss()` plainly
+          on both of its adversarial terms, in the paper and in the released
+          code, so this is the faithful port and it is the default. Paired with
+          untar='ce' — which already returns -CE, so IAP's explicit minus is
+          built in — the three terms here are IAP's three terms.
+
+          'ipatch_cospgd' is TARGETED COSPGD (Agnihotri et al., ICML 2024,
+          Eq. 8 — see losses/adversarial.py; the identifier is a misnomer kept
+          for provenance). It is this repository's own targeted objective, the
+          one every other targeted number in the thesis is measured under, so
+          it is the arm to use when the question is "csf versus IAP's
+          procedure under OUR objective" rather than "what does IAP do".
+
+          THE EARLIER DEFAULT WAS THE OTHER WAY ROUND and that was a mistake.
+          Reusing targeted CosPGD by default silently substituted a different
+          published objective for IAP's own, which buys comparability against
+          this repository at the cost of the thing the arm exists to measure.
+          Comparability is better bought by running BOTH and reporting the
+          pair: the difference between them is exactly what the cosine weight
+          costs, which is a row rather than a caveat. Every run records
+          iap_tar_loss, so no number on disk is ambiguous about which it used.
     untar : 'ce', 'cospgd', 'margin', 'cos_margin' or 'none'. The term away
           from the truth. 'ce' is IAP's literal -CE(pred, truth).
     'none' on either slot drops it. tar='none' makes the attack UNTARGETED,
           which IAP never is — declare it as an extension, not as IAP.
     """
 
-    def __init__(self, tar: str = "ipatch_cospgd", untar: str = "ce",
+    def __init__(self, tar: str = "ce_target", untar: str = "ce",
                  target_class: int = 8,
                  w1: float = IAP_W1, w2: float = IAP_W2, w3: float = IAP_W3,
                  reg_reduce: str = "sum", reg_grad: str = "live",
@@ -546,10 +601,10 @@ class Objective:
         if reg_grad not in REG_GRADS:
             raise ValueError(f"reg_grad must be one of {REG_GRADS}, "
                              f"got {reg_grad!r}")
-        if tar not in ("ipatch_cospgd", "none"):
-            raise ValueError(
-                f"iap_tar_loss must be 'ipatch_cospgd' or 'none', got {tar!r}")
-        if untar not in ("ce", "cospgd", "margin", "cos_margin", "none"):
+        if tar not in TAR_LOSSES:
+            raise ValueError(f"iap_tar_loss must be one of {TAR_LOSSES}, "
+                             f"got {tar!r}")
+        if untar not in UNTAR_LOSSES:
             raise ValueError(f"iap_untar_loss {untar!r} is not a loss in "
                              f"losses/adversarial.py")
         if tar == "none" and untar == "none":
@@ -685,7 +740,7 @@ def progress_rate(clean_logits, adv_logits, label, footprint,
 # ═════════════════════════════════════════════════════════════════════════════
 
 def ssim_psnr(a: torch.Tensor, b: torch.Tensor,
-              data_range: float = 1.0) -> Tuple[float, float]:
+              data_range: float = 1.0) -> Tuple[float, Optional[float]]:
     """
     (SSIM, PSNR) for one [1,3,h,w] pair in [0,1], via torchmetrics with
     data_range=1.0 — the reference's `SSIM(data_range=1.0)` and
@@ -711,7 +766,20 @@ def ssim_psnr(a: torch.Tensor, b: torch.Tensor,
     dev = a.device
     ssim = StructuralSimilarityIndexMeasure(data_range=data_range).to(dev)
     psnr = PeakSignalNoiseRatio(data_range=data_range).to(dev)
-    return float(ssim(a, b)), float(psnr(a, b))
+    s, p = float(ssim(a, b)), float(psnr(a, b))
+
+    # PSNR IS +inf ON IDENTICAL FRAMES (MSE = 0), AND THAT IS REACHABLE HERE,
+    # not a contrived edge case. The patch is initialised to the image region,
+    # the reported patch is the one with the largest drop, and a run whose
+    # regulariser dominates — which is the D3/limit-cycle failure mode — never
+    # beats its own step-1 drop. Its best patch IS the clean content.
+    #
+    # Reported as None rather than inf, because json.dump writes a bare
+    # `Infinity` token that is not valid JSON: Python reads it back, jq and
+    # most other parsers do not, and results.json is read by things outside
+    # this repository. SSIM already says 1.0, which carries the same fact
+    # without leaving the grammar, and _invisibility_stats skips None.
+    return s, (None if p == float("inf") else p)
 
 
 def invisibility(clean01: torch.Tensor, adv01: torch.Tensor,
@@ -906,6 +974,7 @@ def _rung(model, img, label, patch, prepared, objective, lr, steps, *,
         # uses, so a stateful loss cannot mean one thing in one loop and
         # another in the other.
         objective.on_step_begin(step - 1, steps)
+        will_log = (step % log_every == 0 or step == 1)
         if patch.param.grad is not None:
             patch.param.grad = None
         patched, fp = patch.apply(img)
@@ -948,16 +1017,31 @@ def _rung(model, img, label, patch, prepared, objective, lr, steps, *,
                     f"drop {best_drop:+.2f})")
             break
 
+        # THE PATCH `logits` DESCRIBE, snapshotted BEFORE the update.
+        #
+        # OFF-BY-ONE, AND IT IS NOT COSMETIC HERE. `cur` below is computed from
+        # `logits`, which came from the forward pass above — i.e. from the
+        # parameter as it stands NOW. The update then changes the parameter, so
+        # cloning it after the step credits this step's measured drop to a
+        # DIFFERENT patch. optimise.attack_image has the same pattern and gets
+        # away with it, because Adam under a cosine schedule moves the patch by
+        # ~lr per coordinate and the two are near-identical. IAP's update is
+        # multiplicative and, at lr*w3 >= 0.1, a limit cycle: measured on a
+        # real run, best_drop_remote came out +12.17 while the saved parameter
+        # measured +5.13. One clone per logged step is the whole cost.
+        cand = patch.param.detach().clone() if will_log else None
+
         total.backward()
         st = colour_constant_step_(patch.param, sens_patch, lr)
         if clamp:
             patch.project()                   # [0,1] — PGD's own projection
 
-        if step % log_every == 0 or step == 1:
+        if will_log:
             with torch.no_grad():
                 cur = single_image_miou(logits.detach(), label, num_classes,
                                         exclude=fp, classes=classes)
-                drift = float((patch.render() - base).abs().mean())
+                # the drift OF THE MEASURED PATCH, for the same reason
+                drift = float((cand - base).abs().mean())
             row = {"step": step, "miou_remote": cur, "drift_mean_abs": drift,
                    **last, **st}
             history.append(row)
@@ -969,7 +1053,7 @@ def _rung(model, img, label, patch, prepared, objective, lr, steps, *,
                     + f"  |d|={drift:.4f}  {stop}={row['rate']:.3f}")
             if clean_remote - cur > best_drop:
                 best_drop = clean_remote - cur
-                best_param = patch.param.detach().clone()
+                best_param = cand          # the patch `cur` was measured on
 
     # The rung's END state, measured once, outside the loop.
     with torch.no_grad():
@@ -992,7 +1076,7 @@ def _rung(model, img, label, patch, prepared, objective, lr, steps, *,
 
 def attack_image(model, img, label, patch, *, mean_t, std_t, cam,
                  target_class: int = 8,
-                 tar_loss: str = "ipatch_cospgd",
+                 tar_loss: str = "ce_target",
                  untar_loss: str = "ce",
                  w1: float = IAP_W1, w2: float = IAP_W2, w3: float = IAP_W3,
                  reg_reduce: str = "sum", reg_grad: str = "live",

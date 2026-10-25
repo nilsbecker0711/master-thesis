@@ -329,11 +329,28 @@ adv01 = (pz * STD + MEAN).clamp(0, 1)
 # patch. It is invisible at any real drop and dominates PSNR at 138 dB, where
 # the stub patch has barely moved and the metric is measuring float noise.
 v = iap.invisibility(prep["x01"], adv01, (top, left, P))
+
+
+def _same(x, y, tol):
+    """
+    None == None counts as agreement. PSNR is None on IDENTICAL frames, which
+    is reachable rather than contrived: the patch starts as the image region,
+    the reported patch is the one with the largest drop, and a run whose
+    regulariser dominates never beats its own step-1 drop — so its best patch
+    IS the clean content. inf - inf is NaN, so a bare abs() comparison fails
+    exactly when the two agree perfectly.
+    """
+    if x is None or y is None:
+        return x is None and y is None
+    return abs(x - y) < tol
+
+
 step(16, "SSIM/PSNR in the record describe the same composite",
-     abs(v["ssim_patch"] - rec_f["ssim_patch"]) < 1e-5 and
-     abs(v["psnr_image"] - rec_f["psnr_image"]) < 1e-3,
-     f"ssim_patch {v['ssim_patch']:.6f} vs {rec_f['ssim_patch']:.6f}\n"
-     f"psnr_image {v['psnr_image']:.4f} vs {rec_f['psnr_image']:.4f}")
+     _same(v["ssim_patch"], rec_f["ssim_patch"], 1e-5) and
+     _same(v["psnr_image"], rec_f["psnr_image"], 1e-3),
+     f"ssim_patch {v['ssim_patch']} vs {rec_f['ssim_patch']}\n"
+     f"psnr_image {v['psnr_image']} vs {rec_f['psnr_image']}  "
+     f"(None = identical frames)")
 
 print()
 print("=" * 72)

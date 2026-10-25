@@ -612,3 +612,266 @@ a sweep, and if it does not fit for the larger backbones, record that here and k
 Tests: 45 in `tests/test_iap.py`, 498 in the suite
 (`test_core.py::test_tv_zero_on_constant` was already failing and is unrelated), and
 both standalone verifiers still pass.
+
+## 2026-10-17: IAP's first real runs — lr*w3 is a limit cycle, and a best-patch off-by-one
+
+Three findings from the first two IAP runs on segformer_b0, image 464, 1024x2048.
+The runs themselves are not quotable (see the bug below), but the mechanisms are.
+
+### 1. `lr * w3` is the stability control parameter, and 0.3 oscillates
+
+The regulariser's gradient is proportional to `sens` and the colour-constant update
+divides by `sens`, so **the two cancel**: the regulariser contributes a
+sens-independent relative change of `lr * w3 * sign(delta - base)` per step. The `* delta`
+factor then shrinks toward **zero**, not toward `base`, so the step overshoots `base`,
+the sign reverses, and the dynamic becomes a limit cycle rather than a descent.
+
+Measured on the regulariser alone — no model, no adversarial term — starting 0.05 above
+base, 200 steps, reporting mean `|delta - base|`:
+
+| lr | w3 | lr*w3 | step 1 / 2 / 3 / 10 / 200 | swing over the last 50 |
+|---|---|---|---|---|
+| 0.1 | 3.0 | **0.300** | 0.117 / 0.034 / 0.062 / 0.088 / 0.055 | 0.0226 **limit cycle** |
+| 0.1 | 1.0 | 0.100 | 0.024 / 0.025 / 0.027 / 0.024 / 0.028 | 0.0029 limit cycle |
+| 0.1 | 0.3 | 0.030 | 0.033 / 0.019 / 0.018 / 0.018 / 0.020 | 0.0003 settled |
+| 0.01 | 3.0 | 0.030 | 0.033 / 0.019 / 0.018 / 0.018 / 0.020 | 0.0003 settled |
+| 0.003 | 3.0 | 0.009 | 0.045 / 0.040 / 0.035 / 0.016 / 0.018 | 0.0001 settled |
+
+Rows 3 and 4 are **identical trajectories** at different `lr` and different `w3` with the
+same product, which is the proof that the product alone controls the dynamic. The
+observed run at `lr 0.1, w3 3.0` swung `|d|` between 0.0041 and 0.0513 across its log
+rows — the predicted amplitude.
+
+**Operating rule: keep `lr * w3` at or below ~0.03.** And note the convergence with D3:
+`--iap_reg_reduce sum84` scales the regulariser by `(84/256)**2 = 0.1076`, i.e. an
+effective `w3 = 0.32`, giving `lr * w3 = 0.032` at `lr 0.1`. The patch-size rescaling and
+the stability boundary land on the same number independently, which is a strong argument
+for making `sum84` the arm that gets swept.
+
+### 2. An edge-placed patch under slide can only reach half the frame
+
+The Grad-CAM put the patch at `(623, 1792)` — flush against the right edge, 927px from
+centre. Under slide at 1024x2048 the windows are `[0,1024]`, `[768,1792]`, `[1024,2048]`,
+and that patch lies inside **exactly one** of them:
+
+```
+patch at (623, 1792): reachable 1,048,576 / 2,097,152 px  (50.0% of the frame)
+centred patch:        reachable 2,097,152 / 2,097,152 px  (100.0%)
+```
+
+So `target_hit_rate` could not exceed ~50% before the attack started, and the run's
+`--iap_stop_thresh 0.99` was **unreachable by construction**. The whole-inference run at
+the same placement reached 91.1% flip and +49.01; the slide run reached 1.5% and +5.13.
+That gap is the tiling ceiling interacting with an edge placement, NOT the threshold —
+and the two runs differed in both at once, so neither can be attributed from them.
+
+This is the concrete instance of the reach truncation that `wrapper.py` warns about, and
+it is worse than the architecture-dependent ceiling recorded there, because IAP's
+localisation actively seeks edges: the sensitivity map's hottest ridge is the near-field
+road boundary, and `--placement_margin` (which exists for exactly this) defaults to 0.
+**Set `--placement_margin` when running IAP localisation under slide**, or expect the
+window to be chosen in the one place where tiling costs the most.
+
+### 3. BUG, now fixed: `best_param` was one update past the drop it was credited with
+
+`_rung` computes `cur` from `logits`, i.e. from the parameter as it stood at the forward
+pass, and then cloned `best_param` **after** the update had been applied. Every logged
+step therefore credited its measured drop to a different patch.
+
+`optimise.attack_image` has carried the same pattern harmlessly, because Adam under a
+cosine schedule moves the patch by ~lr per coordinate and consecutive patches are
+near-identical. Under IAP's multiplicative limit cycle they are not: the slide run
+reported `best_drop_remote = +12.17` while the parameter it saved measures **+5.13**.
+
+Fixed by snapshotting the candidate before the update on logged steps (one clone per
+logged step). `drift_mean_abs` now also describes the measured patch rather than the
+post-step one. Pinned by `test_best_drop_is_reproducible_from_the_saved_patch`, which
+checks that step 1's history row reports **exactly zero** drift — the forward saw the
+un-updated patch, which is the image region — and which was verified to FAIL with the
+old code rather than being vacuous. An earlier version of that test did pass with the
+bug present, because on a stub the drop is flat and the post-loop best/final comparison
+overwrites the candidate either way.
+
+**Consequence: neither of the two runs above is quotable.** Re-run them.
+
+### 4. PSNR is None, not inf, on identical frames
+
+Exposed by the fix: a run whose regulariser dominates never beats its own step-1 drop, so
+its best patch *is* the clean content, MSE is 0 and PSNR is `+inf`. `json.dump` writes a
+bare `Infinity`, which Python reads back but which is not valid JSON, and `results.json`
+is read outside this repository. `ssim_psnr` now returns `None` there; SSIM already
+reports 1.0, which carries the same fact without leaving the grammar, and
+`_invisibility_stats` skips None. That failure mode is not contrived — it is exactly what
+a too-large `w3` produces.
+
+## 2026-10-23: IAP's training dynamics are a 40-step limit cycle, and the early stop hides it
+
+Measured on the `log_every=10` run (segformer_b0, whole inference, image 464, 1024x2048,
+`lr 0.1`, `w3 3`, `--iap_stop target 0.9`, stopped at step 592 reporting **+48.99**).
+This supersedes the impression that the run is merely "noisy": it is a **deterministic,
+periodic collapse-and-rebuild**, and the number a run reports depends on where in the
+cycle it stops.
+
+### The signature
+
+| | reg | mean &#124;delta-base&#124; |
+|---|---|---|
+| logged steps with drop > 35 (n=13) | 2.7e5 | 0.0407 |
+| collapsed steps (n=10) | 7.1e5 | 0.0173 |
+
+`corr(reg, |d|) = -0.758`, `corr(reg, drop) = -0.493`, `corr(reg, target) = -0.522`.
+So a collapse is **2.6x the regulariser at 0.42x the drift** — the perturbation has not
+merely shrunk, it has moved into the high-`sens` (flat) pixels where it buys nothing and
+costs everything. The patch's own targeted loss returns to **~19**, which is its value at
+step 1: the attack is being undone completely and rebuilt from scratch.
+
+### The period, and why it is exactly what the mechanism predicts
+
+Collapsed logged steps, once the attack has exceeded +20: 260, 300, 310, 350, 390, 430,
+470, 510, 520, 560 — spacings `[40, 10, 40, 40, 40, 40, 40, 10, 40]`, i.e. a **40-step
+period** with the two 10s being the two-row-wide floors of the same trough. The
+`|d|` value at successive collapses walks 0.0051, 0.0099, 0.0149, 0.0198, 0.0245, 0.0292
+and then wraps to 0.0054 — a slow beat on top of the 40-step cycle, so it is
+quasi-periodic rather than a clean period-40 orbit.
+
+The width of the collapse matches the mechanism arithmetically. From the 2026-10-17
+entry, the regulariser's contribution to the multiplicative update is sens-independent
+and equal to `lr * w3 * sign(delta - base)` per step, so with consistent sign the
+perturbation is multiplied by `(1 - 0.3) = 0.7` each step:
+
+```
+0.7 ** 10 = 0.028      ten steps remove 97% of the accumulated perturbation
+```
+
+Ten steps is exactly the observed collapse width, and the ~30 remaining steps of each
+cycle are the attack rebuilding against a 30%-per-step headwind. Duty cycle predicted
+~25% collapsed; measured 10 of 30 logged steps after step 300 are below +10, i.e. 33%.
+
+### Why this makes the reported number a biased estimator
+
+Over the logged steps from 300 onward:
+
+```
+min +4.27   max +46.51   range 42.24 mIoU points   sd 16.84   median +33.62
+```
+
+A run with `--iap_stop none` would report **wherever the sawtooth happened to be at step
+1000** — a 42-point coin flip, and below +10 a third of the time. That is exactly what
+the slide run did: final +5.13 against a best of +12.17.
+
+With `--iap_stop target 0.9` the run instead stops **the first time the cycle crosses the
+threshold**, so it reports a peak *by construction* and can never report a trough. The
+early stop is therefore doing load-bearing work, not saving compute, and `+48.99` is not
+"the attack's strength" — it is "the first peak that crossed 0.9". `best_drop_remote`
+carries the same upward bias, being a max over logged samples of a cycle.
+
+**So for an oscillating run there is no unbiased summary**, and the three candidates fail
+differently: the final is cycle phase, the best is a max over samples, and the
+stop-based number is a defined-but-biased operating point. The fix is not to pick one but
+to leave the regime: **keep `lr * w3` at or below ~0.03**, where the reg-only dynamic
+settles (swing 3e-4 against 2.3e-2 at 0.3). `--iap_reg_reduce sum84` does it at an
+effective `w3 = 0.32`, which is also what D3's patch-size rescaling independently asks
+for.
+
+### What to re-run, and what to report
+
+- Re-run the arm at `lr * w3 <= 0.03` and check the log is monotone-ish rather than
+  sawtoothed before quoting anything.
+- Where an oscillating run must be quoted (e.g. to document this failure), report the
+  stop step, the threshold, AND the spread of the logged drops over the last few hundred
+  steps. A single number from a limit cycle is not a measurement.
+- The instability is a property of **IAP's own update rule at its own published
+  weights**, not of this port: `w3 = 3` is the paper's value, and `lr 0.1` is within its
+  published ladder (0.05, 0.09, 0.2 all give `lr * w3` of 0.15-0.6, i.e. every rung of
+  the released ladder is in the limit-cycle regime at this patch size). That is a result
+  about IAP worth stating, and it is inseparable from D3: the regulariser's scale grows
+  with patch area, so the published `lr * w3` lands in a different regime at 256px than
+  at 84px.
+
+### Correction, same day: the instability is NOT patch-size dependent, and D3 does not cause it
+
+The paragraph above claimed the published `lr * w3` "lands in a different regime at 256px
+than at 84px", on the grounds that the regulariser is a sum whose scale grows with patch
+area. **That reasoning is wrong.** `R = SUM_i sens_i |delta_i - base_i|`, so
+`dR/d(delta_j) = sens_j * sign(delta_j - base_j)` — the gradient with respect to one
+element does not depend on how many elements the sum has. The per-pixel kick is
+`lr * w3 * sign(...)` at every patch size.
+
+Measured, reg-only, same `lr 0.1` and `w3 3` at four sizes:
+
+| P | elements | &#124;d&#124; @ step 1 / 2 / 3 / 10 | swing (last 50) |
+|---|---|---|---|
+| 32 | 3,072 | 0.1146 / 0.0199 / 0.0648 / 0.0915 | 0.0307 |
+| 64 | 12,288 | 0.1155 / 0.0202 / 0.0661 / 0.0932 | 0.0293 |
+| 128 | 49,152 | 0.1152 / 0.0201 / 0.0648 / 0.0937 | 0.0294 |
+| 256 | 196,608 | 0.1153 / 0.0201 / 0.0650 / 0.0931 | 0.0291 |
+
+Identical to the resolution of the different random draws. And `sum84` at P=84 is a
+no-op by construction (`(84/84)**2 = 1`, effective `w3` still 3.0, still a limit cycle);
+it settles at P=256 only because it scales the term down by 0.1076, i.e. it is a `w3`
+change wearing a patch-size costume.
+
+**What this does to the finding.** It makes it stronger and simpler. The instability is
+not an artefact of running IAP at a patch size it was not tuned for — it is a property of
+the paper's loss at the paper's own weights and the paper's own learning-rate ladder, at
+**any** patch size including 84x84. Every rung of that ladder gives `lr * w3` between 0.15
+and 0.60 against a stability boundary near 0.03.
+
+**And it connects to D9 rather than to D3.** The released code's `temp = delta.clone()`
+zeroes the regulariser's gradient entirely, so the released implementation *cannot*
+oscillate — and cannot regularise either. The two findings are consistent and explain
+each other: the instability is exactly what a live version of that term produces at those
+weights, and the released code has it inert. The paper's stated method and its released
+method are different methods, and only one of them runs.
+
+**D3 stands, but narrowed.** The regulariser's VALUE does grow with patch area, 9.3x from
+84x84 to 256x256, so the logged `reg` number is not comparable across patch sizes and
+dwarfs the mean-reduced adversarial terms in the printed loss. That is a reporting and
+loss-balance observation. It is not the dynamics, and the phrase "not the same operating
+point" in D3 should be read as being about the term's weight in the total, not about
+stability — for which the operating point is `lr * w3`, full stop.
+
+## 2026-10-25: ce_target — IAP's own objective, and it is now the default
+
+**The deviation this removes.** IAP's adversarial half is `nn.CrossEntropyLoss()` used
+plainly on both terms:
+
+```python
+loss = 1.5*criterion(pred, target_class) - criterion(pred, class_id) + 3*reg
+```
+
+No weighting, in the paper or in the released code. The port had been reusing
+`ipatch_cospgd` for the targeted term — targeted CosPGD, this repository's own targeted
+objective — on the grounds that it keeps the IAP row comparable to every other targeted
+row here. That was the wrong default: it silently substitutes a different published
+objective for IAP's own, which buys comparability at the cost of the thing the arm
+exists to measure.
+
+`losses/adversarial.ce_target_loss` is the faithful per-pixel port — an unweighted CE
+toward a constant target map, footprint excluded, minimised — and `--iap_tar_loss`
+now defaults to it. Paired with `--iap_untar_loss ce`, which already returns `-CE` so
+IAP's explicit minus is built in, the three terms of the objective are IAP's three terms.
+
+**Comparability is bought by running both, not by picking one.** `--iap_tar_loss
+ipatch_cospgd` is still there, and the difference between the two arms IS what the
+cosine weight costs — a row rather than a caveat. The targeted objective now enters the
+directory name (`tarcospgd` for the weighted arm, unmarked for the faithful default), so
+the two cannot land in the same directory, and every record carries `iap_tar_loss`
+either way, so nothing already on disk is ambiguous.
+
+**What the cosine weight actually does**, for the write-up: `1 - cos(softmax, onehot(t))`
+de-emphasises pixels already converted, concentrating gradient on the holdouts. Plain CE
+keeps full weight on every pixel however converted it is, so a scene that flips early
+keeps spending effort there. A real behavioural difference, which is why both exist.
+
+**Also added to `--loss_fn`** in `overfit.py`, `overfit_population.py` and `train.py`,
+purely as a new choice with no default moved, so the matched csf/raw baseline can be run
+under the same objective as the IAP arm. Every existing command line and `config.json`
+keeps its exact meaning.
+
+Deviation count: D1-D10 stand, but the targeted-term deviation is now conditional —
+it applies only under `--iap_tar_loss ipatch_cospgd`, not to the default arm.
+
+507 passed (`test_core.py::test_tv_zero_on_constant` was already failing and is
+unrelated); eight new tests, including the decomposition of the three terms under the
+faithful objective and a check that the two targeted arms are not interchangeable.

@@ -911,3 +911,252 @@ def test_cam_untiled_is_recorded_in_the_result():
             log=lambda *_: None)
         assert rec["iap_cam_untiled"] is flag
         assert rec["iap_cam_inference"] == want
+
+
+def test_best_drop_is_reproducible_from_the_saved_patch():
+    r"""
+    THE INVARIANT: the drop a run REPORTS must be the drop its saved patch
+    ACHIEVES. Anything else makes the headline number unverifiable.
+
+    This failed before. `cur` is computed from the forward pass's logits — the
+    parameter as it stands BEFORE the update — while `best_param` used to be
+    cloned AFTER it, so each logged step credited its measured drop to a
+    different patch. Harmless under Adam + cosine, where consecutive patches
+    are near-identical, and that is why optimise.attack_image carried the same
+    pattern unnoticed. Not harmless under IAP's multiplicative update, which is
+    a limit cycle at lr*w3 >= 0.1: a real 1000-step run reported
+    best_drop_remote +12.17 while its saved parameter measured +5.13.
+
+    Forced here with a deliberately unstable lr*w3, so consecutive patches are
+    far apart and an off-by-one cannot hide inside the tolerance.
+    """
+    import torch.nn as nn
+
+    H, W, P = 48, 96, 12
+
+    class Stub(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.c = nn.Conv2d(3, K, 5, padding=2)
+            for p in self.parameters():
+                p.requires_grad_(False)
+
+        def forward(self, x):
+            return self.c(x)
+
+    class CamStub:
+        n_degenerate = 0
+
+        def __init__(self, m):
+            self.m = m
+
+        def __call__(self, i, l):
+            c = torch.zeros(1, 1, H, W)
+            c[:, :, 8:28, 40:70] = 1.0
+            with torch.no_grad():
+                return c, self.m(i)
+
+        def close(self):
+            pass
+
+    from patchreach.data.cityscapes import norm_tensors, upsample_to
+    from patchreach.metrics.miou import single_image_miou
+    from patchreach.patch.spec import Patch, PatchConfig
+
+    torch.manual_seed(5)
+    dev = torch.device("cpu")
+    m_t, s_t = norm_tensors(dev)
+    model = Stub().eval()
+    x01 = torch.rand(1, 3, H, W).clamp(0.05, 0.95)
+    img = (x01 - m_t) / s_t
+    label = torch.randint(0, K, (1, H, W))
+
+    cfg = PatchConfig(mode="raw", pixel_param="direct", size=P, scale=P / H,
+                      placement="center")
+
+    # ── the DISCRIMINATING check ────────────────────────────────────────────
+    # At step 1 the forward pass saw the patch BEFORE any update, and the patch
+    # is initialised to the image region, so the drift the history reports for
+    # step 1 must be EXACTLY zero. Under the off-by-one it is the drift after
+    # one update instead, which a large lr makes large. This is what makes the
+    # test non-vacuous: the end-to-end assertion below passes either way on a
+    # stub, because the post-loop best/final comparison overwrites the
+    # candidate when the drop is flat.
+    patch0 = Patch(cfg, dev, m_t, s_t)
+    prep = iap.prepare(model, img, patch0, mean_t=m_t, std_t=s_t, label=label,
+                       cam=CamStub(model), score="cam", log=lambda *_: None)
+    obj = iap.Objective(tar="ipatch_cospgd", untar="ce", target_class=16,
+                        w3=3.0)
+    r1 = iap._rung(model, img, label, patch0, prep, obj, 0.5, 1,
+                   stop="none", stop_thresh=2.0, target_class=16,
+                   num_classes=K, exclude_footprint=True, classes="gt",
+                   clamp=True, clean_remote=float(prep["clean_logits"].new_zeros(())),
+                   log_every=1, verbose=False, log=lambda *_: None)
+    assert r1["history"][0]["drift_mean_abs"] == pytest.approx(0.0, abs=1e-9), (
+        "step 1's history row reports a non-zero drift, so it describes the "
+        "patch AFTER the first update while its mIoU was measured BEFORE it")
+    assert torch.allclose(r1["best_param"], prep["base"], atol=1e-6), (
+        "step 1's best_param is not the initial patch its drop was measured on")
+
+    patch = Patch(cfg, dev, m_t, s_t)
+    rec = iap.attack_image(
+        model, img, label, patch, mean_t=m_t, std_t=s_t, cam=CamStub(model),
+        num_classes=K, lrs=(0.5,), steps=40,        # lr*w3 = 1.5: unstable
+        w3=3.0, stop="none", log_every=4, verbose=False, log=lambda *_: None)
+
+    # attack_image leaves the WINNING BEST parameter in the patch, so
+    # recomputing the remote mIoU from it must reproduce best_drop_remote.
+    with torch.no_grad():
+        patched, fp = patch.apply(img)
+        adv = upsample_to(model(patched), (H, W))
+        remote = single_image_miou(adv, label, K, exclude=fp, classes="gt")
+
+    assert rec["best_drop_remote"] == pytest.approx(
+        rec["clean_remote"] - remote, abs=1e-4), (
+        f"reported best_drop_remote {rec['best_drop_remote']:+.4f} but the "
+        f"saved patch achieves {rec['clean_remote'] - remote:+.4f} — the "
+        f"best parameter is off by one update from the drop it is credited "
+        f"with")
+    # and final_remote, measured on that same patch, must agree with it
+    assert rec["final_remote"] == pytest.approx(remote, abs=1e-4)
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+#  ce_target — IAP's own objective, unweighted
+# ═════════════════════════════════════════════════════════════════════════════
+
+def test_ce_target_is_plain_cross_entropy_to_the_target():
+    r"""
+    IAP's adversarial half is `criterion = nn.CrossEntropyLoss()` used plainly:
+
+        1.5*criterion(pred, target) - criterion(pred, class_id) + 3*reg
+
+    So the faithful per-pixel port of the first term is an UNWEIGHTED CE toward
+    a constant target map. Held against torch's own cross_entropy so the
+    reduction and the sign are both pinned, not just the shape.
+    """
+    import torch.nn.functional as F
+
+    torch.manual_seed(12)
+    logits = torch.randn(1, K, 6, 8)
+    fp = torch.zeros(1, 6, 8, dtype=torch.bool)
+    t = 16
+
+    got = adversarial.ce_target_loss(logits, t, fp, None)
+    target = torch.full((1, 6, 8), t, dtype=torch.long)
+    want = F.cross_entropy(logits, target, reduction="mean")
+    assert float(got) == pytest.approx(float(want), rel=1e-6)
+    # POSITIVE, i.e. minimised to attack — the same sign convention as
+    # ipatch_cospgd, and the opposite of ce_loss which returns -CE.
+    assert float(got) > 0
+
+
+def test_ce_target_differs_from_the_cosine_weighted_version():
+    """
+    The two targeted objectives must not be interchangeable, or the arm that
+    measures what the cosine weight costs would measure nothing.
+    """
+    torch.manual_seed(13)
+    logits = torch.randn(1, K, 6, 8) * 3
+    fp = torch.zeros(1, 6, 8, dtype=torch.bool)
+    plain = float(adversarial.ce_target_loss(logits, 16, fp, None))
+    weighted = float(adversarial.ipatch_cospgd_loss(logits, 16, fp, None))
+    assert abs(plain - weighted) > 1e-3, (plain, weighted)
+
+
+def test_ce_target_excludes_the_footprint_and_honours_support():
+    """
+    Same contract as ipatch_cospgd: without footprint exclusion the cheapest
+    minimiser of a targeted loss is to paint the PATCH in the target class.
+    """
+    torch.manual_seed(14)
+    logits = torch.randn(1, K, 6, 8)
+    fp = torch.zeros(1, 6, 8, dtype=torch.bool)
+    fp[:, :3, :] = True
+    with_fp = float(adversarial.ce_target_loss(logits, 16, fp, None))
+    without = float(adversarial.ce_target_loss(logits, 16, None, None))
+    assert with_fp != pytest.approx(without)
+
+    # support intersects with the footprint exclusion rather than replacing it
+    sup = torch.zeros(1, 6, 8, dtype=torch.bool)
+    sup[:, 3:, :4] = True
+    both = float(adversarial.ce_target_loss(logits, 16, fp, sup))
+    quad = float(adversarial.ce_target_loss(logits[:, :, 3:, :4], 16,
+                                            None, None))
+    assert both == pytest.approx(quad, rel=1e-6)
+
+
+def test_ce_target_refuses_an_empty_scored_set():
+    logits = torch.randn(1, K, 4, 4)
+    fp = torch.ones(1, 4, 4, dtype=torch.bool)
+    with pytest.raises(ValueError, match="no valid pixels"):
+        adversarial.ce_target_loss(logits, 16, fp, None)
+
+
+def test_ce_target_is_reachable_through_build():
+    logits = torch.randn(1, K, 5, 5)
+    fp = torch.zeros(1, 5, 5, dtype=torch.bool)
+    fn = adversarial.build("ce_target", 16)
+    direct = adversarial.ce_target_loss(logits, 16, fp, None)
+    assert float(fn(logits, None, fp, None)) == pytest.approx(float(direct))
+
+
+def test_iap_defaults_to_iaps_own_objective():
+    r"""
+    THE DEFAULT IS THE FAITHFUL ONE. It was ipatch_cospgd first, which silently
+    substituted targeted CosPGD for IAP's plain CE — comparability bought at
+    the cost of the thing the arm exists to measure. Both are available and
+    every run records which it used; this pins which one you get for free.
+    """
+    _scripts_on_path()
+    import iap_attack as S
+
+    a = S.check_args(S.build_parser().parse_args(
+        ["--cityscapes_root", "X"]), S.build_parser())
+    assert a.iap_tar_loss == "ce_target"
+    assert a.iap_untar_loss == "ce"
+    assert iap.Objective().tar_name == "ce_target"
+
+
+def test_the_targeted_arm_gets_its_own_directory():
+    """
+    The cosine-weighted arm and the faithful one are different measurements, so
+    they must not collide in results/iap. The faithful default stays unmarked.
+    """
+    _scripts_on_path()
+    import iap_attack as S
+
+    p = S.build_parser()
+    seen = {}
+    for tl in ("ce_target", "ipatch_cospgd", "none"):
+        a = p.parse_args(["--cityscapes_root", "X", "--iap_tar_loss", tl]
+                         + (["--iap_stop", "flip"] if tl == "none" else []))
+        arm = "_".join(x for x in
+                       ["" if a.iap_locate == "cam" else a.iap_locate,
+                        "" if a.iap_reg_reduce == "sum" else a.iap_reg_reduce,
+                        "" if a.iap_reg_grad == "live" else "reggrad-released",
+                        {"ce_target": "", "ipatch_cospgd": "tarcospgd",
+                         "none": "untargeted"}[a.iap_tar_loss],
+                        "" if a.iap_clamp else "noclamp"] if x)
+        seen[tl] = arm
+    assert seen["ce_target"] == ""
+    assert len(set(seen.values())) == 3, seen
+
+
+def test_the_three_iap_terms_decompose_with_the_faithful_objective():
+    """
+    With the defaults, the total must be IAP's own three terms:
+    w1*CE(pred,target) + w2*(-CE(pred,truth)) + w3*reg, no weighting.
+    """
+    logits, label, fp = _scene()
+    sup = ~fp
+    d = (torch.rand(3, 5, 5) + 0.1)
+    b = torch.rand(3, 5, 5)
+    s = torch.rand(5, 5) + 1
+
+    out = iap.Objective(w1=1.5, w2=1.0, w3=3.0)(logits, label, fp, sup,
+                                                d, b, s)
+    want = (1.5 * adversarial.ce_target_loss(logits, 8, fp, sup)
+            + 1.0 * adversarial.ce_loss(logits, label, sup)
+            + 3.0 * iap.regulariser(d, b, s, "sum"))
+    assert float(out["total"]) == pytest.approx(float(want), rel=1e-6)
