@@ -17,11 +17,21 @@ the renderer resizes it — so the full transfer matrix is evaluation-only.
 The OFF-DIAGONAL is the result: the diagonal says patches work, the
 off-diagonal says whether they TRANSFER, and those are different claims.
 
---patch_png EVALUATES A PNG instead of the checkpoint's parameter, for
-mode='raw' only, where the PNG is exactly what render() produced. The
-checkpoint is still required and still supplies size, scale, scale_ref, shape
-and the resolved placement; only the parameter is replaced, and the deviation
-from the checkpoint's own render -- the 8-bit quantisation -- is printed.
+--patch_png EVALUATES A PNG. Two ways, and they answer different questions:
+
+    --checkpoint best.pt --patch_png best_patch.png
+        the checkpoint's patch, parameterised from the PNG instead of from
+        `param`. mode='raw' only. Size, scale, scale_ref, shape and the
+        RESOLVED placement still come from the checkpoint, so this is the same
+        patch in the same place, and the deviation -- the 8-bit quantisation
+        -- is printed. Use it to check the PNG against the parameter.
+
+    --patch_png patch.png          (no checkpoint)
+        a square raw patch pasted at the CENTRE, at its own pixel size unless
+        --patch_scale says otherwise. Nothing else is needed, and nothing else
+        is assumed: non-square is refused, because a cutout's silhouette is
+        not in an RGB render. Use it for a patch that arrived as a PNG and
+        never had a patchreach checkpoint -- an external universal patch.
 
 Evaluation is cheap and training is not, so evaluate every configuration on the
 same fixed images rather than training more.
@@ -30,6 +40,7 @@ from __future__ import annotations
 
 import argparse
 import json
+from dataclasses import asdict
 from pathlib import Path
 
 import torch
@@ -48,7 +59,10 @@ from patchreach.utils import get_device, seed_everything, increment_path
 
 def main():
     p = add_model_args(argparse.ArgumentParser())
-    p.add_argument("--checkpoint", required=True)
+    p.add_argument("--checkpoint", default=None,
+                   help="a patchreach checkpoint (Patch.save). Optional ONLY "
+                        "with --patch_png, which can stand alone for a square "
+                        "raw patch pasted at the centre.")
     p.add_argument("--images", default="fixed10",
                    help="'fixed10' | 'all' | '2 5 45'")
     p.add_argument("--loss_fn", default=None,
@@ -78,28 +92,47 @@ def main():
                         "deviation from the checkpoint's own render is "
                         "printed so it can be read rather than assumed.")
 
+    p.add_argument("--patch_scale", type=float, default=None,
+                   help="fraction of image HEIGHT the patch is pasted at, "
+                        "for --patch_png WITHOUT a checkpoint. Default: the "
+                        "PNG's own pixel size at this --img_h, so nothing is "
+                        "resampled. Ignored when a checkpoint supplies the "
+                        "geometry.")
+
     p.add_argument("--out_root", default="results/eval")
     p.add_argument("--tag", default="")
     a = p.parse_args()
+    if not a.checkpoint and not a.patch_png:
+        p.error("need --checkpoint, or --patch_png on its own for a square "
+                "raw patch pasted at the centre")
 
     seed_everything(a.seed)
     device = get_device()
     model, n_ch, n_act, spec = setup_model(a)
     mean_t, std_t = norm_tensors(device)
 
-    ck = torch.load(a.checkpoint, map_location="cpu")
-    pcfg = ck["config"]
-    G = None
-    if pcfg.get("mode") in ("gan", "raw_ganinit"):
-        from GANLatentDiscovery.loading import load_from_dir
-        from GANLatentDiscovery.utils import is_conditional
-        _, G, _ = load_from_dir(
-            "./GANLatentDiscovery/models/pretrained/deformators/BigGAN/",
-            G_weights="./GANLatentDiscovery/models/pretrained/generators/BigGAN/G_ema.pth")
-        if is_conditional(G):
-            G.set_classes(259)
-        G.eval().to(device)
-    patch = Patch.load(a.checkpoint, device, mean_t, std_t, generator=G)
+    if a.checkpoint is None:
+        # THE PNG ALONE. Patch.from_png fixes what a PNG cannot carry — raw
+        # pixels, square, centre — and refuses the cases where that would be
+        # a lie. There is no stored config here to be inconsistent with, so
+        # pcfg is the one it built.
+        patch = Patch.from_png(a.patch_png, device, mean_t, std_t,
+                               a.img_h, a.patch_scale)
+        pcfg = asdict(patch.cfg)
+    else:
+        ck = torch.load(a.checkpoint, map_location="cpu")
+        pcfg = ck["config"]
+        G = None
+        if pcfg.get("mode") in ("gan", "raw_ganinit"):
+            from GANLatentDiscovery.loading import load_from_dir
+            from GANLatentDiscovery.utils import is_conditional
+            _, G, _ = load_from_dir(
+                "./GANLatentDiscovery/models/pretrained/deformators/BigGAN/",
+                G_weights="./GANLatentDiscovery/models/pretrained/generators/BigGAN/G_ema.pth")
+            if is_conditional(G):
+                G.set_classes(259)
+            G.eval().to(device)
+        patch = Patch.load(a.checkpoint, device, mean_t, std_t, generator=G)
 
     # REFUSE RATHER THAN RENDER A GREY SQUARE. Patch.load restores `param` and
     # `placement`; `reference` is NOT in the checkpoint, and `from_image` is a
@@ -107,7 +140,7 @@ def main():
     # A csf patch rendered with reference=None takes the 0.5 grey fallback in
     # Patch.render() — the failure --patch_mode's own help text warns about —
     # and every number below would silently describe a different patch.
-    if pcfg.get("mode") == "csf" and not a.from_image:
+    if a.checkpoint and pcfg.get("mode") == "csf" and not a.from_image:
         raise SystemExit(
             "\nThis checkpoint is mode='csf'. Its base is the image region the\n"
             "patch covers, and that base is NOT stored in the checkpoint — only\n"
@@ -121,12 +154,13 @@ def main():
     # BEFORE describe(), so every line it logs describes the patch actually
     # evaluated. Patch.param_from_png refuses any mode but 'raw', where the
     # PNG is the whole patch.
-    png_delta = patch.param_from_png(a.patch_png) if a.patch_png else None
+    png_delta = (patch.param_from_png(a.patch_png)
+                 if a.patch_png and a.checkpoint else None)
 
     loss_fn = a.loss_fn or "cospgd"
     tgt = a.target_class
 
-    print(f"\n[patch] loaded {a.checkpoint}")
+    print(f"\n[patch] loaded {a.checkpoint or a.patch_png}")
     if png_delta is not None:
         # PRINTED rather than asserted against a bound: it is the 8-bit
         # quantisation of the render, and it belongs in the log next to the
@@ -134,6 +168,17 @@ def main():
         print(f"[patch] parameter REPLACED by the pixels of {a.patch_png}")
         print(f"[patch] max |png - checkpoint render| {png_delta:.6f}  "
               f"(one 8-bit step is 1/255 = {1 / 255:.6f})")
+    if a.checkpoint is None:
+        own = " (the PNG's own pixel size)" if a.patch_scale is None else ""
+        print(f"[patch] FROM THE PNG ALONE: square raw patch at the centre, "
+              f"scale {patch.cfg.scale:.6g} of height" + own)
+        if patch.side(a.img_h, a.img_w) != patch.cfg.size:
+            # Resampling has no off switch, so say it rather than let
+            # describe()'s two numbers pass as a formality.
+            print(f"[patch] WARNING   : the PNG is {patch.cfg.size}px but "
+                  f"pastes at {patch.side(a.img_h, a.img_w)}px, so it is "
+                  f"RESAMPLED. Pass --patch_scale "
+                  f"{patch.cfg.size / a.img_h:g} to paste it 1:1.")
     patch.describe(a.img_h, a.img_w)
 
     ds = make_dataset(a, "val")
@@ -141,7 +186,7 @@ def main():
 
     # 'png' in the tag so a PNG-sourced run never lands in the same
     # directory as the checkpoint-sourced run it is compared against.
-    tag = "_".join(x for x in [Path(a.checkpoint).parent.name,
+    tag = "_".join(x for x in [Path(a.checkpoint or a.patch_png).parent.name,
                                f"eval{a.img_h}x{a.img_w}",
                                "png" if a.patch_png else "", a.tag] if x)
     out_dir = Path(increment_path(Path(a.out_root) / tag))

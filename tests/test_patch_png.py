@@ -156,3 +156,84 @@ def test_every_other_mode_is_refused(mode, tmp_path):
     p.cfg.mode = mode
     with pytest.raises(ValueError, match="mode='raw'"):
         p.param_from_png(png)
+
+
+# ── Patch.from_png: the PNG with no checkpoint at all ────────────────────────
+#
+# The claim here is narrower than it looks. A square raw patch at the centre
+# needs three facts to be pasted and the PNG supplies one of them; the other
+# two have answers that are not information at all — its own pixel size, and
+# the middle. Everything these tests pin is one of those two, plus the refusal
+# for the case where the PNG is genuinely missing something.
+
+
+def test_from_png_takes_its_size_and_pastes_1to1(tmp_path):
+    px = torch.rand(3, 256, 256)
+    save_image(px, tmp_path / "patch.png")
+    p = Patch.from_png(tmp_path / "patch.png", DEV, MEAN, STD, img_h=1024)
+
+    assert p.cfg.size == 256
+    assert p.cfg.scale == pytest.approx(0.25)
+    # the whole point of the default scale: int(H*scale) == the PNG's side, so
+    # the paste is 1:1 and no bilinear resampling happens at this img_h.
+    assert p.side(1024, 2048) == 256
+
+
+def test_from_png_is_raw_direct_and_centred(tmp_path):
+    save_image(torch.rand(3, 64, 64), tmp_path / "patch.png")
+    p = Patch.from_png(tmp_path / "patch.png", DEV, MEAN, STD, img_h=256)
+
+    assert (p.cfg.mode, p.cfg.pixel_param) == ("raw", "direct")
+    assert p.cfg.placement == "center"
+    assert p.cfg.scale_ref == "height"
+    p.resolve_placement(256, 512)
+    assert p.placement == ((256 - 64) // 2, (512 - 64) // 2)
+
+
+def test_from_png_renders_the_png_exactly(tmp_path):
+    """No checkpoint to compare against, so the parameter IS the file: the
+    only error in this path is the 8-bit grid the PNG was written on."""
+    px = torch.rand(3, 32, 32)
+    save_image(px, tmp_path / "patch.png")
+    p = Patch.from_png(tmp_path / "patch.png", DEV, MEAN, STD, img_h=128)
+
+    assert float((p.render().detach() - px).abs().max()) <= QUANT
+    # and the parameter is the file read back, not a re-render of it
+    assert torch.equal(p.param.detach(), p.render().detach())
+
+
+def test_from_png_explicit_scale_is_honoured(tmp_path):
+    save_image(torch.rand(3, 256, 256), tmp_path / "patch.png")
+    p = Patch.from_png(tmp_path / "patch.png", DEV, MEAN, STD, img_h=1024,
+                       scale=0.5)
+    assert p.cfg.scale == pytest.approx(0.5)
+    # 256px of parameter pasted over 512px: resampled, and evaluate.py says so
+    assert p.side(1024, 2048) == 512
+
+
+def test_from_png_refuses_a_non_square_png(tmp_path):
+    """A two-panel figure and a cutout both land here, and the cutout is the
+    dangerous one: its silhouette is not in an RGB render."""
+    save_image(torch.rand(3, 540, 1050), tmp_path / "figure.png")
+    with pytest.raises(ValueError, match="not square"):
+        Patch.from_png(tmp_path / "figure.png", DEV, MEAN, STD, img_h=1024)
+
+
+def test_from_png_and_a_checkpoint_paste_the_same_patch(tmp_path):
+    """The equivalence the no-checkpoint path rests on: for a square raw patch
+    at the centre, the PNG alone reproduces what the checkpoint would have
+    pasted, to within the 8 bits it was written on."""
+    p = _raw_patch(size=64, pixel_param="direct")
+    p.cfg.scale = 64 / 256
+    png = _write(p, tmp_path / "patch.png")
+    img = torch.rand(1, 3, 256, 512)
+    p.resolve_placement(256, 512)
+    from_ck, fp_ck = p.apply(img)
+
+    q = Patch.from_png(png, DEV, MEAN, STD, img_h=256)
+    q.resolve_placement(256, 512)
+    from_png, fp_png = q.apply(img)
+
+    assert torch.equal(fp_ck, fp_png)
+    assert float((from_png - from_ck).abs().max()) <= (
+        QUANT / float(STD.min()) + 1e-6)
