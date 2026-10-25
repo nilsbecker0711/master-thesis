@@ -110,15 +110,24 @@ def build_parser():
                    help="weight on the perceptibility regulariser. 3 "
                         "released, AT 84x84 — see --iap_reg_reduce and D3. "
                         "Sweep it; do not inherit it.")
-    g.add_argument("--iap_tar_loss", default="ipatch_cospgd",
-                   choices=["ipatch_cospgd", "none"],
-                   help="the targeted segmentation term. 'none' drops it and "
-                        "makes the run UNTARGETED, which IAP never is — "
-                        "declare that as an extension.")
+    g.add_argument("--iap_tar_loss", default="ce_target",
+                   choices=list(iap_mod.TAR_LOSSES),
+                   help="the targeted term. 'ce_target' (DEFAULT) is IAP's "
+                        "OWN objective — a plain per-pixel CE toward "
+                        "--target_class, no weighting, which is what "
+                        "nn.CrossEntropyLoss() does in IAP.py. "
+                        "'ipatch_cospgd' is targeted CosPGD (Agnihotri et "
+                        "al., Eq. 8), this repository's own targeted "
+                        "objective: use it for the arm that has to be "
+                        "comparable to every other targeted row here, and "
+                        "report the pair — the difference IS what the cosine "
+                        "weight costs. 'none' drops the term and makes the "
+                        "run untargeted, which IAP never is.")
     g.add_argument("--iap_untar_loss", default="ce",
-                   choices=["ce", "cospgd", "margin", "cos_margin", "none"],
+                   choices=list(iap_mod.UNTAR_LOSSES),
                    help="the term away from the truth. 'ce' is IAP's literal "
-                        "-CE(pred, truth).")
+                        "-CE(pred, truth) and needs no sign flip, because "
+                        "ce_loss already returns -CE.")
     g.add_argument("--iap_reg_reduce", default="sum",
                    choices=list(iap_mod.REG_REDUCTIONS),
                    help="'sum' is the released arithmetic and its scale grows "
@@ -287,7 +296,11 @@ def main():
                    ["" if a.iap_locate == "cam" else a.iap_locate,
                     "" if a.iap_reg_reduce == "sum" else a.iap_reg_reduce,
                     "" if a.iap_reg_grad == "live" else "reggrad-released",
-                    "" if a.iap_tar_loss != "none" else "untargeted",
+                    # The targeted objective enters the NAME, because the
+                    # cosine-weighted arm and the faithful one are different
+                    # measurements and must not land in the same directory.
+                    {"ce_target": "", "ipatch_cospgd": "tarcospgd",
+                     "none": "untargeted"}[a.iap_tar_loss],
                     "" if a.iap_clamp else "noclamp"] if x)
     tag = "_".join(x for x in [a.arch, "iap", a.iap_untar_loss,
                                f"w3{a.iap_w3:g}", arm, a.tag] if x)

@@ -242,7 +242,8 @@ def summarise(rows, out_dir: Path) -> dict:
 def main():
     p = add_patch_args(add_model_args(argparse.ArgumentParser()))
     p.add_argument("--loss_fn", default="cospgd",
-                   choices=["ce", "cospgd", "ipatch_cospgd", "tsallis",
+                   choices=["ce", "cospgd", "ce_target",
+                            "ipatch_cospgd", "tsallis",
                             "margin", "cos_margin"])
     p.add_argument("--margin_kappa", type=float, default=5.0,
                    help="--loss_fn margin/cos_margin only: required logit "

@@ -92,7 +92,8 @@ def build_parser():
         description="Optimise one patch per image over a population of "
                     "images and report the distribution")))
     p.add_argument("--loss_fn", default="cospgd",
-                   choices=["ce", "cospgd", "ipatch_cospgd", "tsallis"])
+                   choices=["ce", "cospgd", "ce_target",
+                            "ipatch_cospgd", "tsallis"])
     p.add_argument("--target_class", type=int, default=8)
     p.add_argument("--from_image", action="store_true",
                    help="initialise the patch base with the region it covers "

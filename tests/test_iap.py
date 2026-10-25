@@ -1019,3 +1019,144 @@ def test_best_drop_is_reproducible_from_the_saved_patch():
         f"with")
     # and final_remote, measured on that same patch, must agree with it
     assert rec["final_remote"] == pytest.approx(remote, abs=1e-4)
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+#  ce_target — IAP's own objective, unweighted
+# ═════════════════════════════════════════════════════════════════════════════
+
+def test_ce_target_is_plain_cross_entropy_to_the_target():
+    r"""
+    IAP's adversarial half is `criterion = nn.CrossEntropyLoss()` used plainly:
+
+        1.5*criterion(pred, target) - criterion(pred, class_id) + 3*reg
+
+    So the faithful per-pixel port of the first term is an UNWEIGHTED CE toward
+    a constant target map. Held against torch's own cross_entropy so the
+    reduction and the sign are both pinned, not just the shape.
+    """
+    import torch.nn.functional as F
+
+    torch.manual_seed(12)
+    logits = torch.randn(1, K, 6, 8)
+    fp = torch.zeros(1, 6, 8, dtype=torch.bool)
+    t = 16
+
+    got = adversarial.ce_target_loss(logits, t, fp, None)
+    target = torch.full((1, 6, 8), t, dtype=torch.long)
+    want = F.cross_entropy(logits, target, reduction="mean")
+    assert float(got) == pytest.approx(float(want), rel=1e-6)
+    # POSITIVE, i.e. minimised to attack — the same sign convention as
+    # ipatch_cospgd, and the opposite of ce_loss which returns -CE.
+    assert float(got) > 0
+
+
+def test_ce_target_differs_from_the_cosine_weighted_version():
+    """
+    The two targeted objectives must not be interchangeable, or the arm that
+    measures what the cosine weight costs would measure nothing.
+    """
+    torch.manual_seed(13)
+    logits = torch.randn(1, K, 6, 8) * 3
+    fp = torch.zeros(1, 6, 8, dtype=torch.bool)
+    plain = float(adversarial.ce_target_loss(logits, 16, fp, None))
+    weighted = float(adversarial.ipatch_cospgd_loss(logits, 16, fp, None))
+    assert abs(plain - weighted) > 1e-3, (plain, weighted)
+
+
+def test_ce_target_excludes_the_footprint_and_honours_support():
+    """
+    Same contract as ipatch_cospgd: without footprint exclusion the cheapest
+    minimiser of a targeted loss is to paint the PATCH in the target class.
+    """
+    torch.manual_seed(14)
+    logits = torch.randn(1, K, 6, 8)
+    fp = torch.zeros(1, 6, 8, dtype=torch.bool)
+    fp[:, :3, :] = True
+    with_fp = float(adversarial.ce_target_loss(logits, 16, fp, None))
+    without = float(adversarial.ce_target_loss(logits, 16, None, None))
+    assert with_fp != pytest.approx(without)
+
+    # support intersects with the footprint exclusion rather than replacing it
+    sup = torch.zeros(1, 6, 8, dtype=torch.bool)
+    sup[:, 3:, :4] = True
+    both = float(adversarial.ce_target_loss(logits, 16, fp, sup))
+    quad = float(adversarial.ce_target_loss(logits[:, :, 3:, :4], 16,
+                                            None, None))
+    assert both == pytest.approx(quad, rel=1e-6)
+
+
+def test_ce_target_refuses_an_empty_scored_set():
+    logits = torch.randn(1, K, 4, 4)
+    fp = torch.ones(1, 4, 4, dtype=torch.bool)
+    with pytest.raises(ValueError, match="no valid pixels"):
+        adversarial.ce_target_loss(logits, 16, fp, None)
+
+
+def test_ce_target_is_reachable_through_build():
+    logits = torch.randn(1, K, 5, 5)
+    fp = torch.zeros(1, 5, 5, dtype=torch.bool)
+    fn = adversarial.build("ce_target", 16)
+    direct = adversarial.ce_target_loss(logits, 16, fp, None)
+    assert float(fn(logits, None, fp, None)) == pytest.approx(float(direct))
+
+
+def test_iap_defaults_to_iaps_own_objective():
+    r"""
+    THE DEFAULT IS THE FAITHFUL ONE. It was ipatch_cospgd first, which silently
+    substituted targeted CosPGD for IAP's plain CE — comparability bought at
+    the cost of the thing the arm exists to measure. Both are available and
+    every run records which it used; this pins which one you get for free.
+    """
+    _scripts_on_path()
+    import iap_attack as S
+
+    a = S.check_args(S.build_parser().parse_args(
+        ["--cityscapes_root", "X"]), S.build_parser())
+    assert a.iap_tar_loss == "ce_target"
+    assert a.iap_untar_loss == "ce"
+    assert iap.Objective().tar_name == "ce_target"
+
+
+def test_the_targeted_arm_gets_its_own_directory():
+    """
+    The cosine-weighted arm and the faithful one are different measurements, so
+    they must not collide in results/iap. The faithful default stays unmarked.
+    """
+    _scripts_on_path()
+    import iap_attack as S
+
+    p = S.build_parser()
+    seen = {}
+    for tl in ("ce_target", "ipatch_cospgd", "none"):
+        a = p.parse_args(["--cityscapes_root", "X", "--iap_tar_loss", tl]
+                         + (["--iap_stop", "flip"] if tl == "none" else []))
+        arm = "_".join(x for x in
+                       ["" if a.iap_locate == "cam" else a.iap_locate,
+                        "" if a.iap_reg_reduce == "sum" else a.iap_reg_reduce,
+                        "" if a.iap_reg_grad == "live" else "reggrad-released",
+                        {"ce_target": "", "ipatch_cospgd": "tarcospgd",
+                         "none": "untargeted"}[a.iap_tar_loss],
+                        "" if a.iap_clamp else "noclamp"] if x)
+        seen[tl] = arm
+    assert seen["ce_target"] == ""
+    assert len(set(seen.values())) == 3, seen
+
+
+def test_the_three_iap_terms_decompose_with_the_faithful_objective():
+    """
+    With the defaults, the total must be IAP's own three terms:
+    w1*CE(pred,target) + w2*(-CE(pred,truth)) + w3*reg, no weighting.
+    """
+    logits, label, fp = _scene()
+    sup = ~fp
+    d = (torch.rand(3, 5, 5) + 0.1)
+    b = torch.rand(3, 5, 5)
+    s = torch.rand(5, 5) + 1
+
+    out = iap.Objective(w1=1.5, w2=1.0, w3=3.0)(logits, label, fp, sup,
+                                                d, b, s)
+    want = (1.5 * adversarial.ce_target_loss(logits, 8, fp, sup)
+            + 1.0 * adversarial.ce_loss(logits, label, sup)
+            + 3.0 * iap.regulariser(d, b, s, "sum"))
+    assert float(out["total"]) == pytest.approx(float(want), rel=1e-6)

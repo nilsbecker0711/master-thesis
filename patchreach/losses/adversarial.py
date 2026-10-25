@@ -4,6 +4,11 @@ Adversarial objectives.
   ce            untargeted, -CE(logits, GT)
   cospgd        untargeted, cos(pred,GT).detach() * CE, maximised
                 (Agnihotri et al., ICML 2024)
+  ce_target     TARGETED, plain per-pixel CE toward target_class, minimised.
+                No weighting. This is what IAP's adversarial half actually
+                specifies (`nn.CrossEntropyLoss()` used plainly), so it is the
+                one to use when reproducing IAP rather than comparing against
+                this repository's own targeted objective.
   ipatch_cospgd TARGETED CosPGD — Agnihotri et al.'s own Eq. 8, not a local
                 combination. Drives every scored pixel toward target_class.
                 THE IDENTIFIER IS A MISNOMER AND IS KEPT ANYWAY: every
@@ -98,6 +103,62 @@ def cospgd_loss(logits, labels, support: Optional[torch.Tensor] = None):
     cos_w = F.cosine_similarity(F.softmax(logits, 1), ref, dim=1).detach()
     ce = F.cross_entropy(logits, labels, reduction="none", ignore_index=255)
     return -_reduce(cos_w * ce, valid)
+
+
+def ce_target_loss(logits, target_class: int,
+                   footprint: Optional[torch.Tensor] = None,
+                   support: Optional[torch.Tensor] = None):
+    r"""
+    PLAIN TARGETED CE, per pixel:
+
+        L = mean_i CE( f(x)_i, t )
+
+    ipatch_cospgd_loss below, minus the cosine weight. That is the whole
+    difference, and it exists because an unweighted targeted CE is what several
+    published attacks actually specify.
+
+    WHO NEEDS IT. IAP (Dutta & Zhang, ICCV 2025) builds its adversarial half
+    from `criterion = nn.CrossEntropyLoss()` used plainly on both terms —
+
+        1.5*criterion(pred, target) - criterion(pred, class_id) + 3*reg
+
+    — with no cosine anywhere, in the paper or in the released code. Porting
+    that to segmentation means a per-pixel targeted CE, which is this, and a
+    per-pixel CE away from the ground truth, which is ce_loss above (it already
+    returns -CE, so IAP's explicit minus is built in). Reusing
+    ipatch_cospgd_loss instead would silently substitute targeted CosPGD for
+    IAP's own objective — defensible for comparability against the rest of this
+    repository, but not a reproduction, and the choice has to be the caller's.
+    See patchreach/patch/iap.py.
+
+    THE SIGN AND THE FOOTPRINT follow ipatch_cospgd_loss exactly: minimised to
+    attack, and `footprint` is as mandatory here as it is there, for the same
+    reason — leave the patch region in a targeted loss and the cheapest
+    minimiser is to paint the PATCH in the target class, which collapses the
+    loss and moves nothing remote.
+
+    WHAT IT GIVES UP against the cosine-weighted version: every pixel keeps
+    full weight however converted it already is, so a scene where most pixels
+    flip early keeps spending gradient on them instead of on the holdouts.
+    That is a real difference in behaviour, not a formality, and it is the
+    reason both exist.
+    """
+    B, C, H, W = logits.shape
+    target = torch.full((B, H, W), target_class, dtype=torch.long,
+                        device=logits.device)
+    if footprint is not None:
+        target[footprint] = 255                       # camouflage prevention
+
+    valid = target != 255
+    if support is not None:
+        valid = valid & support
+    if valid.sum() == 0:
+        raise ValueError("ce_target loss has no valid pixels — check the "
+                         "footprint and reach masks do not exclude everything")
+
+    per_pixel = F.cross_entropy(logits, target, reduction="none",
+                                ignore_index=255)
+    return _reduce(per_pixel, valid)
 
 
 def ipatch_cospgd_loss(logits, target_class: int,
@@ -307,6 +368,8 @@ def build(loss_fn: str, target_class: int = 8,
         return TsallisCELoss(q=tsallis_q, schedule=tsallis_schedule,
                              q_start=tsallis_q_start, q_end=tsallis_q_end,
                              total_steps=tsallis_total_steps)
+    if loss_fn == "ce_target":
+        return lambda lg, lb, fp, sp: ce_target_loss(lg, target_class, fp, sp)
     if loss_fn == "ipatch_cospgd":
         return lambda lg, lb, fp, sp: ipatch_cospgd_loss(lg, target_class,
                                                          fp, sp)

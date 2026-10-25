@@ -275,6 +275,12 @@ STOP_CRITERIA = ("none", "flip", "target", "drop")
 # the released code's exact gradient cancellation, where the term is reported
 # and optimises nothing.
 REG_GRADS = ("live", "released")
+# The targeted slot. 'ce_target' is IAP's own plain per-pixel CE and the
+# default; 'ipatch_cospgd' is targeted CosPGD, this repository's own targeted
+# objective, kept as the arm that makes the IAP row comparable to every other
+# targeted row; 'none' drops the term, which IAP never does.
+TAR_LOSSES = ("ce_target", "ipatch_cospgd", "none")
+UNTAR_LOSSES = ("ce", "cospgd", "margin", "cos_margin", "none")
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -556,27 +562,37 @@ class Objective:
     term, with its explicit minus, IS adversarial.ce_loss, and the port is a
     substitution rather than a rearrangement.
 
-    tar : 'ipatch_cospgd' or 'none'. The targeted term, and despite the
-          identifier it is TARGETED COSPGD — Agnihotri et al., ICML 2024,
-          Eq. 8 — not a local combination; see losses/adversarial.py. This
-          repository has no plain targeted CE and one is not added here:
-          targeted CosPGD is its targeted objective, every targeted number in
-          the thesis is measured under it, and introducing a second targeted
-          loss purely to match IAP's would make the IAP column incomparable to
-          every other column.
+    tar : 'ce_target' (DEFAULT), 'ipatch_cospgd', or 'none'.
 
-          THE DEVIATION FROM IAP is therefore the (1 - cos to target) weight,
-          which de-emphasises pixels already converted where IAP's first term
-          is a plain CE. Note what that deviation is NOT: it is not an ad-hoc
-          weight invented here, it is one published objective substituted for
-          another, which is the honest form for a comparison arm to take.
+          'ce_target' is IAP'S OWN OBJECTIVE: a plain per-pixel CE toward the
+          target class, no weighting. IAP uses `nn.CrossEntropyLoss()` plainly
+          on both of its adversarial terms, in the paper and in the released
+          code, so this is the faithful port and it is the default. Paired with
+          untar='ce' — which already returns -CE, so IAP's explicit minus is
+          built in — the three terms here are IAP's three terms.
+
+          'ipatch_cospgd' is TARGETED COSPGD (Agnihotri et al., ICML 2024,
+          Eq. 8 — see losses/adversarial.py; the identifier is a misnomer kept
+          for provenance). It is this repository's own targeted objective, the
+          one every other targeted number in the thesis is measured under, so
+          it is the arm to use when the question is "csf versus IAP's
+          procedure under OUR objective" rather than "what does IAP do".
+
+          THE EARLIER DEFAULT WAS THE OTHER WAY ROUND and that was a mistake.
+          Reusing targeted CosPGD by default silently substituted a different
+          published objective for IAP's own, which buys comparability against
+          this repository at the cost of the thing the arm exists to measure.
+          Comparability is better bought by running BOTH and reporting the
+          pair: the difference between them is exactly what the cosine weight
+          costs, which is a row rather than a caveat. Every run records
+          iap_tar_loss, so no number on disk is ambiguous about which it used.
     untar : 'ce', 'cospgd', 'margin', 'cos_margin' or 'none'. The term away
           from the truth. 'ce' is IAP's literal -CE(pred, truth).
     'none' on either slot drops it. tar='none' makes the attack UNTARGETED,
           which IAP never is — declare it as an extension, not as IAP.
     """
 
-    def __init__(self, tar: str = "ipatch_cospgd", untar: str = "ce",
+    def __init__(self, tar: str = "ce_target", untar: str = "ce",
                  target_class: int = 8,
                  w1: float = IAP_W1, w2: float = IAP_W2, w3: float = IAP_W3,
                  reg_reduce: str = "sum", reg_grad: str = "live",
@@ -585,10 +601,10 @@ class Objective:
         if reg_grad not in REG_GRADS:
             raise ValueError(f"reg_grad must be one of {REG_GRADS}, "
                              f"got {reg_grad!r}")
-        if tar not in ("ipatch_cospgd", "none"):
-            raise ValueError(
-                f"iap_tar_loss must be 'ipatch_cospgd' or 'none', got {tar!r}")
-        if untar not in ("ce", "cospgd", "margin", "cos_margin", "none"):
+        if tar not in TAR_LOSSES:
+            raise ValueError(f"iap_tar_loss must be one of {TAR_LOSSES}, "
+                             f"got {tar!r}")
+        if untar not in UNTAR_LOSSES:
             raise ValueError(f"iap_untar_loss {untar!r} is not a loss in "
                              f"losses/adversarial.py")
         if tar == "none" and untar == "none":
@@ -1060,7 +1076,7 @@ def _rung(model, img, label, patch, prepared, objective, lr, steps, *,
 
 def attack_image(model, img, label, patch, *, mean_t, std_t, cam,
                  target_class: int = 8,
-                 tar_loss: str = "ipatch_cospgd",
+                 tar_loss: str = "ce_target",
                  untar_loss: str = "ce",
                  w1: float = IAP_W1, w2: float = IAP_W2, w3: float = IAP_W3,
                  reg_reduce: str = "sum", reg_grad: str = "live",

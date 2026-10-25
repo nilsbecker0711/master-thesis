@@ -61,7 +61,8 @@ def build_parser():
                                # placement*, reference*, lap_*, init_from
 
     p.add_argument("--loss_fn",
-                   choices=["ce", "cospgd", "ipatch_cospgd", "tsallis"],
+                   choices=["ce", "cospgd", "ce_target",
+                            "ipatch_cospgd", "tsallis"],
                    default="cospgd")
     p.add_argument("--target_class", type=int, default=8)
 

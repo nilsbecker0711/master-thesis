@@ -830,3 +830,48 @@ dwarfs the mean-reduced adversarial terms in the printed loss. That is a reporti
 loss-balance observation. It is not the dynamics, and the phrase "not the same operating
 point" in D3 should be read as being about the term's weight in the total, not about
 stability — for which the operating point is `lr * w3`, full stop.
+
+## 2026-10-25: ce_target — IAP's own objective, and it is now the default
+
+**The deviation this removes.** IAP's adversarial half is `nn.CrossEntropyLoss()` used
+plainly on both terms:
+
+```python
+loss = 1.5*criterion(pred, target_class) - criterion(pred, class_id) + 3*reg
+```
+
+No weighting, in the paper or in the released code. The port had been reusing
+`ipatch_cospgd` for the targeted term — targeted CosPGD, this repository's own targeted
+objective — on the grounds that it keeps the IAP row comparable to every other targeted
+row here. That was the wrong default: it silently substitutes a different published
+objective for IAP's own, which buys comparability at the cost of the thing the arm
+exists to measure.
+
+`losses/adversarial.ce_target_loss` is the faithful per-pixel port — an unweighted CE
+toward a constant target map, footprint excluded, minimised — and `--iap_tar_loss`
+now defaults to it. Paired with `--iap_untar_loss ce`, which already returns `-CE` so
+IAP's explicit minus is built in, the three terms of the objective are IAP's three terms.
+
+**Comparability is bought by running both, not by picking one.** `--iap_tar_loss
+ipatch_cospgd` is still there, and the difference between the two arms IS what the
+cosine weight costs — a row rather than a caveat. The targeted objective now enters the
+directory name (`tarcospgd` for the weighted arm, unmarked for the faithful default), so
+the two cannot land in the same directory, and every record carries `iap_tar_loss`
+either way, so nothing already on disk is ambiguous.
+
+**What the cosine weight actually does**, for the write-up: `1 - cos(softmax, onehot(t))`
+de-emphasises pixels already converted, concentrating gradient on the holdouts. Plain CE
+keeps full weight on every pixel however converted it is, so a scene that flips early
+keeps spending effort there. A real behavioural difference, which is why both exist.
+
+**Also added to `--loss_fn`** in `overfit.py`, `overfit_population.py` and `train.py`,
+purely as a new choice with no default moved, so the matched csf/raw baseline can be run
+under the same objective as the IAP arm. Every existing command line and `config.json`
+keeps its exact meaning.
+
+Deviation count: D1-D10 stand, but the targeted-term deviation is now conditional —
+it applies only under `--iap_tar_loss ipatch_cospgd`, not to the default arm.
+
+507 passed (`test_core.py::test_tv_zero_on_constant` was already failing and is
+unrelated); eight new tests, including the decomposition of the three terms under the
+faithful objective and a check that the two targeted arms are not interchangeable.
