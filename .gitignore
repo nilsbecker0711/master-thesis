@@ -15,3 +15,6 @@ slurm-*.out
 *.txt
 *.sh
 *.log
+
+# shekhar arm: run output (patches, logs, pickled traces)
+shekhar/Experiments/runs/
