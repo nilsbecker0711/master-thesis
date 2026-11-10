@@ -15,3 +15,8 @@ slurm-*.out
 *.txt
 *.sh
 *.log
+*.pdf
+*.pptx
+*.csv
+*.md
+shekhar/
