@@ -1,0 +1,39 @@
+# patch-reach - MAIN environment. Everything that touches a segmentor.
+#
+#   conda env create -f envs/main.yml
+#   conda activate patchreach
+#   pip install numpy==1.26.4 setuptools==60.2.0 ninja==1.13.0
+#   pip install -r envs/requirements-main.txt
+#   pip install -e . --no-deps
+#
+# CONDA SUPPLIES THE INTERPRETER AND A COMPILER, NOTHING ELSE. torch,
+# mmcv-full and mmseg come from pip (requirements-main.txt) on purpose: the
+# mmcv-full 1.5.0 wheel is compiled against the pip `torch 1.11.0+cu113`
+# build, and pairing it with a conda-forge pytorch is how you get an ABI
+# mismatch that only shows up as a segfault inside the first forward.
+#
+# NO cudatoolkit / cuda-runtime either - the pip cu113 wheels bundle their own
+# CUDA runtime. The host needs an NVIDIA driver recent enough for CUDA 11.3
+# and nothing else; on the cluster no `module load cuda` is required.
+#
+# WHY THE COMPILER IS HERE. Two extensions compile against this torch:
+# pycocotools (C) and dcnv3 (CUDA, InternImage). gcc 11.4 from conda-forge is
+# what the recorded env built them with; the system gcc on the login nodes is
+# older and nvcc rejects newer ones. Drop the four toolchain lines if you do
+# not need --arch internimage_* and your wheels all resolve prebuilt.
+#
+# PYTHON 3.9 IS NOT NEGOTIABLE: it is the cluster's python, and the mmcv 1.x
+# wheels on the openmmlab index are built for cp39.
+name: patchreach
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.9
+  - pip
+  - wheel
+  # the toolchain the recorded env compiled its extensions with
+  - gcc_linux-64=11.4
+  - gxx_linux-64=11.4
+  - sysroot_linux-64=2.34
+  - binutils_linux-64=2.40

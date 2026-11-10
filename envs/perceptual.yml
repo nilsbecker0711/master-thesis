@@ -1,0 +1,46 @@
+# patch-reach - PERCEPTUAL environment. All of the perceptual analysis.
+#
+#   conda env create -f envs/perceptual.yml
+#   conda activate lpips_eval
+#   pip install -r envs/requirements-perceptual.txt
+#   pip install -e . --no-deps
+#
+# THE ENV NAME IS `lpips_eval` FOR COMPATIBILITY, not because LPIPS is all it
+# does: it is what scripts/lpips_eval.py's docstring and the SLURM launchers
+# already say, and renaming it would only break those. The file is named for
+# what it actually covers - every perceptual/visibility metric in the thesis.
+#
+# SEPARATE FROM THE MAIN ENV ON PURPOSE. The main env is pinned to torch 1.11
+# + mmcv 1.x and the metric packages do not install into it. Nothing here
+# constructs a segmentor, so nothing from the mmseg stack belongs here; the
+# reasoning is in requirements-perceptual.txt.
+#
+# CONDA SUPPLIES THE INTERPRETER AND THE SCIENTIFIC BASE. torch and every
+# metric package come from pip, because that is how the recorded env was
+# built and because pyiqa / cvvdp / lpips are pure-python wheels on top of
+# torch that add no CUDA constraints of their own.
+#
+# NUMPY COMES FROM PIP (2.2.6), and pip overwrites whatever conda's
+# scipy/pandas/matplotlib pulled in. That is what the recorded env looks like
+# and it is consistent - those three are built against the numpy 2 ABI here -
+# but it is the one place where `conda list` shows a pip package shadowing a
+# conda one, so do not "fix" it by pinning numpy on both sides.
+#
+# PYTHON 3.10: pyiqa 0.1.16 and cvvdp 0.5.7 both resolve on it, and numba
+# 0.68 (cvvdp's hot loops) has no cp39 wheel for this llvmlite.
+name: lpips_eval
+channels:
+  - conda-forge
+dependencies:
+  - python=3.10
+  - pip
+  - scipy=1.15.2         # lpips imports scipy.ndimage at top level
+  - tqdm=4.70            # lpips imports tqdm at top level
+  - pillow=12.3
+  - matplotlib=3.9.4     # the panels; Agg is enough, see below
+  - pandas=2.3.3
+  - pyyaml=6.0.3
+  # The recorded env also carries pyside6 + qt6-main, dragged in by an
+  # interactive matplotlib backend. ~1 GB of Qt that nothing here needs: the
+  # panels are written to PNG through Agg. Left out deliberately; add
+  # `- pyside6` only if you want to open figures in a window.

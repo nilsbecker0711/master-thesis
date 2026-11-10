@@ -1,0 +1,32 @@
+# patch-reach - SAM 3 environment. The cross-paradigm transfer arm only.
+#
+#   conda env create -f envs/sam3.yml
+#   conda activate sam3
+#   pip install -r envs/requirements-sam3.txt
+#   git clone https://github.com/facebookresearch/sam3.git    # into the repo root
+#   pip install -e sam3
+#   pip install -e . --no-deps
+#
+# A THIRD ENV BECAUSE TWO WOULD NOT DO. SAM 3 wants a current torch (2.10 +
+# cu128) and mmcv-full 1.5.0 is a compiled extension built against torch 1.11's
+# ABI, so the main env cannot host it. scripts/sam3_transfer.py is written for
+# that split: it imports nothing from patchreach.models.
+#
+# CONDA SUPPLIES THE INTERPRETER AND NOTHING ELSE - no numpy, no matplotlib,
+# no cudatoolkit. Every runtime package comes from pip
+# (requirements-sam3.txt), because torch 2.10+cu128 and sam3 itself are only
+# available as pip/source installs and mixing a conda numpy underneath them is
+# how you get two numpy resolutions in one env.
+#
+# PYTHON 3.12 is what SAM 3's own setup resolves against; the thesis' numpy
+# pin (1.26.4) still has a cp312 wheel, so nothing is forced upwards.
+#
+# A DRIVER NEW ENOUGH FOR CUDA 12.8 is the only host requirement; the wheels
+# bundle their own CUDA runtime, so no `module load cuda` on the cluster.
+name: sam3
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.12
+  - pip

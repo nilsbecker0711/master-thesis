@@ -443,7 +443,7 @@ def build_metrics(names, device, spatial: bool = False):
                       f"{', '.join(ALL_METRICS)}")
         except ImportError as e:
             print(f"[skip] {name}: {e}. pip install pyiqa / cvvdp into the "
-                  f"evaluation env (see envs/lpips_eval.yml).")
+                  f"evaluation env (see envs/perceptual.yml).")
         except Exception as e:                      # a model that will not load
             print(f"[skip] {name}: {type(e).__name__}: {e}")
     if not out:

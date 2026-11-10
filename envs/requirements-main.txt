@@ -1,0 +1,158 @@
+# patch-reach - MAIN environment. Everything that touches a segmentor.
+#
+# This is the env the overwhelming majority of the thesis ran under: every
+# attack, evaluation, defence and analysis script (scripts/train.py,
+# overfit.py, overfit_population.py, evaluate.py, transfer_matrix.py,
+# clean_baseline.py, measure_*.py, sweep_operating_point.py, iap_attack.py,
+# defences/, analysis/). On the cluster it is
+# $WS/miniconda3/envs/thesis_backup3 and the SLURM launchers call that
+# interpreter by absolute path rather than `conda activate` (that conda install
+# moved from /hkfs to /pfs and its shebangs still point at the old path).
+#
+# THE WHOLE STACK IS PINNED BY ONE DECISION: mmcv 1.x + mmseg 0.x.
+# patchreach calls `from mmcv import Config` and `mmseg.models.build_segmentor`
+# - the 1.x/0.x API, not the 2.x one - and the released checkpoints were
+# trained under it. mmcv-full 1.5.0 is compiled against torch 1.11.0+cu113, so
+# torch is pinned BY mmcv rather than the other way round. Treat
+# torch / torchvision / mmcv-full / mmsegmentation / mmdet / mmcls as one
+# atomic set: moving any one of them means rebuilding mmcv from source and
+# revalidating every number in the results chapter, because mmcv/mmseg minor
+# versions move the config schema and a config that builds a DIFFERENT variant
+# from the checkpoint loads with missing-key warnings and still runs.
+#
+# A SINGLE `pip install -r` IS NOT ENOUGH. pycocotools compiles at install
+# time, and mmcv-full compiles too whenever no wheel matches the resolved
+# torch, so numpy, setuptools and ninja have to be importable BEFORE the
+# resolver gets that far. The order below is not cosmetic:
+#
+#   conda env create -f envs/main.yml
+#   conda activate patchreach
+#   pip install numpy==1.26.4 setuptools==60.2.0 ninja==1.13.0
+#   pip install -r envs/requirements-main.txt
+#   pip install -e . --no-deps          # patchreach itself; deps are above
+#
+# STILL MISSING AFTERWARDS, both on purpose:
+#   dcnv3        compiled from InternImage source, see the bottom of this file
+#   checkpoints  `mim download mmsegmentation --config <name> --dest ...`
+# SegFormer (b0-b5), SETR, Swin/UPerNet, PSPNet and the DeepLabs all run
+# without dcnv3; only --arch internimage_* needs it.
+
+# NEITHER INDEX IS OPTIONAL. cu113 torch is not on PyPI and mmcv-full wheels
+# are not either. The mmcv index is per (CUDA, torch) pair, so these two lines
+# are a matched pair: changing one invalidates the other.
+--extra-index-url https://download.pytorch.org/whl/cu113
+--find-links https://download.openmmlab.com/mmcv/dist/cu113/torch1.11.0/index.html
+
+# --- build prerequisites (install first, see header) -------------------------
+numpy==1.26.4             # <2: mmcv 1.x and mmseg 0.x predate the numpy 2 ABI
+setuptools==60.2.0        # openxlab/openmim still run `python setup.py`
+ninja==1.13.0             # parallel nvcc for the mmcv / dcnv3 extensions
+
+# --- the pinned quintuple ----------------------------------------------------
+torch==1.11.0+cu113
+torchvision==0.12.0+cu113
+mmcv-full==1.5.0
+mmsegmentation==0.27.0
+mmdet==2.28.1             # pulled in by a few mmseg configs
+mmcls==0.25.0             # Swin / ConvNeXt backbones live here
+
+# --- everything else, as frozen from the working env ------------------------
+addict==2.4.0             # mmcv Config
+aliyun-python-sdk-core==2.16.0
+aliyun-python-sdk-kms==2.16.5
+annotated-doc==0.0.4
+anyio==4.12.1
+asttokens==3.0.1
+certifi==2026.6.17
+cffi==2.0.0
+charset-normalizer==3.4.7
+click==8.1.8
+colorama==0.4.6
+contourpy==1.3.0
+crcmod==1.7
+cryptography==49.0.0
+cycler==0.12.1
+decorator==5.3.1
+exceptiongroup==1.3.1
+executing==2.2.1
+filelock==3.14.0
+fonttools==4.60.2
+fsspec==2025.10.0
+h11==0.16.0
+hf-xet==1.5.1
+httpcore==1.0.9
+httpx==0.28.1
+huggingface-hub==1.8.0
+idna==3.18
+importlib-metadata==8.7.1
+importlib-resources==6.5.2
+ipdb==0.13.13
+ipython==8.18.1
+jedi==0.19.2
+jmespath==0.10.0
+kiwisolver==1.4.7
+markdown==3.9
+markdown-it-py==3.0.0
+matplotlib==3.9.4
+matplotlib-inline==0.2.2
+mdurl==0.1.2
+model-index==0.1.11
+opencv-python==5.0.0.93
+opendatalab==0.0.10
+openmim==0.3.9            # how mmcv-full and the checkpoints are fetched
+openxlab==0.1.3
+ordered-set==4.1.0
+oss2==2.17.0
+packaging==24.2
+pandas==2.3.3
+parso==0.8.7
+pexpect==4.9.0
+pillow==11.3.0
+platformdirs==4.4.0
+prettytable==3.16.0       # mmseg's eval tables, and this repo's own
+prompt-toolkit==3.0.52
+protobuf==6.33.6
+ptyprocess==0.7.0
+pure-eval==0.2.3
+pycocotools==2.0.11       # compiles; needs numpy already installed
+pycparser==2.23
+pycryptodome==3.23.0
+pygments==2.20.0
+pyparsing==3.3.2
+python-dateutil==2.9.0.post0
+pytz==2023.4
+pyyaml==6.0.3
+requests==2.28.2          # <2.29 is openxlab's constraint, not a choice
+rich==13.4.2
+scipy==1.13.1
+shellingham==1.5.4
+six==1.17.0
+stack-data==0.6.3
+tabulate==0.9.0
+tensorboardX==2.6.5
+terminaltables==3.1.10
+timm==0.6.11              # 0.6.x: mmcls 0.25 imports the pre-1.0 layout
+tomli==2.4.1
+torch-fidelity==0.4.0
+torchmetrics==0.11.4      # SSIM/PSNR for the IAP arm; later majors moved the
+                          # import path for the image metrics
+torchsummary==1.5.1
+tqdm==4.65.2
+traitlets==5.15.1
+typer==0.23.2
+typing-extensions==4.16.0
+tzdata==2026.3
+urllib3==1.26.20          # <2: pinned by requests 2.28
+wcwidth==0.8.2
+yapf==0.32.0              # mmcv imports it at config-parse time
+zipp==3.23.1
+
+# --- NOT pip-installable: dcnv3 1.0 -----------------------------------------
+# InternImage's deformable-convolution CUDA op. It is a source tree, not a
+# release, and it must be built against the torch above with the conda gcc 11.4
+# that envs/main.yml provides:
+#
+#   git clone https://github.com/OpenGVLab/InternImage.git
+#   cd InternImage/segmentation/ops_dcnv3 && python setup.py build install
+#
+# Only --arch internimage_* needs it. Skip it unless that row is required.
