@@ -1,9 +1,4 @@
-r"""
-Cheap invariant tests. Run with: pytest -q
-
-Each of these encodes a bug that actually cost a run in the previous codebase.
-They take seconds; the bugs took hours to find.
-"""
+"""Cheap invariant tests."""
 import numpy as np
 import pytest
 
@@ -39,9 +34,9 @@ def test_tv_zero_on_constant():
 
 def test_largest_component_drops_specks():
     m = torch.zeros(32, 32, dtype=torch.bool)
-    m[8:24, 8:24] = True          # object
-    m[2, 2] = True                # speck
-    m[29:31, 28:31] = True        # speck
+    m[8:24, 8:24] = True
+    m[2, 2] = True
+    m[29:31, 28:31] = True
     out = largest_component(m)
     assert out.sum() == 16 * 16
     assert out[8:24, 8:24].all()
@@ -50,7 +45,7 @@ def test_largest_component_drops_specks():
 def test_semantic_placement_finds_class():
     """Road in the lower half -> the window must land in the lower half."""
     pred = torch.zeros(40, 80, dtype=torch.long)
-    pred[:18, :] = 2              # building on top
+    pred[:18, :] = 2
     top, _ = find_semantic_placement(pred, cls=0, p=12)
     assert top >= 18
 
@@ -61,34 +56,22 @@ def test_semantic_placement_absent_class_falls_back_to_centre():
                                                            (80 - 12) // 2)
 
 
-# ═════════════════════════════════════════════════════════════════════════════
-#  mIoU class set — the bug that made an inert attack look beneficial
-# ═════════════════════════════════════════════════════════════════════════════
-
 def test_union_class_set_lets_a_rare_class_swing_miou():
-    """
-    THE FAILURE THIS PINS. Under 'union' a class with no ground truth that the
-    model nevertheless predicts scores IoU=0 and drags the nanmean down.
-    Suppress that prediction and the class leaves the denominator entirely and
-    the mean JUMPS — which made a 150-epoch run report drop_remote = -3.63,
-    i.e. the attack apparently improving the model, on 0.86% of pixels flipped.
-    """
+    """THE FAILURE THIS PINS."""
     from patchreach.metrics.miou import SegMetric
 
     labels = torch.zeros(1, 100, 100, dtype=torch.long)
-    labels[:, 50:] = 1                       # only classes 0 and 1 in GT
+    labels[:, 50:] = 1
 
     clean = SegMetric(19)
     pred = labels.clone()
-    pred[:, 0, :5] = 16                      # 5 spurious px of a GT-absent class
+    pred[:, 0, :5] = 16
     clean.update(pred, labels)
 
     adv = SegMetric(19)
-    adv.update(labels.clone(), labels)       # attack removed them; else perfect
+    adv.update(labels.clone(), labels)
 
-    # union: the "attack" looks hugely beneficial
     assert clean.compute("union") < adv.compute("union") - 20
-    # gt: the class is never counted in either pass, so nothing moves
     assert clean.compute("gt") == pytest.approx(adv.compute("gt"), abs=0.5)
 
 
@@ -98,7 +81,7 @@ def test_gt_class_set_is_identical_for_clean_and_adv():
     labels = torch.randint(0, 4, (1, 64, 64))
     a, b = SegMetric(19), SegMetric(19)
     a.update(labels.clone(), labels)
-    b.update(torch.randint(0, 19, (1, 64, 64)), labels)   # wildly different
+    b.update(torch.randint(0, 19, (1, 64, 64)), labels)
     assert a.n_counted("gt") == b.n_counted("gt")
     assert a.n_counted("union") != b.n_counted("union")
 

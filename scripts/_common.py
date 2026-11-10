@@ -1,4 +1,4 @@
-"""Shared CLI plumbing. Keeps the entry points thin and consistent."""
+"""Shared CLI plumbing."""
 from __future__ import annotations
 
 import argparse
@@ -15,9 +15,6 @@ from patchreach.models.wrapper import (SlidingWindowSegModel, WrappedSegModel,
                                        low_precision_dtype)
 from patchreach.utils import get_device, seed_everything, channel_probe
 
-# Ten fixed val images. EVERY number in the thesis is reported on these, so
-# scene-to-scene variance (which is large for contestability) is measured
-# rather than accidental.
 FIXED10 = [430, 46, 441, 331, 45, 162, 195, 424, 91, 353]
 
 
@@ -184,11 +181,7 @@ def add_patch_args(p):
 
 
 def add_tsallis_args(p):
-    """
-    Tsallis attack objective (--loss_fn tsallis). Guarded like add_csf_args
-    and add_cam_args so a parser that ever takes two of these groups does not
-    raise on duplicate option strings.
-    """
+    """Tsallis attack objective (--loss_fn tsallis)."""
     if any(a.option_strings and "--tsallis_q" in a.option_strings
            for a in p._actions):
         return p
@@ -218,16 +211,7 @@ def add_tsallis_args(p):
 
 
 def tsallis_tag(a) -> str:
-    """
-    Run-directory slug for the active q, or '' for every other loss_fn.
-
-    Without it a q sweep writes every arm under the SAME name and
-    increment_path silently disambiguates with _2, _3, _4. The data survives;
-    nothing in the path says which q produced it, and a sweep is exactly the
-    situation where that is the only thing you need to know.
-
-    One definition, used by all four entry points that name a run.
-    """
+    """Run-directory slug for the active q, or '' for every other loss_fn."""
     if getattr(a, "loss_fn", None) != "tsallis":
         return ""
     if getattr(a, "tsallis_schedule", "const") == "const":
@@ -237,22 +221,7 @@ def tsallis_tag(a) -> str:
 
 
 def tsallis_kwargs(src, total_steps: int = 1) -> dict:
-    """
-    argparse namespace (or a saved config dict) -> the tsallis_* keywords
-    adversarial.build() and segmentation_cam.build() take.
-
-    ONE mapping, for the same reason add_patch_args exists: four entry points
-    now construct an attack objective, and a q field that reaches train.py but
-    not overfit.py is precisely the drift that put three bugs into this
-    repository before the argument parsers were centralised.
-
-    `total_steps` is the schedule's horizon and differs per entry point — the
-    step count for a single-image attack, epochs x batches for a universal one.
-    It is only a fallback: on_step_begin() re-supplies it every step.
-
-    Reads with defaults because export_conditional_patches.py resolves against
-    a TRAINING CONFIG that may predate these flags entirely.
-    """
+    """argparse namespace (or a saved config dict) -> the tsallis_* keywords adversarial.build() and segmentation_cam.build() take."""
     get = (src.get if isinstance(src, dict)
            else lambda k, d: getattr(src, k, d))
     return {"tsallis_q": get("tsallis_q", 0.0),
@@ -263,19 +232,7 @@ def tsallis_kwargs(src, total_steps: int = 1) -> dict:
 
 
 def add_cam_args(p):
-    r"""
-    Sensitivity-map arguments — shared by add_patch_args and
-    add_generator_args, one definition.
-
-    These used to live only on the generator, because gradcam placement lived
-    only on the generator. --placement gradcam brings the same policy to the
-    per-image patch modes, and it needs the same map, built the same way. A
-    second copy of these flags is exactly the drift that put three bugs into
-    train.py/overfit.py before add_patch_args existed.
-
-    Guarded like add_csf_args so a parser that ever takes BOTH groups does not
-    raise on the duplicate option strings.
-    """
+    """Sensitivity-map arguments — shared by add_patch_args and add_generator_args, one definition."""
     if any(a.option_strings and "--cam_objective" in a.option_strings
            for a in p._actions):
         return p
@@ -366,26 +323,15 @@ def add_csf_args(p):
 
 
 def add_generator_args(p):
-    r"""
-    Image-conditioned generator (--mode conditional_generator).
-
-    A SEPARATE argument group from add_patch_args on purpose. The generator is
-    a different threat model, not another patch_mode: raw/lap/gan/raw_ganinit
-    all optimise ONE patch tensor, while here theta is shared across the
-    dataset and the patch is a FUNCTION of the image. Folding it into
-    --patch_mode would have let it inherit reference/shape/init_from semantics
-    that do not apply, and would have put a second meaning on Patch.param.
-    """
+    """Image-conditioned generator (--mode conditional_generator)."""
     g = p.add_argument_group("conditional generator")
 
-    # ── geometry ─────────────────────────────────────────────────────────────
     g.add_argument("--patch_size", type=int, default=128,
                    help="S — the generator's output resolution")
     g.add_argument("--patch_scale", type=float, default=0.25,
                    help="patch side as a fraction of image HEIGHT; "
                         "p = int(H*scale), the same rule Patch.apply() uses")
 
-    # ── architecture (saved as generator_config) ─────────────────────────────
     g.add_argument("--gen_base_ch", type=int, default=32)
     g.add_argument("--gen_depth", type=int, default=3,
                    help="U-Net downsampling levels; patch_size must be "
@@ -407,18 +353,12 @@ def add_generator_args(p):
                         "Evaluation always uses the prior mean (zeros) so the "
                         "reported test-time patch is reproducible.")
 
-    # ── perceptual constraint (--gen_residual csf) ───────────────────────────
     add_csf_args(p)
 
-    # ── sensitivity map ──────────────────────────────────────────────────────
     add_cam_args(p)
 
-    # ── attack objective (--loss_fn tsallis) ─────────────────────────────────
-    # The generator is a different threat model but the SAME attack losses, so
-    # it takes the same objective flags rather than a second copy of them.
     add_tsallis_args(p)
 
-    # ── placement ────────────────────────────────────────────────────────────
     g.add_argument("--gen_placement", default="gradcam",
                    choices=["center", "gradcam", "semantic", "fixed"],
                    help="ABLATION A vs B. gradcam = argmax over MeanPool(M_i). "
@@ -437,7 +377,6 @@ def add_generator_args(p):
                         "edge, where ~half its receptive field lies outside "
                         "the image. Try p/2 (64 at the default geometry).")
 
-    # ── reference source ─────────────────────────────────────────────────────
     g.add_argument("--gen_reference", default="center",
                    choices=["center", "window"],
                    help="where r_i is sampled. 'center' is the centre crop. "
@@ -447,7 +386,6 @@ def add_generator_args(p):
                         "With 'window' baseline A becomes a literal no-op, so "
                         "every point of degradation is the generator's.")
 
-    # ── LAP constraint ───────────────────────────────────────────────────────
     g.add_argument("--gen_lap_alpha", type=float, default=0.0,
                    help="ABLATION C vs D. L_rat weight. DEFAULT 0: L_rat and "
                         "L_tv are SUMS (1e2-1e4) while the attack losses are "
@@ -472,7 +410,7 @@ def build_generator_config(a):
 
 
 def setup_model(a):
-    """(model, n_channels, n_active, spec). Prints the identity checks."""
+    """(model, n_channels, n_active, spec)."""
     if not getattr(a, "cityscapes_root", None):
         raise SystemExit("--cityscapes_root is required (or set it in --config)")
     cfg, weights, spec = resolve(a.arch, a.cfg_path, a.weights)
@@ -487,11 +425,6 @@ def setup_model(a):
            torch.bfloat16: "[prec] bf16 (autocast)",
            torch.float16: "[prec] fp16 (autocast, grad-scaled)"}[amp_dtype])
 
-    # Inference mode is decided ONCE, here, by wrapping the model — so the ~30
-    # `model(x)` forwards across scripts/ and patchreach/ honour it without any
-    # per-call branching. test_cfg rides on cfg.model, which build_segmentor
-    # attaches to the segmentor, so crop and stride come from the checkpoint's
-    # own config and nothing is hard-coded per architecture.
     tc = getattr(model.model, "test_cfg", None) or {}
     want = getattr(a, "inference", "whole")
     if want == "slide" or (want == "auto" and tc.get("mode") == "slide"):
@@ -516,14 +449,7 @@ def setup_model(a):
 
 
 def make_dataset(a, split, random_crop=None):
-    """
-    CityscapesSeg honouring --img_h/--img_w and --scale.
-
-    Single construction point so `--scale crop` cannot be silently ignored by
-    one script while another honours it. random_crop defaults to True on the
-    train split under scale='crop' (a fixed centre crop every epoch would give
-    universal-patch training no scene diversity) and False everywhere else.
-    """
+    """CityscapesSeg honouring --img_h/--img_w and --scale."""
     if random_crop is None:
         random_crop = (split == "train")
     return CityscapesSeg(a.cityscapes_root, split, a.img_h, a.img_w,

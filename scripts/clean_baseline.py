@@ -1,32 +1,5 @@
 #!/usr/bin/env python
-r"""
-Block 0.1 — clean DATASET mIoU per architecture and resolution. No patch.
-
-    python scripts/clean_baseline.py --arch segformer_b0 \
-        --cityscapes_root $CS --img_h 512 --img_w 1024 --n_images 20
-
-WHY THIS RUNS FIRST: you cannot compare two models until both are healthy. If
-one is outside its trained regime, every attack number downstream conflates
-"attack worked" with "model was already broken". Pick the resolution where BOTH
-land near published values — that is your fair comparison point, and running
-each at its own native scale would confound architecture with resolution.
-
-DATASET vs PER-IMAGE mIoU: this reports DATASET mIoU, accumulated over one
-confusion matrix across all images. That is what published numbers are. A
-per-image mIoU averages over only the classes present in that image, so a rare
-class covering a few hundred pixels scores near zero and drags the mean down —
-50 per-image is normal for a model that scores 76 on the dataset. Do not
-compare the two.
-
-WHOLE vs SLIDE INFERENCE — the other half of reproducing a published number.
-DeepLab and UNet declare test_cfg=dict(mode='whole'), so a single forward IS
-their published procedure. SegFormer and SETR declare mode='slide', and their
-published Cityscapes numbers come from overlapping crops; a whole forward reads
-several points low for them. --inference auto honours whatever the config
-declares, which is what you want when checking a checkpoint against the zoo.
-The default stays 'whole' so every other script's behaviour is unchanged, and
-the attack path never uses slide at all.
-"""
+"""Block 0.1 — clean DATASET mIoU per architecture and resolution."""
 from __future__ import annotations
 
 import argparse
@@ -64,19 +37,12 @@ def main():
     p.add_argument("--out", default=f"results/clean_baselines")
     p.add_argument("--tag", type=str, default=None)
     a = p.parse_args()
-    # The tag is folded in ONCE, here. It used to be applied again where the
-    # file is written, which produced 'clean_baselines_x.json_x' — tag twice,
-    # and the .json buried mid-name. Strip any .json the caller passed so
-    # --out foo.json --tag x lands on foo_x.json rather than foo.json_x.json.
     _stem = a.out[:-5] if a.out.endswith(".json") else a.out
     a.out = f"{_stem}_{a.tag}.json" if a.tag else f"{_stem}.json"
     seed_everything(a.seed)
     device = get_device()
     model, n_ch, n_act, spec = setup_model(a)
 
-    # setup_model already wrapped the model for --inference, so model(img)
-    # slides or not by construction; only the warning and the record need to
-    # know which happened.
     mode = getattr(model, "mode", "whole")
     if mode == "slide":
         print(SLIDE_WARNING)
@@ -106,7 +72,6 @@ def main():
     print(f"{'='*66}")
     print(f"  DATASET mIoU  : {dataset_miou:.2f}   <- compare to published")
     pim = torch.tensor(per_image)
-    # std of one value is NaN (and a torch warning); a single image has none.
     std = float(pim.std()) if len(pim) > 1 else 0.0
     print(f"  per-image mIoU: {pim.mean():.2f} +/- {std:.2f} "
           f"(range {pim.min():.2f}-{pim.max():.2f})")

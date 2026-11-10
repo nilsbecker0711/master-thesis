@@ -1,41 +1,5 @@
 #!/usr/bin/env python
-r"""
-Evaluate a trained patch on a fixed image set. NO TRAINING.
-
-    python scripts/evaluate.py --checkpoint results/runs/<id>/best.pt \
-        --arch segformer_b0 --cityscapes_root $CS --img_h 512 --img_w 1024 \
-        --from_image
-
---from_image IS REQUIRED FOR mode='csf' and the script refuses without it. The
-checkpoint stores the parameter and the placement; the BASE is the image region
-the patch covers and is rebuilt per image, so evaluating without it silently
-substitutes flat grey for scene content.
-
-RESOLUTION TRANSFER: pass an --img_h/--img_w different from training. Nothing
-in the patch is tied to resolution — the checkpoint stores the parameter, and
-the renderer resizes it — so the full transfer matrix is evaluation-only.
-The OFF-DIAGONAL is the result: the diagonal says patches work, the
-off-diagonal says whether they TRANSFER, and those are different claims.
-
---patch_png EVALUATES A PNG. Two ways, and they answer different questions:
-
-    --checkpoint best.pt --patch_png best_patch.png
-        the checkpoint's patch, parameterised from the PNG instead of from
-        `param`. mode='raw' only. Size, scale, scale_ref, shape and the
-        RESOLVED placement still come from the checkpoint, so this is the same
-        patch in the same place, and the deviation -- the 8-bit quantisation
-        -- is printed. Use it to check the PNG against the parameter.
-
-    --patch_png patch.png          (no checkpoint)
-        a square raw patch pasted at the CENTRE, at its own pixel size unless
-        --patch_scale says otherwise. Nothing else is needed, and nothing else
-        is assumed: non-square is refused, because a cutout's silhouette is
-        not in an RGB render. Use it for a patch that arrived as a PNG and
-        never had a patchreach checkpoint -- an external universal patch.
-
-Evaluation is cheap and training is not, so evaluate every configuration on the
-same fixed images rather than training more.
-"""
+"""Evaluate a trained patch on a fixed image set."""
 from __future__ import annotations
 
 import argparse
@@ -112,10 +76,6 @@ def main():
     mean_t, std_t = norm_tensors(device)
 
     if a.checkpoint is None:
-        # THE PNG ALONE. Patch.from_png fixes what a PNG cannot carry — raw
-        # pixels, square, centre — and refuses the cases where that would be
-        # a lie. There is no stored config here to be inconsistent with, so
-        # pcfg is the one it built.
         patch = Patch.from_png(a.patch_png, device, mean_t, std_t,
                                a.img_h, a.patch_scale)
         pcfg = asdict(patch.cfg)
@@ -134,12 +94,6 @@ def main():
             G.eval().to(device)
         patch = Patch.load(a.checkpoint, device, mean_t, std_t, generator=G)
 
-    # REFUSE RATHER THAN RENDER A GREY SQUARE. Patch.load restores `param` and
-    # `placement`; `reference` is NOT in the checkpoint, and `from_image` is a
-    # script flag rather than a PatchConfig field, so it cannot round-trip.
-    # A csf patch rendered with reference=None takes the 0.5 grey fallback in
-    # Patch.render() — the failure --patch_mode's own help text warns about —
-    # and every number below would silently describe a different patch.
     if a.checkpoint and pcfg.get("mode") == "csf" and not a.from_image:
         raise SystemExit(
             "\nThis checkpoint is mode='csf'. Its base is the image region the\n"
@@ -151,9 +105,6 @@ def main():
             "square with an invisible texture, and drop_remote describes that\n"
             "square rather than the residual under test.\n")
 
-    # BEFORE describe(), so every line it logs describes the patch actually
-    # evaluated. Patch.param_from_png refuses any mode but 'raw', where the
-    # PNG is the whole patch.
     png_delta = (patch.param_from_png(a.patch_png)
                  if a.patch_png and a.checkpoint else None)
 
@@ -162,9 +113,6 @@ def main():
 
     print(f"\n[patch] loaded {a.checkpoint or a.patch_png}")
     if png_delta is not None:
-        # PRINTED rather than asserted against a bound: it is the 8-bit
-        # quantisation of the render, and it belongs in the log next to the
-        # drop it produced.
         print(f"[patch] parameter REPLACED by the pixels of {a.patch_png}")
         print(f"[patch] max |png - checkpoint render| {png_delta:.6f}  "
               f"(one 8-bit step is 1/255 = {1 / 255:.6f})")
@@ -173,8 +121,6 @@ def main():
         print(f"[patch] FROM THE PNG ALONE: square raw patch at the centre, "
               f"scale {patch.cfg.scale:.6g} of height" + own)
         if patch.side(a.img_h, a.img_w) != patch.cfg.size:
-            # Resampling has no off switch, so say it rather than let
-            # describe()'s two numbers pass as a formality.
             print(f"[patch] WARNING   : the PNG is {patch.cfg.size}px but "
                   f"pastes at {patch.side(a.img_h, a.img_w)}px, so it is "
                   f"RESAMPLED. Pass --patch_scale "
@@ -184,8 +130,6 @@ def main():
     ds = make_dataset(a, "val")
     idxs = image_indices(a.images, len(ds))
 
-    # 'png' in the tag so a PNG-sourced run never lands in the same
-    # directory as the checkpoint-sourced run it is compared against.
     tag = "_".join(x for x in [Path(a.checkpoint or a.patch_png).parent.name,
                                f"eval{a.img_h}x{a.img_w}",
                                "png" if a.patch_png else "", a.tag] if x)
@@ -202,13 +146,7 @@ def main():
         hw = label.shape[-2:]
         with torch.no_grad():
             lc = upsample_to(model(img), hw)
-            # placement is resolved per image; semantic placement depends on
-            # scene content, so a fixed offset would be wrong here
             patch.resolve_placement(a.img_h, a.img_w, lc.argmax(1)[0])
-            # AFTER resolve_placement, never before: set_reference_from_image
-            # copies the region at the RESOLVED placement, so the order here
-            # matches optimise.prepare() and semantic/gradcam placement stays
-            # consistent between training and evaluation.
             if a.from_image:
                 patch.set_reference_from_image(img, mean_t, std_t)
             patched, fp = patch.apply(img)
@@ -231,8 +169,6 @@ def main():
         print(f"  img {i:4d}: drop_remote {cr-ar:+6.2f}  "
               f"any_flip {rates['any_flip_rate']:5.1f}%")
 
-        # Labelled figures for EVERY evaluated image, not only the one that
-        # gets the full diagnostic suite.
         if not a.no_panels:
             d = out_dir / "panels" / f"img{i:04d}"
             report.save_panels(img, label, patched, lc, la, fp, patch,
@@ -241,8 +177,6 @@ def main():
                 lc, la, label, a.num_classes, d / "per_class_iou.png", tgt,
                 title=f"val image {i}")
 
-        # Full suite (ERF probe, confusion, margins) on one image only — the
-        # probe costs n_probes extra forward passes.
         if i == a.diagnostics_on:
             report.run(model, img, label, patch, out_dir / f"diag_img{i}",
                        loss_fn, a.num_classes, tgt, mean_t, std_t)
@@ -270,9 +204,6 @@ def main():
 
     with open(out_dir / "results.json", "w") as f:
         json.dump({"checkpoint": a.checkpoint,
-                   # which file the PARAMETER came from.
-                   # patch_config below is the checkpoint's either
-                   # way, because that is where it came from.
                    "param_source": a.patch_png or a.checkpoint,
                    "config": vars(a),
                    "patch_config": pcfg, "aggregate": agg,

@@ -1,50 +1,5 @@
 #!/usr/bin/env python
-r"""
-IAP (Dutta & Zhang, ICCV 2025) against this repository's segmentors — the
-comparison arm for csf.
-
-    conda activate iap            # envs/iap.yml
-    python scripts/iap_attack.py --arch segformer --cityscapes_root $CS \
-        --images fixed10 --target_class 16
-
-WHAT THIS IS FOR
-----------------
-csf and IAP answer the same question — "bound how visible the patch is" — with
-two different visibility models: a contrast sensitivity function over spatial
-frequency, and a pixel-local texture map. The thesis needs them measured under
-ONE dataset, ONE set of architectures and ONE geometry, or the comparison is
-between two papers rather than between two models of visibility.
-
-So the procedure here is IAP's, reproduced from its released code, and
-everything around it is this repository's: the segmentors, Cityscapes at
-1024x2048, a 256px patch, remote mIoU outside the footprint, the attack-rate
-metrics, and the segmentation objectives from losses/adversarial.py in place of
-IAP's classification cross-entropies. patchreach/patch/iap.py carries the
-procedure and names all ten deviations (D1-D10); read that before quoting a
-number from here.
-
-ONE PATCH PER IMAGE. IAP is a per-image attack and this is its population
-form, so the right neighbour for these numbers is overfit_population.py — NOT
-train.py, which optimises one tensor across the dataset under a strictly harder
-threat model. Do not merge the two sets of rows.
-
-WHAT IT COSTS. The ladder is three learning rates x 1000 steps, restarted per
-rung, and the early stop almost never fires in segmentation (D5), so budget
-~3000 forward+backward passes per image at full resolution. At 1024x2048 that
-is tens of minutes per image. --iap_steps and --iap_lrs are the two knobs;
-cutting either makes the run cheaper and no longer IAP's own setting, so say
-which you used.
-
-STEALTHINESS. SSIM and PSNR, footprint and whole frame, are computed here
-because the reference computes them. Everything else the paper reports — LPIPS,
-CLIPScore, UIQ, SRE — comes from scripts/lpips_eval.py, which runs in its own
-environment and discovers this script's runs automatically: the panel PNGs and
-the per-image best.pt/final.pt are written in the layout its `png` and
-`checkpoint` sources already read.
-
-    conda activate lpips_eval
-    python scripts/lpips_eval.py results/iap/segformer_* --metrics all
-"""
+"""IAP (Dutta & Zhang, ICCV 2025) against this repository's segmentors — the comparison arm for csf."""
 from __future__ import annotations
 
 import argparse
@@ -74,22 +29,9 @@ def build_parser():
                     "objectives, one patch per image",
         formatter_class=argparse.RawDescriptionHelpFormatter)))
 
-    # ── the geometry, defaulted to the thesis's and not to the module's ──────
-    # Every experiment in this thesis is at 1024x2048 with a 256px patch, and
-    # add_model_args defaults to 512x1024 because that is what the pre-2026-09
-    # runs used. Inheriting that default here would silently measure IAP at a
-    # resolution nothing else is measured at. --patch_scale 0.25 of 1024 IS
-    # 256, which is the equality iap.prepare() refuses to run without.
     p.set_defaults(img_h=1024, img_w=2048, patch_size=256, patch_scale=0.25,
                    patch_mode="raw", pixel_param="direct",
-                   # IAP's delta IS the image region; this is not optional and
-                   # is asserted in prepare(). Kept visible as a default
-                   # rather than hidden, because the flag appears in config.json.
                    raw_init="grey",
-                   # Classification Grad-CAM differentiates the predicted
-                   # class's score. 'ce' + 'pred' is its segmentation analogue:
-                   # S_seg = mean_i log p(argmax_i), the model's own prediction,
-                   # no labels. See D2.
                    cam_objective="ce", cam_target="pred")
 
     g = p.add_argument_group("IAP")
@@ -219,10 +161,7 @@ def resolve_images(a, n_val: int):
 
 
 def check_args(a, p):
-    r"""
-    Refusals, each of which would otherwise produce a plausible number for a
-    procedure that did not run.
-    """
+    """Refusals, each of which would otherwise produce a plausible number for a procedure that did not run."""
     want = iap_mod.REF_PATCH_SIDE
     side = int(a.img_h * a.patch_scale)
     if side != a.patch_size:
@@ -234,13 +173,6 @@ def check_args(a, p):
             f"three of its four parts describe a different signal. Set "
             f"--patch_size {side}, or --patch_scale "
             f"{a.patch_size / a.img_h:g}.")
-    # NO --slide_checkpoint REFUSAL, and the history is worth keeping. It began
-    # as a blanket refusal, which blocked the one combination that works at
-    # native resolution; then as conditional on --iap_locate. Both are now
-    # obsolete: under D10 the CAM runs on the UN-TILED model, so nothing ever
-    # calls autograd.grad through a checkpointed window, whatever --iap_locate
-    # says. The combination that does not work — a CAM on the tiled model —
-    # cannot be expressed any more, because SegmentationCAM refuses it.
     if a.cam_objective == "attack" and a.iap_locate != "center":
         if a.iap_untar_loss in ("ce", "cospgd"):
             a.cam_objective = a.iap_untar_loss
@@ -252,10 +184,6 @@ def check_args(a, p):
                 f"clean prediction, which is what the CAM is computing). Pass "
                 f"--cam_objective ce or cospgd explicitly.")
     if a.placement != "center":
-        # --placement is add_patch_args's policy knob and IAP does not use it:
-        # localisation is --iap_locate, and prepare() overwrites cfg.placement
-        # with the window it resolved. Accepting a second policy here would put
-        # two placement fields in config.json, one of which never ran.
         p.error(f"--placement {a.placement!r} has no effect under IAP; "
                 f"localisation is --iap_locate (and --iap_locate center is "
                 f"the centred control).")
@@ -274,9 +202,6 @@ def check_args(a, p):
             f"produce identical runs under different directory names. Leave "
             f"w3 at {iap_mod.IAP_W3:g}, or use --iap_reg_grad live to sweep "
             f"it.")
-    # Only under 'live'. Under 'released' the regulariser has no gradient at
-    # all, so advice about its scale against the adversarial terms would be
-    # advice about a term that is not in the optimisation.
     if (a.iap_reg_reduce == "sum" and a.patch_size != want
             and a.iap_reg_grad == "live"):
         print(f"\n  NOTE (D3): --iap_reg_reduce sum at {a.patch_size}px sums "
@@ -296,17 +221,11 @@ def main():
                    ["" if a.iap_locate == "cam" else a.iap_locate,
                     "" if a.iap_reg_reduce == "sum" else a.iap_reg_reduce,
                     "" if a.iap_reg_grad == "live" else "reggrad-released",
-                    # The targeted objective enters the NAME, because the
-                    # cosine-weighted arm and the faithful one are different
-                    # measurements and must not land in the same directory.
                     {"ce_target": "", "ipatch_cospgd": "tarcospgd",
                      "none": "untargeted"}[a.iap_tar_loss],
                     "" if a.iap_clamp else "noclamp"] if x)
     tag = "_".join(x for x in [a.arch, "iap", a.iap_untar_loss,
                                f"w3{a.iap_w3:g}", arm, a.tag] if x)
-    # ABSOLUTE, for the reason overfit.py gives: the directory is written to
-    # from three places separated by a model build, and mmcv's config
-    # machinery is entitled to change the process working directory in between.
     out_dir = Path(increment_path(Path(a.out_root) / tag)).resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
     with tee_output(out_dir / "run.log"):
@@ -319,23 +238,9 @@ def _run(a, out_dir: Path):
     device = get_device()
     model, n_ch, n_act, spec = setup_model(a)
 
-    # D10. RESOLVED HERE, NOT IN check_args, because --inference auto only
-    # becomes slide once the checkpoint's test_cfg has been read, which needs
-    # the model built.
-    #
-    # A tiled model has no frame-shaped feature map to weight (the backbone is
-    # called once per window), so SegmentationCAM refuses one outright. The CAM
-    # is a pre-optimisation artefact, though — one pass, before the loop, to
-    # choose the window — so it is built on the UN-TILED model the slide
-    # wrapper holds, while every attack step stays tiled. See D10 in
-    # patchreach/patch/iap.py for the argument and for what it costs.
     from patchreach.models.wrapper import SlidingWindowSegModel
     cam_model, cam_untiled = model, False
     if isinstance(model, SlidingWindowSegModel) and a.iap_locate != "center":
-        # .model is SlidingWindowSegModel's own documented attribute, not a
-        # guess — but assert it rather than assume, because reaching blindly
-        # through a wrapper is how a run ends up attacking a different model
-        # from the one it reports.
         inner = getattr(model, "model", None)
         if inner is None or isinstance(inner, SlidingWindowSegModel):
             raise SystemExit(
@@ -355,8 +260,6 @@ def _run(a, out_dir: Path):
     lrs = [float(x) for x in str(a.iap_lrs).replace(",", " ").split()]
     with open(out_dir / "config.json", "w") as f:
         json.dump({**vars(a), "images": idxs, "iap_lr_ladder": lrs,
-                   # D10's mode pair, in the config as well as in every
-                   # record, so a directory can be read without its rows.
                    "iap_cam_untiled": cam_untiled,
                    "bracket": spec.bracket, "backbone_channels": n_ch,
                    "backbone_active_channels": n_act}, f, indent=2)
@@ -371,9 +274,6 @@ def _run(a, out_dir: Path):
           f"these numbers")
     print(f"{'=' * 72}")
 
-    # ONE CAM for the whole run. It registers a forward hook on the backbone;
-    # rebuilding it per image would stack one live hook per image on a frozen
-    # model and slow every forward pass in the run.
     cam = None
     if a.iap_locate == "center":
         print("[cam ] none       : --iap_locate center, the localisation "
@@ -404,9 +304,6 @@ def _run(a, out_dir: Path):
               f"{sorted(label.unique().tolist())}")
         print(f"{'#' * 72}")
 
-        # A FRESH patch per image. Carrying one over would make image k's
-        # result depend on image k-1 and turn this into a sequential universal
-        # patch by accident — a different threat model, silently.
         patch = build_patch(a, device, mean_t, std_t)
         t_img = time.time()
         rec = iap_mod.attack_image(
@@ -451,9 +348,6 @@ def _run(a, out_dir: Path):
 
     if cam is not None:
         if cam.n_degenerate:
-            # A fully-suppressed map carries no localisation information, so
-            # those images were CENTRED. Saying so matters: counting them as
-            # IAP-localised would dilute the very effect being measured.
             print(f"\n  NOTE: the Grad-CAM was degenerate (ReLU suppressed "
                   f"every channel) on {cam.n_degenerate} images;")
             print(f"        those fell back to CENTRE placement and are not "
@@ -471,10 +365,6 @@ def _run(a, out_dir: Path):
                                     f"w3={a.iap_w3:g}",
                               highlight=[r["image"] for r in panels])
 
-    # THE PANELS ARE ALSO THE STEALTHINESS INPUT. scripts/lpips_eval.py's png
-    # source discovers a_clean.png / c_patched.png by rglob and recovers the
-    # image index from the imgNNNN path component, so this layout is what makes
-    # LPIPS, DISTS and cvvdp available on an IAP run with no extra plumbing.
     target = a.target_class if a.iap_tar_loss != "none" else None
     for rank, r in enumerate(panels):
         i = r["image"]
@@ -493,8 +383,6 @@ def _run(a, out_dir: Path):
         report.per_class_iou_figure(clean_logits, adv_logits, label,
                                     a.num_classes, d / "per_class_iou.png",
                                     target, title=f"val image {i}")
-        # The ERF probe is a MODEL property, not an image one, so it runs once
-        # rather than once per panel — report.run's own flag for exactly that.
         report.run(model, img, label, patch, d, a.iap_untar_loss,
                    a.num_classes, target, mean_t, std_t,
                    skip_geometric=(rank > 0), log=lambda *_, **__: None)
@@ -530,16 +418,7 @@ def _invisibility_stats(records) -> dict:
 
 
 def _report_invisibility(records):
-    r"""
-    The stealthiness half of the table, printed beside the strength half.
-
-    BOTH REGIONS, ALWAYS. The frame figures are spatial means, so a 256px patch
-    in a 1024x2048 frame is diluted ~32x and will look invisible under any
-    attack whatsoever; the footprint figures ignore a visible seam against the
-    surround. Quoting either alone is the mistake this block exists to make
-    hard. See lpips_eval.py's THREE REGIONS note for the same argument at
-    greater length.
-    """
+    """The stealthiness half of the table, printed beside the strength half."""
     st = _invisibility_stats(records)
     if not st:
         return

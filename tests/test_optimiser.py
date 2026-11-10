@@ -1,23 +1,4 @@
-r"""
-The optimiser ablation: step rule (adam | sign) x parameterisation
-(sigmoid | direct).
-
-WHAT THESE TESTS ARE FOR
-------------------------
-Two claims in this repository's docstrings explain why the attack is not
-described as PGD, and neither had ever been measured:
-
-  losses/adversarial.py : "a patch is not an epsilon-ball perturbation, so we
-                          use Adam" — the step rule.
-  patch/spec.py         : "a hard clamp zeroes the gradient for any pixel
-                          sitting on the bound, which is exactly where an
-                          adversarial patch wants to live" — the projection.
-
-The flags exist so a cluster run can test them. These tests do NOT test the
-claims — that needs a real segmentor and real data. They test that the two
-arms do what they say, that the default arm is unchanged, and that the whole
-2x2 runs end to end, so a cluster job fails here rather than four GPU-hours in.
-"""
+"""The optimiser ablation: step rule (adam | sign) x parameterisation (sigmoid | direct)."""
 from __future__ import annotations
 
 import pytest
@@ -33,17 +14,8 @@ MEAN = torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1)
 STD = torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1)
 
 
-# ═════════════════════════════════════════════════════════════════════════════
-#  The step rule
-# ═════════════════════════════════════════════════════════════════════════════
-
 def test_sign_step_displaces_every_coordinate_by_exactly_lr():
-    """
-    THE MATCHING CLAIM. optim.py asserts adam and sign are comparable at equal
-    lr because both move a coordinate by ~lr. For sign that is exact, and it is
-    exact regardless of gradient magnitude — which is the property that makes
-    the comparison a comparison of DIRECTION policy, not of step size.
-    """
+    """THE MATCHING CLAIM. optim.py asserts adam and sign are comparable at equal lr because both move a coordinate by ~lr."""
     p = torch.zeros(4, requires_grad=True)
     p.grad = torch.tensor([1e-9, -1e-9, 1e9, -1e9])
     optim_mod.SignSGD([p], lr=0.1).step()
@@ -51,11 +23,7 @@ def test_sign_step_displaces_every_coordinate_by_exactly_lr():
 
 
 def test_sign_step_leaves_a_dead_coordinate_where_it_is():
-    """
-    sign(0) = 0. A pixel whose gradient the projection has zeroed does not
-    drift, so 'stuck at the bound' stays visibly stuck rather than diffusing —
-    which is what makes frac_at_clip readable as a diagnostic.
-    """
+    """sign(0) = 0."""
     p = torch.zeros(2, requires_grad=True)
     p.grad = torch.tensor([0.0, 2.0])
     optim_mod.SignSGD([p], lr=0.5).step()
@@ -64,8 +32,7 @@ def test_sign_step_leaves_a_dead_coordinate_where_it_is():
 
 
 def test_sign_carries_no_state_between_steps():
-    """No momentum, deliberately — see SignSGD's docstring. Two steps against
-    opposite gradients return exactly to the start."""
+    """No momentum, deliberately — see SignSGD's docstring."""
     p = torch.zeros(1, requires_grad=True)
     opt = optim_mod.SignSGD([p], lr=0.25)
     p.grad = torch.tensor([1.0]); opt.step()
@@ -74,11 +41,7 @@ def test_sign_carries_no_state_between_steps():
 
 
 def test_lr_schedulers_drive_signsgd():
-    """
-    THE REASON SignSGD SUBCLASSES Optimizer. A hand-rolled update in the loop
-    would ignore --lr_schedule, and the ablation would silently compare two
-    schedules as well as two step rules.
-    """
+    """THE REASON SignSGD SUBCLASSES Optimizer."""
     p = torch.zeros(1, requires_grad=True)
     opt = optim_mod.SignSGD([p], lr=1.0)
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=10)
@@ -93,16 +56,11 @@ def test_build_rejects_an_unknown_rule_rather_than_defaulting():
 
 
 def test_build_adam_honours_the_betas_it_is_given():
-    """Both loops route through build() but disagree on betas; the builder must
-    not impose one of them."""
+    """Both loops route through build() but disagree on betas; the builder must not impose one of them."""
     p = [torch.zeros(1, requires_grad=True)]
     assert optim_mod.build("adam", p, 0.1,
                            betas=(0.5, 0.999)).param_groups[0]["betas"] == (0.5, 0.999)
 
-
-# ═════════════════════════════════════════════════════════════════════════════
-#  The parameterisation
-# ═════════════════════════════════════════════════════════════════════════════
 
 def _patch(pixel_param="sigmoid", size=16):
     return Patch(PatchConfig(mode="raw", size=size, scale=0.25,
@@ -111,10 +69,7 @@ def _patch(pixel_param="sigmoid", size=16):
 
 
 def test_both_parameterisations_start_from_the_same_grey_image():
-    """
-    Or the ablation compares two runs that began at different patches. 0.5
-    either way: sigmoid(0) on one branch, the literal value on the other.
-    """
+    """Or the ablation compares two runs that began at different patches."""
     assert torch.allclose(_patch("sigmoid").render(),
                           _patch("direct").render(), atol=1e-6)
 
@@ -130,14 +85,9 @@ def test_direct_projects_back_into_the_pixel_box_after_a_step():
 
 
 def test_direct_does_not_clamp_inside_the_forward_pass():
-    """
-    THE WHOLE CONTENT OF 'direct'. The bound is a projection applied AFTER the
-    step, never a clamp inside the graph — a forward clamp is the absorbing
-    state residual() measured on the spectrum. If render() ever grows a clamp,
-    the gradient dies at the bound and the arm stops being PGD-like.
-    """
+    """THE WHOLE CONTENT OF 'direct'."""
     patch = _patch("direct")
-    patch.param.data.fill_(3.0)                  # out of range on purpose
+    patch.param.data.fill_(3.0)
     out = patch.render()
     assert out.max().item() == pytest.approx(3.0)
     out.sum().backward()
@@ -176,10 +126,6 @@ def test_checkpoints_record_which_parameterisation_wrote_them(tmp_path):
     assert torch.load(tmp_path / "s.pt")["parameterisation"] == "sigmoid"
 
 
-# ═════════════════════════════════════════════════════════════════════════════
-#  The 2x2, end to end
-# ═════════════════════════════════════════════════════════════════════════════
-
 class _TinySeg(nn.Module):
     """Frozen stand-in for WrappedSegModel — stride-4 stem, 19 classes."""
 
@@ -198,10 +144,7 @@ class _TinySeg(nn.Module):
 @pytest.mark.parametrize("pixel_param", ["sigmoid", "direct"])
 def test_every_arm_of_the_ablation_runs_and_moves_the_patch(optimiser,
                                                             pixel_param):
-    """
-    The cheap insurance. A cluster job that dies on an unwired kwarg should die
-    here, on CPU, in a second — not four GPU-hours into the sweep.
-    """
+    """The cheap insurance."""
     torch.manual_seed(0)
     H, W = 64, 128
     model = _TinySeg()
@@ -226,10 +169,7 @@ def test_every_arm_of_the_ablation_runs_and_moves_the_patch(optimiser,
 
 
 def test_the_sign_arm_takes_lr_sized_steps_through_attack_image():
-    """
-    End-to-end confirmation of the matching claim: after ONE step with no
-    schedule, every coordinate that had a gradient has moved by exactly lr.
-    """
+    """End-to-end confirmation of the matching claim: after ONE step with no schedule, every coordinate that had a gradient has moved by exactly lr."""
     torch.manual_seed(0)
     H, W = 64, 128
     model = _TinySeg()

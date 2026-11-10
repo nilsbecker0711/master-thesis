@@ -1,39 +1,4 @@
-r"""
-Reach-restricted optimisation.
-
-RATIONALE
----------
-The patch can only influence pixels inside the model's effective receptive
-field. Measured here: random-patch prediction-change collapses below ~1% past
-~300px at 512x1024 and ~150px at 256x512. Yet the loss averages over ALL valid
-remote pixels — typically ~450k, of which only ~50-80k are reachable.
-
-The unreachable ~85% contribute gradients that are tiny but NOT zero. They are
-noise rather than signal: those gradients do not correspond to achievable
-flips. They dilute the mean (shrinking the effective per-pixel contribution of
-reachable pixels ~5x) and add variance to the update direction.
-
-Restricting the loss support therefore (a) shrinks the denominator ~5x,
-amplifying reachable-pixel gradients, and (b) removes unreachable contributions
-outright instead of averaging them in.
-
-THIS CANNOT EXTEND REACH. The reachable set is fixed by the architecture. What
-it may buy is faster convergence and a higher plateau WITHIN the existing reach
-— deeper flips near the patch, not a longer tail. If the near field is already
-saturated there may be little headroom, and that null result is itself a test
-of the two-factor model.
-
-This supersedes the earlier dist_alpha experiment, which used DISTANCE as a
-soft proxy for reachability and made results slightly WORSE. Distance is a poor
-proxy: measured reach varies by source class and is non-monotonic in distance.
-Here we either cut radially at the measured collapse point, or measure
-reachability directly.
-
-REPORTING: the loss support and the evaluation metric now cover different pixel
-sets — we optimise on the reachable set but still report drop_remote over ALL
-remote pixels. That is deliberate (the metric must not be tuned to the method)
-and must be stated explicitly.
-"""
+"""Reach-restricted optimisation."""
 from __future__ import annotations
 
 from typing import Optional, Tuple
@@ -63,16 +28,7 @@ def radial_mask(footprint: torch.Tensor, radius: float) -> torch.Tensor:
 @torch.no_grad()
 def empirical_mask(model, loader, patch, device, n_images=8, n_probes=16,
                    thresh=0.02, log=print):
-    """
-    Measure the reachable set directly: feed the patch region UNIFORM RANDOM
-    noise (maximal stimulus) and record which pixels change their argmax.
-
-    Target-independent and label-free by construction — it never references any
-    class, only whether the prediction moved. That invariance is what makes it
-    a valid control for the geometric factor.
-
-    Returns (reach_prob [H,W] float, reach_mask [H,W] bool).
-    """
+    """Measure the reachable set directly: feed the patch region UNIFORM RANDOM noise (maximal stimulus) and record which pixels change their argmax."""
     from ..data.cityscapes import upsample_to
 
     log(f"\n{'='*66}")
@@ -132,12 +88,7 @@ def empirical_mask(model, loader, patch, device, n_images=8, n_probes=16,
 
 def build(mode: str, footprint: torch.Tensor, img_h: int,
           radius: Optional[float] = None, **kw) -> Optional[torch.Tensor]:
-    """
-    [H,W] bool support mask, or None for mode='off'.
-
-    The radial default of 0.62*img_h (~320px at 512, ~158px at 256) is set from
-    the measured collapse point, not chosen arbitrarily.
-    """
+    """[H,W] bool support mask, or None for mode='off'."""
     if mode == "off":
         return None
     if mode == "radial":

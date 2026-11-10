@@ -1,41 +1,5 @@
 #!/usr/bin/env python
-r"""
-Score candidate reference images before committing a training run.
-
-    python scripts/score_reference.py refs/*.png --shape auto
-
-WHAT THIS MEASURES AND WHY
---------------------------
-Tan et al.'s ASI/AGI/ADE describe how NATURAL a patch looks. They say nothing
-about how much room the optimiser has to work in — which, once Bg() and Grad()
-are applied, is the thing that decides whether a LAP run can succeed at all.
-
-After masking, the free parameters are:
-
-    free = silhouette  AND  NOT strong-edge
-
-Two failure modes this catches before you burn a run:
-
-  1. THIN STRUCTURES. A spindly object is mostly edge, so Grad() freezes most
-     of it and `free_frac` collapses. Nothing left to optimise.
-
-  2. FLAT INTERIORS. A white road marking has a beautiful outline and almost
-     zero interior texture variance. Any adversarial pattern painted into a
-     uniform white region is instantly visible as wrong — the perturbation has
-     nowhere to hide. `interior_std` is the proxy for that hiding capacity.
-
-`interior_std` is not from the paper. It is the natural texture variance of the
-region the attack gets to modify, and empirically it is what separates a
-reference that can absorb adversarial signal from one that cannot.
-
-READING THE OUTPUT
-------------------
-  free_frac      > 0.35 good, < 0.20 too constrained
-  interior_std   > 0.10 good hiding capacity, < 0.05 flat (avoid)
-  ASI            lower = more natural   (their cartoon 0.3704)
-  AGI            higher = cleaner edges (their cartoon 0.3378)
-  ADE            higher = regular texture (their cartoon 0.4056)
-"""
+"""Score candidate reference images before committing a training run."""
 from __future__ import annotations
 
 import argparse
@@ -64,9 +28,6 @@ def score(path: str, size: int, shape: str, bg: str, thresh: float,
     edges = edge_mask(rgb, edge_thresh)
     free = sil & (~edges)
 
-    # Texture variance of the region the optimiser actually gets. Local std in
-    # 5x5 windows, averaged over free pixels — a plain global std would be
-    # dominated by large-scale shading rather than by hideable texture.
     grey = (0.299 * rgb[0] + 0.587 * rgb[1] + 0.114 * rgb[2]).view(1, 1, size, size)
     mean = torch.nn.functional.avg_pool2d(grey, 5, 1, 2)
     var = torch.nn.functional.avg_pool2d(grey ** 2, 5, 1, 2) - mean ** 2

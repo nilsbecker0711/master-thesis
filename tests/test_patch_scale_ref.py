@@ -1,12 +1,4 @@
-"""
---patch_scale_ref: what --patch_scale is a fraction of.
-
-The guarantees that matter are the ones a silent regression would break:
-'height' must stay BIT-IDENTICAL to the historical int(H*scale) that every
-existing checkpoint was trained at, 'area' must hold frame coverage constant
-across input shapes, and the pasted footprint must actually be the size the
-rule reports — a rule that only fed the log line would pass every other check.
-"""
+"""--patch_scale_ref: what --patch_scale is a fraction of."""
 from __future__ import annotations
 
 import argparse
@@ -49,8 +41,6 @@ def test_area_holds_frame_coverage_across_shapes():
     s = 0.25
     for H, W in SHAPES:
         p = footprint_side(H, W, s, "area")
-        # int() floors, so coverage sits at or just under s**2. One pixel of
-        # side is the whole tolerance — anything looser would hide a bug.
         assert p == int(s * math.sqrt(H * W))
         assert (p / math.sqrt(H * W)) ** 2 <= s ** 2 + 1e-12
         assert ((p + 1) / math.sqrt(H * W)) ** 2 > s ** 2
@@ -101,14 +91,14 @@ def test_area_changes_the_pasted_size_on_a_wide_input():
         _, fp = patch.apply(torch.zeros(1, 3, H, W))
         sizes[ref] = int(fp[0].sum())
     assert sizes["height"] == 32 * 32
-    assert sizes["area"] == 45 * 45          # int(0.25 * sqrt(128*256)) = 45
+    assert sizes["area"] == 45 * 45
 
 
 def test_checkpoints_without_the_field_load_as_height(tmp_path):
     patch = Patch(PatchConfig(mode="raw", size=16, scale=0.25), DEV, MEAN, STD)
     patch.save(tmp_path / "old.pt")
     ck = torch.load(tmp_path / "old.pt", map_location="cpu")
-    ck["config"].pop("scale_ref")                     # a pre-field checkpoint
+    ck["config"].pop("scale_ref")
     torch.save(ck, tmp_path / "old.pt")
     loaded = Patch.load(tmp_path / "old.pt", DEV, MEAN, STD)
     assert loaded.cfg.scale_ref == "height"
@@ -124,8 +114,6 @@ def test_area_round_trips_through_a_checkpoint(tmp_path):
 
 
 def test_universal_csf_remedy_is_correct_under_area():
-    # The refusal suggests a --patch_scale. Under 'area' it must invert the
-    # AREA rule — a height-rule suggestion would name a scale that fails again.
     H, W, S = 128, 256, 32
     cfg = PatchConfig(mode="universal_csf", size=S, scale=0.25,
                       scale_ref="area")

@@ -1,24 +1,5 @@
 #!/usr/bin/env python
-r"""
-Block 0.2 — effective receptive field across architectures. NO TRAINING.
-
-    python scripts/measure_erf.py --arch segformer_b0 \
-        --cityscapes_root $CS --img_h 512 --img_w 1024 --n_images 5
-
-THIS IS A RESULT, NOT SETUP. It independently replicates the ERF-vulnerability
-relationship using a different instrument than the source paper: they
-backpropagate from a central output unit, this feeds maximal random stimulus
-and measures prediction change. Two methods agreeing is far stronger than
-citing theirs.
-
-LABEL-FREE AND DATASET-INDEPENDENT: the probe never touches ground truth and
-never references a class. So ADE20K weights are perfectly valid here — you can
-place Swin in the three-bracket comparison without Cityscapes weights for it.
-
-PREDICTION: ERF should order by attention mechanism — deformable-conv narrowest,
-windowed attention middle, global attention widest. If it does not, the
-geometric factor needs rethinking, and better to know that on day two.
-"""
+"""Block 0.2 — effective receptive field across architectures."""
 from __future__ import annotations
 
 import argparse
@@ -63,8 +44,6 @@ def main():
         if a.sweep and i == 0:
             sweeps = geometric.scale_sweep(model, img, patch)
 
-    # average the rings across images — ERF is a model property, so the
-    # image-to-image spread should be small. If it is not, say so.
     rings = all_stats[0]
     mean_stats = []
     print(f"\n{'='*66}")

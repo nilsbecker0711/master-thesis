@@ -1,40 +1,4 @@
-r"""
-Reporting for the universal CSF-bounded patch — where the value of this
-experiment actually is.
-
-The headline attack numbers (drop_remote, any_flip_rate) are computed by the
-same evaluate() every other mode uses, and say nothing specific about this one.
-What is specific is three questions, and a null result answers all three just as
-informatively as a success does:
-
-  REALISED TAU   tau is set ONCE, at a fixed reference luminance, because a
-                 universal patch cannot look at the image it lands on. What did
-                 that one residual actually cost on each val image, measured at
-                 that image's own luminance? The sentence worth being able to
-                 write is "the budget was set at tau = a using a fixed
-                 reference; realised visibility across the val set ranged from
-                 b to c". That spread IS the empirical case for content
-                 dependence, or the evidence against it.
-
-  SPECTRAL       Radially averaged amplitude of the converged residual against
-  ALLOCATION     the budget it was allowed. The interesting quantity is the
-                 RATIO -- where the optimiser chose to spend relative to what
-                 it could have. The measured ~47x visibility-efficiency
-                 advantage at Nyquist predicts it loads high frequencies; this
-                 is what confirms or refutes that.
-
-  CLIPPING       clip(x + delta) truncates where content is near 0 or 1, so the
-                 realised perturbation is not the projected one and tau is
-                 violated in the permissive direction. Non-negligible
-                 frac_clipped invalidates the guarantee quietly, which is the
-                 worst way for it to fail.
-
-CONFIDENCE INTERVALS ON EVERYTHING, with n reported. A single val-set mean is a
-point estimate over a small number of scenes with large scene-to-scene variance
--- overfit.py's --seeds note documents a 9.6-point swing from the same
-invocation. A headline number without an interval invites a comparison the data
-does not support.
-"""
+"""Reporting for the universal CSF-bounded patch — where the value of this experiment actually is."""
 from __future__ import annotations
 
 import math
@@ -46,18 +10,7 @@ from ..patch import csf as csf_mod
 
 
 def mean_ci(x, confidence: float = 0.95) -> dict:
-    r"""
-    Mean with a normal-approximation confidence interval, and n.
-
-    Deliberately the normal approximation rather than a t-interval or a
-    bootstrap: n here is the val set (hundreds), where the three agree to well
-    inside the width that matters, and an interval nobody can recompute by hand
-    from mean/sd/n is worse than a slightly conservative one.
-
-    n = 1 returns a null interval rather than a zero-width one. A zero-width
-    interval reads as "measured exactly", which is the opposite of what one
-    sample establishes.
-    """
+    """Mean with a normal-approximation confidence interval, and n."""
     t = torch.as_tensor(x, dtype=torch.float64).flatten()
     n = int(t.numel())
     if n == 0:
@@ -87,26 +40,7 @@ def distribution(x) -> dict:
 @torch.no_grad()
 def realised_tau(patch, loader, device, mean_t, std_t, max_images: int = 0
                  ) -> dict:
-    r"""
-    Per-image realised visibility of the SHARED residual, both conventions.
-
-      tau_nominal_i     the legacy mu = 0.5 convention -- identical for every
-                        image, because nothing in it depends on the image. It
-                        is reported anyway, because it is the number every
-                        existing run is quoted in and the one the budget was
-                        enforced under.
-      tau_calibrated_i  the same residual scored against image i's OWN measured
-                        luminance, linearised properly, with Barten's retinal
-                        illuminance following it. This is what the residual
-                        really costs on that scene.
-
-    The gap between them is the calibration error (~1.9x on this data); the
-    SPREAD of tau_calibrated across images is the content-dependence.
-
-    Also returns frac_clipped per batch, because a large realised tau and a
-    large frac_clipped mean opposite things: the first is the residual costing
-    more than intended, the second is it being truncated to less than intended.
-    """
+    """Per-image realised visibility of the SHARED residual, both conventions."""
     cfg = patch.cfg
     if cfg.mode != "universal_csf":
         raise ValueError(f"realised_tau is universal_csf only, got {cfg.mode!r}")
@@ -150,21 +84,7 @@ def realised_tau(patch, loader, device, mean_t, std_t, max_images: int = 0
 
 @torch.no_grad()
 def spectral_allocation(patch, n_bins: int = 32) -> dict:
-    r"""
-    Radially averaged residual amplitude, the budget, and their RATIO.
-
-    The ratio is the deliverable. An amplitude profile alone mostly reproduces
-    the 1/CSF envelope it was projected onto and says little; the ratio says
-    where, within what it was allowed, the optimiser actually chose to spend.
-
-      ratio -> 1 across the band   the bound is active everywhere; the attack
-                                   is limited by tau and not by the optimiser
-      ratio peaked at high f       the predicted behaviour, and what the ~47x
-                                   efficiency advantage at Nyquist implies
-      ratio peaked at low f        the premise is wrong for this model -- the
-                                   network is not reading the cheap band, so
-                                   the attack pays for visibility it cannot use
-    """
+    """Radially averaged residual amplitude, the budget, and their RATIO."""
     delta = patch.residual().detach()
     f, amp = csf_mod.radial_profile(delta, n_bins)
     fb, bud = csf_mod.budget_radial_profile(patch._csf_budget, n_bins)
@@ -218,7 +138,7 @@ def plot(report: dict, alloc: dict, path, title: str = ""):
 
 
 def log_report(report: dict, alloc: dict, log=print):
-    """The console summary. Read the spread, not the mean."""
+    """The console summary."""
     d = report["tau_calibrated"]
     log(f"\n[univ] tau requested   : {report['tau_requested']:g}")
     log(f"[univ] tau nominal     : {report['tau_nominal_legacy']:.4f} "

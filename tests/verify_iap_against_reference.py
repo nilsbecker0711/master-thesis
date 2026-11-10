@@ -1,25 +1,4 @@
-r"""
-Step-by-step verification of the IAP port against the reference's STRUCTURE.
-
-    python tests/verify_iap_against_reference.py
-
-NOT A PYTEST MODULE, and the name is deliberate — pytest's default collection
-pattern is test_*.py, so this is skipped by `pytest tests/`. It is a DIFFERENTIAL
-check: it transcribes the reference's inner loop structure for structure and
-holds patchreach/patch/iap.py equal to it, which is a different kind of evidence
-from tests/test_iap.py's per-function pins and is slow enough (it runs the real
-attack loop several times over) not to belong in the suite.
-
-WHAT ONLY THIS CAN CATCH. test_iap.py pins each of IAP's four parts in
-isolation. The loop can still be wrong in ways every one of those tests passes:
-the order of grad-zero / stop-check / backward / update, whether each rung
-restarts from the base, whether the clamp lands before or after the step, and
-whether the number in the record describes the patch written to disk. Deviation
-D9 — the released regulariser's two gradient paths cancelling exactly — was
-found here, not there.
-
-Exits non-zero on the first failing check, so it can gate a commit.
-"""
+"""Step-by-step verification of the IAP port against the reference's STRUCTURE."""
 import sys
 from pathlib import Path
 
@@ -27,7 +6,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-# argv[1] stays supported so the check can be pointed at another checkout.
 ROOT = (Path(sys.argv[1]) if len(sys.argv) > 1
         else Path(__file__).resolve().parents[1])
 sys.path.insert(0, str(ROOT))
@@ -98,12 +76,11 @@ print("=" * 72)
 print(" PART 3 — THE REGULARISER'S GRADIENT")
 print("=" * 72)
 
-# ─── 1. the reference's own expression, transcribed exactly ──────────────────
 base_vals = x01[0, :, 8:8 + P, 70:70 + P].clone()
 sens_t = torch.rand(P, P) * 20 + 1.0
 
-delta_ref = torch.nn.Parameter(base_vals.clone()[None])   # [1,3,p,p]
-temp_ref = delta_ref.clone()                              # <-- the reference
+delta_ref = torch.nn.Parameter(base_vals.clone()[None])
+temp_ref = delta_ref.clone()
 r_ref = 3 * (sens_t.detach() * torch.abs(delta_ref - temp_ref)).sum()
 r_ref.backward()
 g_from_clone = delta_ref.grad.abs().sum().item()
@@ -112,10 +89,9 @@ step(1, "reference `temp = delta.clone()` keeps the graph",
      f"temp.requires_grad={temp_ref.requires_grad}  "
      f"grad_fn={type(temp_ref.grad_fn).__name__ if temp_ref.grad_fn else None}")
 
-# Move delta away from temp so sign() is non-zero everywhere, then re-check.
 delta_ref2 = torch.nn.Parameter(base_vals.clone()[None])
 temp_ref2 = delta_ref2.clone()
-delta_ref2.data.add_(0.1)                        # |delta - temp| = 0.1 > 0
+delta_ref2.data.add_(0.1)
 r_ref2 = 3 * (sens_t.detach() * torch.abs(delta_ref2 - temp_ref2)).sum()
 r_ref2.backward()
 g2 = delta_ref2.grad.abs().sum().item()
@@ -125,15 +101,13 @@ step(2, "reference regulariser contributes ZERO gradient (paths cancel)",
      f"grad sum at |d-t|=0.1   : {g2:.3e}   (value of the term: "
      f"{float(r_ref2):.1f}, so the LOSS moves but the GRADIENT does not)")
 
-# ─── 3. the port's regulariser, with a detached base ─────────────────────────
 delta_mine = base_vals.clone().requires_grad_(True)
 r_mine = 3 * iap.regulariser(delta_mine, base_vals + 0.0, sens_t, "sum")
-# shift so sign() != 0
 delta_mine2 = (base_vals + 0.1).clone().requires_grad_(True)
 r_mine2 = 3 * iap.regulariser(delta_mine2, base_vals, sens_t, "sum")
 r_mine2.backward()
 g_mine = delta_mine2.grad
-want = 3 * sens_t * torch.ones(3, P, P)          # sign(+0.1) = +1
+want = 3 * sens_t * torch.ones(3, P, P)
 step(3, "port's regulariser gradient is live and equals 3*w*sens*sign(d-b)",
      torch.allclose(g_mine, want, atol=1e-5),
      f"max |grad - 3*sens*sign| = {float((g_mine - want).abs().max()):.3e}")
@@ -145,16 +119,9 @@ print("=" * 72)
 
 
 def reference_style_rung(objective, top, left, base, sens, lr, steps):
-    """
-    The reference's inner loop, structure for structure, with the SAME
-    objective the port uses (the loss substitution is the declared deviation;
-    everything else here is claimed unchanged, and that is what is tested).
-
-    base is passed in DETACHED, i.e. the paper's regulariser, so the two sides
-    differ only in the mechanics under test.
-    """
+    """The reference's inner loop, structure for structure, with the SAME objective the port uses (the loss substitution is the declared deviation; everything else here is claimed unchanged, and that is what is tested)."""
     delta = torch.nn.Parameter(base.clone()[None])
-    temp = base.clone()                                  # detached: no clone()
+    temp = base.clone()
     traj = []
     fp = torch.zeros(1, H, W, dtype=torch.bool)
     fp[:, top:top + P, left:left + P] = True
@@ -177,28 +144,22 @@ prep = iap.prepare(model, img, patch, mean_t=MEAN, std_t=STD, label=label,
                    cam=cam, score="cam", log=lambda *_: None)
 top, left, p_side = prep["box"]
 
-# ─── 4. localisation ─────────────────────────────────────────────────────────
 step(4, "localisation lands on the CAM hotspot, not the centre",
      (top, left) == (8, 70) and (top, left) != ((H - P) // 2, (W - P) // 2),
      f"(top,left)=({top},{left})  centre=({(H-P)//2},{(W-P)//2})")
 
-# ─── 5. base is the image region, in [0,1] ───────────────────────────────────
 step(5, "delta initialises to the denormalised image region it replaces",
      torch.allclose(patch.param.detach(), x01[0, :, top:top + P,
                                                left:left + P], atol=1e-6),
      f"max |param - x01[region]| = "
      f"{float((patch.param.detach() - x01[0,:,top:top+P,left:left+P]).abs().max()):.2e}")
 
-# ─── 6. the sensitivity crop is aligned with the window ──────────────────────
 step(6, "sens_patch is the sensitivity map cropped at the same window",
      torch.equal(prep["sens_patch"],
                  prep["sens"][0, top:top + P, left:left + P]))
 
-# ─── 7. sens is computed in [0,1], not in normalised space ───────────────────
 s01 = iap.sensitivity(x01)
 snorm = iap.sensitivity(img)
-#     allclose, not equal: prepare() recovers [0,1] by un-normalising, which
-#     round-trips through float32 and lands ~6e-8 from the original frame.
 step(7, "sens is computed on the [0,1] frame (eps=1e-3 is calibrated there)",
      torch.allclose(prep["sens"], s01, rtol=1e-4) and
      not torch.allclose(s01, snorm),
@@ -206,14 +167,12 @@ step(7, "sens is computed on the [0,1] frame (eps=1e-3 is calibrated there)",
      f"on normalised = {float(snorm.median()):.2f}  "
      f"(ratio {float(s01.median()/snorm.median()):.2f}x)")
 
-# ─── 8. the footprint apply() produces matches the resolved window ───────────
 _, fp_applied = patch.apply(img)
 fp_want = torch.zeros(1, H, W, dtype=torch.bool)
 fp_want[:, top:top + P, left:left + P] = True
 step(8, "Patch.apply footprint == the window localisation resolved",
      torch.equal(fp_applied, fp_want))
 
-# ─── 9. the composite is the reference's paste, exactly ──────────────────────
 patched, _ = patch.apply(img)
 manual = x01.clone()
 manual[:, :, top:top + P, left:left + P] = patch.param.detach()
@@ -221,7 +180,6 @@ step(9, "normalised composite == norm(reference's in-place paste)",
      torch.allclose(patched, (manual - MEAN) / STD, atol=1e-6),
      f"max abs diff = {float((patched - (manual-MEAN)/STD).abs().max()):.2e}")
 
-# ─── 10. the trajectory, step for step ───────────────────────────────────────
 obj = iap.Objective(tar="ipatch_cospgd", untar="ce", target_class=16,
                     w1=1.5, w2=1.0, w3=3.0, reg_reduce="sum")
 LR, NSTEP = 0.09, 5
@@ -245,7 +203,6 @@ step(10, f"_rung trajectory == reference update, each of {NSTEP} steps",
      "max |param_mine - param_ref| after k steps:\n" +
      "\n".join(f"  k={i+1}: {d:.3e}" for i, d in enumerate(diffs)))
 
-# ─── 11. each rung restarts from the base ────────────────────────────────────
 pk = mk_patch()
 pk.placement = (top, left)
 rec = iap.attack_image(model, img, label, pk, mean_t=MEAN, std_t=STD, cam=cam,
@@ -263,12 +220,11 @@ print("=" * 72)
 print(" THE STOP, THE CLAMP, AND RECORD/ARTEFACT AGREEMENT")
 print("=" * 72)
 
-# ─── 12. the stop is evaluated BEFORE the update ─────────────────────────────
 pk = mk_patch()
 pk.placement = (top, left)
 rec_s = iap.attack_image(model, img, label, pk, mean_t=MEAN, std_t=STD,
                          cam=cam, target_class=16, lrs=(0.05,), steps=50,
-                         stop="flip", stop_thresh=0.0,   # fires at step 1
+                         stop="flip", stop_thresh=0.0,
                          num_classes=K, clamp=False, log_every=10 ** 6,
                          verbose=False, log=lambda *_: None)
 step(12, "stop at step 1 leaves the UNMODIFIED base as the result",
@@ -279,7 +235,6 @@ step(12, "stop at step 1 leaves the UNMODIFIED base as the result",
      f"{float((pk.param.detach() - prep['base']).abs().max()):.2e}  "
      f"(the break precedes the update, so no step was taken)")
 
-# ─── 13. the clamp ───────────────────────────────────────────────────────────
 pk = mk_patch()
 pk.placement = (top, left)
 iap.attack_image(model, img, label, pk, mean_t=MEAN, std_t=STD, cam=cam,
@@ -301,7 +256,6 @@ step(13, "clamp=True holds [0,1]; clamp=False reproduces the released escape",
      f"clamp=False range [{float(pk2.param.min()):.3f}, "
      f"{float(pk2.param.max()):.3f}]")
 
-# ─── 14. the record describes the patch left in the object ───────────────────
 pk = mk_patch()
 pk.placement = (top, left)
 rec_f = iap.attack_image(model, img, label, pk, mean_t=MEAN, std_t=STD,
@@ -316,30 +270,16 @@ step(14, "record's final_remote is measured on the patch the object holds",
      abs(remote_now - rec_f["final_remote"]) < 1e-4,
      f"recomputed {remote_now:.6f}  vs record {rec_f['final_remote']:.6f}")
 
-# ─── 15. drop_remote is internally consistent ────────────────────────────────
 step(15, "drop_remote == clean_remote - final_remote",
      abs((rec_f["clean_remote"] - rec_f["final_remote"])
          - rec_f["drop_remote"]) < 1e-9)
 
-# ─── 16. invisibility is measured on that same patch ─────────────────────────
 adv01 = (pz * STD + MEAN).clamp(0, 1)
-# AGAINST prepared["x01"], NOT the original frame — and that is the right
-# reference, not a convenience. Clean and adversarial must sit in the SAME
-# round-tripped space, or the ~6e-8 un-normalisation error is attributed to the
-# patch. It is invisible at any real drop and dominates PSNR at 138 dB, where
-# the stub patch has barely moved and the metric is measuring float noise.
 v = iap.invisibility(prep["x01"], adv01, (top, left, P))
 
 
 def _same(x, y, tol):
-    """
-    None == None counts as agreement. PSNR is None on IDENTICAL frames, which
-    is reachable rather than contrived: the patch starts as the image region,
-    the reported patch is the one with the largest drop, and a run whose
-    regulariser dominates never beats its own step-1 drop — so its best patch
-    IS the clean content. inf - inf is NaN, so a bare abs() comparison fails
-    exactly when the two agree perfectly.
-    """
+    """None == None counts as agreement."""
     if x is None or y is None:
         return x is None and y is None
     return abs(x - y) < tol

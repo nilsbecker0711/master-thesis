@@ -1,20 +1,4 @@
-r"""
-SEMANTIC diagnostics — within the reachable zone, WHICH pixels can flip.
-
-The geometric factor says where the patch has leverage. This says whether the
-network will yield there. A pixel flips when
-
-    kappa * R(i)  >  |m_t(i)|
-    \_________/      \______/
-     geometric        semantic
-
-CONTESTABILITY is the key measurement: the fraction of far-field pixels where a
-class sits within a few logits of the current top-1. It varies enormously by
-class AND by scene — vegetation measured 4.2% on one image and 24.7% on
-another, because contestability tracks whether that class plausibly occupies
-the far field IN THAT SCENE. The geometric factor barely moves between images;
-this one does. Report it as a distribution, never a single number.
-"""
+"""SEMANTIC diagnostics — within the reachable zone, WHICH pixels can flip."""
 from __future__ import annotations
 
 import torch
@@ -29,7 +13,7 @@ RINGS = [(0, 150), (150, 300), (300, 450), (450, 650), (650, 900), (900, 1200)]
 
 @torch.no_grad()
 def per_class_iou(logits, labels, K: int, log=print):
-    """Clean per-class IoU. A target the model predicts poorly is a bad target."""
+    """Clean per-class IoU."""
     m = SegMetric(K, device=logits.device)
     m.update(upsample_to(logits, labels.shape[-2:]).argmax(1), labels)
     iou = m.per_class()
@@ -45,14 +29,7 @@ def per_class_iou(logits, labels, K: int, log=print):
 
 @torch.no_grad()
 def class_margin(logits, target_class: int, footprint, K: int, log=print):
-    """
-    Mean logit margin to target_class per distance ring:
-        margin = logit_target - max_other        (negative = target is losing)
-
-    A margin of -13 means the attack must deliver 13 logits of shift to flip.
-    Compare against what the patch can actually deliver — that comparison is
-    the two-factor inequality made concrete.
-    """
+    """Mean logit margin to target_class per distance ring"""
     H, W = logits.shape[-2:]
     lg = logits[0, :K]
     tgt = lg[target_class]
@@ -79,17 +56,7 @@ def class_margin(logits, target_class: int, footprint, K: int, log=print):
 @torch.no_grad()
 def contestability(logits, footprint, K: int, min_dist: float = 300.0,
                    tol: float = 3.0, log=print):
-    """
-    Per class: % of FAR-FIELD pixels where that class is within `tol` logits of
-    the top-1 — i.e. how attackable it is at distance.
-
-    This is the semantic factor isolated: distance is held fixed (far field
-    only) while the target class varies. The geometric probe does the opposite.
-    Together they decompose the reach limit.
-
-    Channels beyond K are capped: some heads emit 150 channels with only 19
-    active, and listing cls19..cls149 at 0.0% is noise.
-    """
+    """Per class: % of FAR-FIELD pixels where that class is within `tol` logits of the top-1 — i.e. how attackable it is at distance."""
     H, W = logits.shape[-2:]
     lg = logits[0, :K]
     top1 = lg.max(0).values
@@ -114,7 +81,7 @@ def contestability(logits, footprint, K: int, min_dist: float = 300.0,
 @torch.no_grad()
 def target_probability(clean_logits, adv_logits, target_class: int, footprint,
                        log=print):
-    """P(target) per ring, clean vs patched. Did the attack move the mass?"""
+    """P(target) per ring, clean vs patched."""
     H, W = clean_logits.shape[-2:]
     pc = F.softmax(clean_logits, 1)[0, target_class]
     pa = F.softmax(upsample_to(adv_logits, (H, W)), 1)[0, target_class]

@@ -1,53 +1,4 @@
-r"""
-Diagnostics POOLED ACROSS A POPULATION — the suite report.py runs on one image,
-accumulated over all of them.
-
-WHY THIS EXISTS
----------------
-overfit_population.py already reports a distribution of mIoU drops, and it runs
-report.run() on --n_panels images. Those are the two ends of a range with a hole
-in the middle:
-
-  the distribution   one scalar per image. Says how MUCH the attack achieved,
-                     says nothing about what it did.
-  the panel suite    everything about what it did — on three images out of n.
-                     Every mechanism claim in the thesis then rests on three
-                     anecdotes, and every one of those claims is about the
-                     ATTACK ("the untargeted loss is an implicit class
-                     selector", "influence extends past effect") rather than
-                     about those three images.
-
-This module closes it. Everything report.run() computes from logits — the
-confusion flows, the reach curve, the ring profiles, contestability — is pure
-post-processing on tensors the population loop has already computed, so running
-it on EVERY image costs a handful of [H,W] reductions per image against a
-1000-step optimisation. Only the two genuinely expensive probes stay
-panel-only: the Grad-CAM (a hook and a backward) and the ERF probe (n_probes
-forward passes, and a MODEL property that does not vary by image anyway).
-
-The panels then stop carrying the argument. They illustrate it, and the pooled
-figures are what the claim is quoted from — which is also what makes
---panel_select best defensible: cherry-picking is only a problem when the
-cherries ARE the evidence.
-
-POOLED, NOT AVERAGED
---------------------
-Every rate here is a POOLED ratio: numerator and denominator summed over images
-and divided once. A mean of per-image rates weights a class present in 300
-pixels of one image equally with the same class covering 200k pixels of
-another, and for flip rates that gap is two orders of magnitude. The per-image
-spread is reported ALONGSIDE the pooled value (the band on the reach curve, the
-box plot on contestability) rather than instead of it, for the same reason
-population.py reports a distribution next to the pooled mIoU: they answer
-different questions and neither substitutes for the other.
-
-DISTANCE BINS ARE ABSOLUTE PIXELS, deliberately. curves.untargeted_reach uses
-n_bins spanning each image's own max distance, which is right for one image and
-wrong for pooling: under --placement gradcam the footprint moves, the max
-distance moves with it, and bin 7 would mean 420px in one image and 680px in
-another. Fixed edges make bin k the same physical ring in every image, at the
-cost of trailing bins that only off-centre placements populate.
-"""
+"""Diagnostics POOLED ACROSS A POPULATION — the suite report.py runs on one image, accumulated over all of them."""
 from __future__ import annotations
 
 import warnings
@@ -62,16 +13,11 @@ from ..data.cityscapes import PALETTE, class_name, upsample_to
 from ..losses.reach import centroid, distance_map
 from .untargeted import RINGS
 
-# Fixed absolute rings, in pixels from the footprint centroid. 50px steps out to
-# 1200: at 512x1024 a centred patch reaches 572px to the far corner and an
-# edge-placed one ~1140, so this covers both without either being rebinned.
 BIN_W = 50
 N_BINS = 24
 BIN_EDGES = [(k * BIN_W, (k + 1) * BIN_W) for k in range(N_BINS)]
 BIN_CENTRES = np.array([(lo + hi) / 2 for lo, hi in BIN_EDGES])
 
-# RINGS is imported rather than redefined so a pooled ring number and a panel
-# ring number are the same measurement and can be quoted in one sentence.
 CONTEST_MIN_DIST = 300.0
 CONTEST_TOL = 3.0
 
@@ -90,7 +36,7 @@ def _save(fig, path):
 
 
 def _iqr_band(rows: np.ndarray):
-    """(median, q1, q3) down axis 0. All-nan columns give nan, not a warning."""
+    """(median, q1, q3) down axis 0."""
     if rows.size == 0:
         empty = np.array([])
         return empty, empty, empty
@@ -101,41 +47,20 @@ def _iqr_band(rows: np.ndarray):
                 np.nanpercentile(rows, 75, axis=0))
 
 
-# ═════════════════════════════════════════════════════════════════════════════
-#  Accumulator
-# ═════════════════════════════════════════════════════════════════════════════
-
 class PopulationDiagnostics:
-    r"""
-    Fold one image's clean/adversarial logits into the pooled diagnostics.
-
-    Mirrors metrics.population.Population: update() per image, state_dict() for
-    resume, summarise() at the end. It is a SEPARATE object with a SEPARATE
-    checkpoint file rather than fields on Population, because Population's
-    state_dict is what every existing population run on disk was written with,
-    and load_state_dict() would have to grow optional-key handling for runs that
-    never had these tensors. A second file is resumable, backward compatible,
-    and simply absent when the aggregate suite is off.
-
-    Everything accumulates on CPU. The tensors are small (one K x K long matrix
-    and a few length-24 vectors) and keeping them off-device means a resumed run
-    reloads them without a device round-trip.
-    """
+    """Fold one image's clean/adversarial logits into the pooled diagnostics."""
 
     def __init__(self, num_classes: int = 19, n_bins: int = N_BINS):
         self.K = num_classes
         self.n_bins = n_bins
 
-        # what flipped, and into what
         self.flip_cm = torch.zeros(num_classes, num_classes, dtype=torch.long)
         self.pred_total = torch.zeros(num_classes, dtype=torch.long)
 
-        # reach: pooled counts, plus one row per image for the spread band
         self.reach_changed = torch.zeros(n_bins, dtype=torch.long)
         self.reach_total = torch.zeros(n_bins, dtype=torch.long)
         self.per_image_reach: List[List[float]] = []
 
-        # ring profiles: sums and counts, so the pooled mean is pixel-weighted
         nr = len(RINGS)
         self.margin_clean = torch.zeros(nr, dtype=torch.float64)
         self.margin_adv = torch.zeros(nr, dtype=torch.float64)
@@ -143,23 +68,15 @@ class PopulationDiagnostics:
         self.ent_clean = torch.zeros(nr, dtype=torch.float64)
         self.ent_adv = torch.zeros(nr, dtype=torch.float64)
 
-        # a clean-image property, so it is per image and stays per image
         self.contest: List[List[float]] = []
 
-        # convergence traces, already downsampled by the caller's --log_every
         self.curves: List[Dict] = []
         self.images: List[int] = []
-
-    # ── per image ────────────────────────────────────────────────────────────
 
     @torch.no_grad()
     def update(self, clean_logits, adv_logits, label, footprint,
                record: Optional[Dict] = None):
-        """
-        One image. `clean_logits`/`adv_logits` may be at any resolution; both
-        are upsampled to the LABEL resolution, which is the resolution every
-        other measurement in the repository is taken at.
-        """
+        """One image."""
         K = self.K
         hw = label.shape[-2:]
         H, W = hw
@@ -171,10 +88,6 @@ class PopulationDiagnostics:
         remote = (label[0] != 255) & (~fp)
         changed = (pc != pa) & remote
 
-        # ── flip flows, pooled ───────────────────────────────────────────────
-        # The denominator is remote pixels of each CLEAN-PREDICTED class, not of
-        # each ground-truth class: the question is what the attack MOVED, and
-        # what it moved is a prediction.
         self.pred_total += torch.bincount(
             pc[remote].clamp(0, K - 1).flatten().cpu(), minlength=K).long()
         if bool(changed.any()):
@@ -184,15 +97,11 @@ class PopulationDiagnostics:
             cm.scatter_add_(0, s * K + d, torch.ones_like(s))
             self.flip_cm += cm.view(K, K).cpu()
 
-        # ── reach, on fixed absolute rings ───────────────────────────────────
         dist = distance_map(H, W, *centroid(footprint), cl.device)
         outside = ~fp
         row: List[float] = []
         for k, (lo, hi) in enumerate(BIN_EDGES[:self.n_bins]):
             ring = outside & (dist >= lo) & (dist < hi)
-            # `changed` is already restricted to labelled pixels, so the
-            # denominator has to be too or an unlabelled ring would depress the
-            # rate without ever being able to contribute to the numerator.
             n = int((remote & ring).sum())
             if n == 0:
                 row.append(float("nan"))
@@ -203,7 +112,6 @@ class PopulationDiagnostics:
             row.append(100.0 * c / n)
         self.per_image_reach.append(row)
 
-        # ── margin and entropy by coarse ring ────────────────────────────────
         def margin(lg):
             t2 = lg[0, :K].topk(2, dim=0).values
             return t2[0] - t2[1]
@@ -225,7 +133,6 @@ class PopulationDiagnostics:
             self.ent_clean[j] += float(ec[ring].sum())
             self.ent_adv[j] += float(ea[ring].sum())
 
-        # ── far-field contestability, from the CLEAN logits ──────────────────
         far = outside & (dist >= CONTEST_MIN_DIST)
         if int(far.sum()) > 0:
             lg = cl[0, :K]
@@ -236,7 +143,6 @@ class PopulationDiagnostics:
         else:
             self.contest.append([float("nan")] * K)
 
-        # ── convergence trace ────────────────────────────────────────────────
         if record is not None:
             self.images.append(int(record.get("image", -1)))
             hist = record.get("history") or []
@@ -245,15 +151,9 @@ class PopulationDiagnostics:
                 self.curves.append({
                     "image": int(record.get("image", -1)),
                     "step": [int(h["step"]) for h in hist],
-                    # the DROP, not the absolute mIoU: images start from
-                    # different clean scores, and a band over absolute mIoU
-                    # would be dominated by that offset rather than by the
-                    # attack's progress.
                     "drop": [float(base - h["miou_remote"]) for h in hist],
                     "visibility": [float(h["visibility"]) for h in hist
                                    if "visibility" in h]})
-
-    # ── resume ───────────────────────────────────────────────────────────────
 
     def state_dict(self) -> Dict:
         return {"num_classes": self.K, "n_bins": self.n_bins,
@@ -292,8 +192,6 @@ class PopulationDiagnostics:
     def done_images(self) -> set:
         return {i for i in self.images if i >= 0}
 
-    # ── reporting ────────────────────────────────────────────────────────────
-
     def flows(self, top: int = 12) -> List[Dict]:
         total = int(self.flip_cm.sum())
         if total == 0:
@@ -307,14 +205,7 @@ class PopulationDiagnostics:
                 for n, s, d in pairs[:top]]
 
     def flip_rates(self, min_px: int = 50_000) -> Dict[str, Dict]:
-        """
-        Pooled flip rate per clean-predicted class.
-
-        min_px is a POOLED floor, so it is far larger than the per-image 50 that
-        untargeted.confusion uses: at n=100 a class covering 500px per image
-        accumulates 50k, and below that the pooled rate is decided by whichever
-        handful of images happened to contain the class at all.
-        """
+        """Pooled flip rate per clean-predicted class."""
         out = {}
         for c in range(self.K):
             tot = int(self.pred_total[c])
@@ -327,7 +218,7 @@ class PopulationDiagnostics:
 
     def summarise(self, tau: Optional[float] = None,
                   records: Sequence[Dict] = (), log=print) -> Dict:
-        """The pooled report. Returns the dict that goes into aggregate.json."""
+        """The pooled report."""
         n = self.n_images
         res: Dict = {"n_images": n, "distance_bin_width_px": BIN_W}
 
@@ -346,8 +237,6 @@ class PopulationDiagnostics:
         res["visibility"] = self._report_visibility(tau, records, log)
         res["convergence"] = self._report_convergence(log)
         return res
-
-    # ── the individual sections ──────────────────────────────────────────────
 
     def _report_flows(self, log) -> Dict:
         total_flips = int(self.flip_cm.sum())
@@ -450,9 +339,6 @@ class PopulationDiagnostics:
         out = {}
         for c in np.argsort(-np.nan_to_num(med)):
             c = int(c)
-            # nan means NO image had a far field at all — at this resolution or
-            # this placement every remote pixel sits inside CONTEST_MIN_DIST.
-            # That is a missing measurement, not a contestability of zero.
             if np.isnan(med[c]) or (med[c] < 0.05 and q3[c] < 0.05):
                 continue
             out[class_name(c)] = {"median": float(med[c]), "q1": float(q1[c]),
@@ -473,17 +359,7 @@ class PopulationDiagnostics:
         return out
 
     def _report_visibility(self, tau, records, log) -> Dict:
-        r"""
-        Realised visibility against the budget it was optimised under.
-
-        tau is an INTENT — the constraint the renderer enforces, under a mu=0.5
-        contrast convention. The realised index is the OUTCOME, measured on the
-        rendered patch against the content it actually landed on, and the two
-        are not the same number: local contrast on Cityscapes windows runs well
-        below 0.5, so the locally-measured index is systematically the larger of
-        the two. A CSF result quoted at its nominal tau without this ratio
-        beside it is quoting the intent and calling it the measurement.
-        """
+        """Realised visibility against the budget it was optimised under."""
         vals = {k: [r[k] for r in records if r.get(k) is not None]
                 for k in ("final_visibility", "final_visibility_local",
                           "final_resid_rms", "final_resid_absmax")}
@@ -540,9 +416,6 @@ class PopulationDiagnostics:
         if len(steps) < 5:
             return out
 
-        # THE RUN-LENGTH TEST. If the last fifth of the run still moves the
-        # median by more than a point, the reported number is where the step
-        # counter stopped rather than where the attack converged.
         k = max(1, len(steps) // 5)
         tail = float(med[-1] - med[-1 - k])
         out["tail_gain"] = tail
@@ -563,8 +436,6 @@ class PopulationDiagnostics:
             log(f"       reported drop is a LOWER BOUND and --steps needs "
                 f"raising before it is quoted.")
         return out
-
-    # ── figures ──────────────────────────────────────────────────────────────
 
     def write_figures(self, out_dir, tau: Optional[float] = None,
                       records: Sequence[Dict] = (), title: str = ""):
@@ -645,9 +516,6 @@ class PopulationDiagnostics:
         rows = np.asarray(self.per_image_reach, dtype=np.float64)
         med, q1, q3 = _iqr_band(rows)
         keep = tot > 0
-        # BIN_CENTRES is the full ladder; this accumulator may hold a prefix of
-        # it, and indexing the full array with a short mask is an IndexError
-        # rather than a wrong plot only by luck.
         x = BIN_CENTRES[:self.n_bins][keep]
 
         plt = _plt()
@@ -800,28 +668,11 @@ class PopulationDiagnostics:
         return True
 
 
-# ═════════════════════════════════════════════════════════════════════════════
-#  Pooled per-class IoU — the one aggregate that comes from Population, not here
-# ═════════════════════════════════════════════════════════════════════════════
-
 def pooled_per_class_iou(clean_metric, adv_metric, out_path,
                          target_class: Optional[int] = None,
                          title: Optional[str] = None, log=print) -> Dict:
-    r"""
-    Per-class IoU from the POOLED confusion matrices, clean vs patched.
-
-    The population run already accumulates these four matrices for its pooled
-    mIoU; this is the per-class breakdown of the same object, and it costs one
-    division. It is the aggregate answer to the question a single-image
-    per_class_iou.png raises and cannot settle: aggregate mIoU hides WHICH
-    classes the attack destroys, and one image cannot tell a class the attack
-    reliably destroys from a class that happened to be fragile in that scene.
-
-    `classes='gt'` throughout — a class with no ground truth anywhere in the
-    pool is nan in both passes and is dropped from the figure rather than
-    scored 0, which is the artefact miou.py's header exists to prevent.
-    """
-    from .report import _iou_figure  # local: report imports diagnostics too
+    """Per-class IoU from the POOLED confusion matrices, clean vs patched."""
+    from .report import _iou_figure
 
     ciou, aiou = clean_metric.per_class("gt"), adv_metric.per_class("gt")
     present = [c for c in range(ciou.numel())

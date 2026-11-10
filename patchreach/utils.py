@@ -1,10 +1,4 @@
-"""
-Small utilities, vendored so the package has no project-local dependencies.
-
-Replaces ensemble_tool.utils. Keeping them here means the repo installs and
-runs standalone, which matters for the thesis: results should be reproducible
-from this repo alone.
-"""
+"""Small utilities, vendored so the package has no project-local dependencies."""
 from __future__ import annotations
 
 import os
@@ -22,20 +16,7 @@ def get_device() -> torch.device:
 
 
 def atomic_save(obj, path) -> None:
-    """Write to a temporary file, then rename over the target.
-
-    A plain torch.save that is interrupted leaves a TRUNCATED file, and the
-    next --resume dies in torch.load with nothing to fall back on. That is a
-    live risk rather than a theoretical one: both the population loop and
-    train.py checkpoint precisely so they can be killed at the walltime, and
-    a driver feeding short slices kills them dozens to hundreds of times.
-    os.replace is atomic on POSIX and on Windows, so the worst case becomes a
-    checkpoint one unit of work stale rather than a run that cannot resume.
-
-    Lives here, not in a script, because two callers now depend on the
-    guarantee and a second copy is how the two drift apart. Same pattern as
-    sweep_operating_point.py's sweep.json write.
-    """
+    """Write to a temporary file, then rename over the target."""
     path = Path(path)
     tmp = path.with_suffix(path.suffix + ".tmp")
     torch.save(obj, tmp)
@@ -50,7 +31,7 @@ def seed_everything(seed: int) -> None:
 
 
 def increment_path(path, exist_ok: bool = False) -> Path:
-    """`runs/exp` -> `runs/exp_1` if it exists. Never overwrites."""
+    """`runs/exp` -> `runs/exp_1` if it exists."""
     path = Path(path)
     if not path.exists() or exist_ok:
         return path
@@ -61,16 +42,7 @@ def increment_path(path, exist_ok: bool = False) -> Path:
 
 
 def channel_probe(model, device, h: int = 512, w: int = 1024):
-    """
-    (n_channels, n_numerically_active) of a segmentation head.
-
-    Some checkpoints emit an ADE20K-dimensioned 150-channel head even on
-    Cityscapes, with channels 19..149 inert. Diagnostics index by channel, so
-    probe rather than assume.
-
-    Uses amax, NOT Tensor.any — multi-dim any/all only landed in torch 2.0 and
-    this codebase targets 1.11.
-    """
+    """(n_channels, n_numerically_active) of a segmentation head."""
     with torch.no_grad():
         out = model(torch.zeros(1, 3, h, w, device=device))
         return out.shape[1], int((out.abs().amax(dim=(0, 2, 3)) > 1e-3).sum())
@@ -78,34 +50,7 @@ def channel_probe(model, device, h: int = 512, w: int = 1024):
 
 @contextmanager
 def tee_output(path):
-    r"""
-    Mirror stdout AND stderr into `path` for the lifetime of the block.
-
-    WHY THIS EXISTS. results.json answers "what was the drop". It does not
-    answer "did the run complain on the way there", and several things this
-    pipeline says only once are said on the console: the CSF budget table, the
-    degraded-after-peak warning naming best.pt, the NOT CONVERGED verdict, and
-    the classes-present line. Those are the difference between a number and a
-    number you can defend, and they were previously kept only in terminal
-    scrollback -- or, on the cluster, in a slurm file named after a job id that
-    nothing connects back to the run directory.
-
-    Captured at the STREAM rather than through logging, because the scripts
-    print, the diagnostics print, and torch prints; a logger would catch only
-    the first of the three.
-
-    Line-buffered so a run killed by the scheduler still leaves a readable log
-    of everything up to the kill.
-
-    APPEND, NEVER TRUNCATE. A sweep directory is written by more than one
-    invocation by design -- the objectives run as separate jobs into one tree,
-    and a job killed at walltime is resumed by another. Opening "w" meant each
-    of those destroyed the log of everything before it: a cospgd sweep that
-    took three hours left nothing behind once the ce job started, and the only
-    surviving record was of the run that happened to go last. The cells keep
-    their own run.log either way; this is the pooled view, and a pooled view
-    that keeps only the most recent writer is worse than none.
-    """
+    """Mirror stdout AND stderr into `path` for the lifetime of the block."""
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     fh = open(path, "a", encoding="utf-8", buffering=1)
@@ -123,9 +68,6 @@ def tee_output(path):
             self._stream.flush()
             fh.flush()
 
-        # Delegated so anything probing the stream -- tqdm asking whether it is
-        # a terminal, a subprocess asking for a descriptor -- sees the real
-        # answer rather than an AttributeError.
         def isatty(self):
             return self._stream.isatty()
 

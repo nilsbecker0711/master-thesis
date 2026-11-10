@@ -1,53 +1,4 @@
-r"""
-Statistics over a POPULATION of per-image attacks.
-
-WHY THIS IS NOT JUST A MEAN
----------------------------
-Every existing result in this repository is one image. One image is an
-anecdote: semantic.py already records contestability for vegetation measured at
-4.2% on one image and 24.7% on another, and closes with "Report it as a
-distribution, never a single number." The geometric factor barely moves between
-images; the semantic one moves enormously. So the spread across images is not
-noise around a true value — it IS the finding, and a mean that hides it throws
-away the more interesting half of the two-factor model.
-
-This module therefore reports a distribution, an interval, and a pooled
-dataset-level number, and it says which of those is comparable with what.
-
-TWO NUMBERS THAT ARE BOTH CORRECT AND ARE NOT THE SAME
-------------------------------------------------------
-miou.py states the rule this module has to honour:
-
-    PER-IMAGE mIoU averages IoU over the classes present in ONE image, so a
-    rare class covering a few hundred pixels scores near zero and drags the
-    mean down hard. DATASET mIoU accumulates ONE confusion matrix across many
-    images. Published numbers are always dataset mIoU.
-
-A population of per-image attacks admits both, and they answer different
-questions:
-
-  mean per-image drop   "what does this attack do to a typical image?"
-                        The right headline for a per-image threat model, and
-                        the thing that carries a confidence interval.
-  pooled dataset drop   "what does this attack do to the benchmark?"
-                        One confusion matrix over every image, clean vs
-                        adversarial. This is the number that is comparable
-                        with published mIoU, and it is NOT the mean of the
-                        per-image numbers.
-
-Both are computed. Reporting one and calling it the other is the mistake this
-module exists to make impossible.
-
-THE INTERVAL IS BOOTSTRAP, NOT t
---------------------------------
-drop_remote is bounded above by the clean mIoU and below by roughly zero, and
-in practice it piles up against one end depending on the architecture —
-SegFormer saturates near total disruption, InternImage sits low. That is a
-skewed, bounded distribution, and a t-interval assumes neither. The percentile
-bootstrap assumes only that the images are exchangeable draws, which is exactly
-what a random subset of the validation set is. The t-interval is reported
-alongside it so the two can be seen to agree, or not.
-"""
+"""Statistics over a POPULATION of per-image attacks."""
 from __future__ import annotations
 
 from typing import Dict, List, Optional, Sequence
@@ -57,26 +8,12 @@ import torch
 
 from .miou import SegMetric, compare as miou_compare
 
-# Drops, in mIoU points, at which "did the attack work on this image?" is
-# scored. 1.0 is "measurably at all"; 5.0 is the threshold curves.py already
-# uses for reach collapse; 10.0 is a drop nobody would call marginal.
 SUCCESS_THRESHOLDS = (1.0, 5.0, 10.0)
 
 
-# ═════════════════════════════════════════════════════════════════════════════
-#  Distribution summary
-# ═════════════════════════════════════════════════════════════════════════════
-
 def bootstrap_ci(values: Sequence[float], n_boot: int = 10000,
                  alpha: float = 0.05, seed: int = 0) -> tuple:
-    """
-    Percentile bootstrap CI for the MEAN. Returns (lo, hi).
-
-    Resamples images with replacement, which is the assumption that actually
-    holds here — the images are exchangeable draws from the validation set —
-    rather than the normality a t-interval assumes of a bounded, skewed
-    quantity.
-    """
+    """Percentile bootstrap CI for the MEAN."""
     v = np.asarray(values, dtype=np.float64)
     if v.size == 0:
         return (float("nan"), float("nan"))
@@ -95,7 +32,6 @@ def describe(values: Sequence[float], seed: int = 0) -> Dict:
     if n == 0:
         return {"n": 0}
     mean = float(v.mean())
-    # ddof=1: these are a SAMPLE of the validation set, not the population.
     std = float(v.std(ddof=1)) if n > 1 else 0.0
     se = std / np.sqrt(n) if n > 1 else 0.0
     lo, hi = bootstrap_ci(v, seed=seed)
@@ -110,34 +46,14 @@ def describe(values: Sequence[float], seed: int = 0) -> Dict:
 
 
 def images_needed(std: float, half_width: float = 1.0) -> int:
-    """
-    N required for a 95% CI of +/- `half_width` points, at the observed spread.
-
-    n = (1.96 * sigma / half_width)^2
-
-    Printed at the end of every run so the sample size defends itself with the
-    variance that was actually measured, instead of with a number copied from
-    a paper whose attack had a different spread.
-    """
+    """N required for a 95% CI of +/- `half_width` points, at the observed spread."""
     if std <= 0:
         return 1
     return int(np.ceil((1.96 * std / max(half_width, 1e-9)) ** 2))
 
 
-# ═════════════════════════════════════════════════════════════════════════════
-#  Accumulator
-# ═════════════════════════════════════════════════════════════════════════════
-
 class Population:
-    r"""
-    Per-image records plus the POOLED confusion matrices.
-
-    Four SegMetrics, because "all" and "remote" and "clean" and "adversarial"
-    are four different denominators and mixing them is the error miou.py's
-    header is written to prevent. The remote pair excludes each image's OWN
-    footprint, which differs per image here — every image has its own patch and
-    its own placement, so a single shared exclusion mask would be wrong.
-    """
+    """Per-image records plus the POOLED confusion matrices."""
 
     def __init__(self, num_classes: int = 19, device="cpu",
                  target_class: Optional[int] = None):
@@ -148,9 +64,9 @@ class Population:
         self.adv_all = SegMetric(num_classes, device=device)
         self.adv_rem = SegMetric(num_classes, device=device)
         self.records: List[Dict] = []
-        self._flipped = 0          # remote pixels whose argmax changed
-        self._remote = 0           # remote pixels considered
-        self._hit = 0              # non-target remote pixels driven to target
+        self._flipped = 0
+        self._remote = 0
+        self._hit = 0
         self._not_target = 0
 
     @torch.no_grad()
@@ -178,19 +94,8 @@ class Population:
         self.records.append(record)
         return record
 
-    # ── resume ───────────────────────────────────────────────────────────────
-
     def state_dict(self) -> Dict:
-        r"""
-        Everything needed to continue a run that hit the walltime.
-
-        The POOLED confusion matrices cannot be rebuilt from the per-image
-        records — a confusion matrix is not recoverable from a scalar mIoU —
-        so a run resumed from the record file alone would silently report a
-        pooled number computed over only the images since the restart. Four
-        19x19 long tensors and four counters cost nothing to checkpoint, and
-        that is the whole reason this exists.
-        """
+        """Everything needed to continue a run that hit the walltime."""
         return {"clean_all": self.clean_all.cm.cpu(),
                 "clean_rem": self.clean_rem.cm.cpu(),
                 "adv_all": self.adv_all.cm.cpu(),
@@ -225,21 +130,8 @@ class Population:
     def done_images(self) -> set:
         return {r["image"] for r in self.records if "image" in r}
 
-    # ── reporting ────────────────────────────────────────────────────────────
-
     def pooled(self, classes: str = "gt") -> Dict:
-        r"""
-        Dataset-level mIoU from one confusion matrix over every image, under
-        BOTH class sets.
-
-        'gt' is the number to trust: a class absent from the ground truth is
-        not evaluated in either pass, so the denominator cannot move between
-        clean and adversarial. 'union' is carried because runs recorded before
-        that distinction existed used it, and because the GAP between the two
-        is a diagnostic — it means a rare class moved in or out of the mean.
-        miou.compare() owns that logic; duplicating it here is how the pooled
-        and per-image numbers would come to disagree.
-        """
+        """Dataset-level mIoU from one confusion matrix over every image, under BOTH class sets."""
         ca = miou_compare(self.clean_all, self.adv_all)
         cr = miou_compare(self.clean_rem, self.adv_rem)
         sfx = "" if classes == "gt" else "_union"
@@ -264,7 +156,7 @@ class Population:
 
     def summarise(self, key: str = "drop_remote", seed: int = 0,
                   log=print) -> Dict:
-        """The collective statistic. Distribution first, pooled second."""
+        """The collective statistic."""
         vals = [r[key] for r in self.records if r.get(key) is not None]
         dist = describe(vals, seed=seed)
         classes = (self.records[0].get("classes", "gt")
@@ -311,8 +203,6 @@ class Population:
         log(f"    drop   REMOTE union : {pool['drop_remote_union']:+6.2f}   "
             f"(pre-fix convention, for comparison only)")
         if pool["class_set_moved"]:
-            # The artefact that made a 150-epoch run report an attack IMPROVING
-            # the model by 3.6 points. Say it loudly, next to the number.
             log(f"    [!] class set moved : union counts "
                 f"{pool['n_classes_clean_union']} clean vs "
                 f"{pool['n_classes_adv_union']} adv over {pool['n_classes_gt']} "
@@ -325,7 +215,6 @@ class Population:
         if "target_hit_rate" in pool:
             log(f"    target_hit_rate     : {pool['target_hit_rate']:6.2f}%")
 
-        # ── does N defend itself? ────────────────────────────────────────────
         need1 = images_needed(dist["std"], 1.0)
         need2 = images_needed(dist["std"], 2.0)
         log(f"\n  SAMPLE SIZE, judged against the spread actually observed:")
@@ -355,34 +244,12 @@ class Population:
                 "degraded_after_peak": degraded}
 
 
-# ═════════════════════════════════════════════════════════════════════════════
-#  Which images get the expensive treatment
-# ═════════════════════════════════════════════════════════════════════════════
-
 SELECT_MODES = ("best", "worst", "median", "spread")
 
 
 def select(records: Sequence[Dict], k: int = 3, mode: str = "spread",
            key: str = "drop_remote") -> List[Dict]:
-    r"""
-    Pick the k records that get panels and the full diagnostic suite.
-
-    The suite costs a Grad-CAM, an ERF probe and a dozen figures per image, so
-    it cannot run on every image of a population — but which k is a
-    presentational choice with a defensible answer and an indefensible one.
-
-    best    the k strongest attacks. What you want to look at, and precisely
-            what a reviewer will call cherry-picking if it is the only figure
-            in the chapter.
-    worst   the k weakest. The failure analysis.
-    median  the k nearest the median. The typical case.
-    spread  DEFAULT. best, median and worst, in that order, so the figure
-            shows the range the distribution actually covers. For k not
-            divisible by 3 the remainder goes to `best` first.
-
-    `spread` is the default because the population summary already reports the
-    distribution, and a panel figure showing only winners contradicts it.
-    """
+    """Pick the k records that get panels and the full diagnostic suite."""
     if mode not in SELECT_MODES:
         raise ValueError(f"mode must be one of {SELECT_MODES}, got {mode!r}")
     rs = [r for r in records if r.get(key) is not None]
@@ -401,7 +268,6 @@ def select(records: Sequence[Dict], k: int = 3, mode: str = "spread",
         lo = max(0, mid - k // 2)
         return ordered[lo:lo + k]
 
-    # spread: best / median / worst, remainder to the strong end
     n_best = k - 2 * (k // 3) if k % 3 else k // 3
     n_med, n_worst = k // 3, k // 3
     mid = n // 2
@@ -413,7 +279,6 @@ def select(records: Sequence[Dict], k: int = 3, mode: str = "spread",
         if rid not in seen:
             seen.add(rid)
             picked.append(r)
-    # a small population can collide; top up from the strongest unused
     for r in ordered:
         if len(picked) >= k:
             break
@@ -423,38 +288,10 @@ def select(records: Sequence[Dict], k: int = 3, mode: str = "spread",
     return picked[:k]
 
 
-# ═════════════════════════════════════════════════════════════════════════════
-#  Paired comparison — the only honest way to compare two conditions
-# ═════════════════════════════════════════════════════════════════════════════
-
 def paired_compare(a_records: Sequence[Dict], b_records: Sequence[Dict],
                    key: str = "drop_remote", label_a: str = "A",
                    label_b: str = "B", seed: int = 0, log=print) -> Dict:
-    r"""
-    Compare two conditions image by image, not mean against mean.
-
-    WHY PAIRED. Image-to-image variance dominates here — the whole reason
-    population.py exists is that contestability swings 4.2% to 24.7% between
-    scenes while the geometric factor barely moves. Comparing two independent
-    means buries the effect being measured under that spread: with sigma ~10
-    points, an unpaired test needs ~100 images per arm to resolve a 2-point
-    difference, while the paired test needs only that the DIFFERENCE be
-    consistent, and the difference cancels the scene entirely.
-
-    So both conditions must run on the SAME images with the SAME --sample_seed.
-    This function enforces that by intersecting on the image index and
-    reporting what it had to drop.
-
-    There is a second reason paired matters specifically for --placement.
-    drop_remote excludes the footprint, and moving the patch moves the
-    footprint, so the two arms have slightly different remote denominators. A
-    per-image difference is still a like-for-like comparison of what the attack
-    achieved on THAT scene; a difference of means silently mixes two
-    denominators.
-
-    Returns the difference distribution (b - a), the sign counts, and each
-    arm's own summary.
-    """
+    """Compare two conditions image by image, not mean against mean."""
     a_by = {r["image"]: r for r in a_records if "image" in r}
     b_by = {r["image"]: r for r in b_records if "image" in r}
     common = sorted(set(a_by) & set(b_by))
@@ -473,8 +310,6 @@ def paired_compare(a_records: Sequence[Dict], b_records: Sequence[Dict],
     better = sum(1 for x in diffs if x > 0)
     worse = sum(1 for x in diffs if x < 0)
     tie = len(diffs) - better - worse
-    # The CI excluding zero is the claim. A sign count alone is not: 51/49
-    # "better" with a mean difference of 0.01 is noise wearing a majority.
     conclusive = not (d["ci95_boot"][0] <= 0.0 <= d["ci95_boot"][1])
 
     log(f"\n{'=' * 72}")
@@ -514,13 +349,7 @@ def paired_compare(a_records: Sequence[Dict], b_records: Sequence[Dict],
 def plot_paired(a_records: Sequence[Dict], b_records: Sequence[Dict], out_path,
                 key: str = "drop_remote", label_a: str = "A",
                 label_b: str = "B", title: str = "Paired comparison"):
-    """
-    Scatter of B against A, one point per image, with the identity line.
-
-    The figure that makes a paired result readable: points above the diagonal
-    are images B won, and the vertical spread around it is the effect. A pair
-    of histograms cannot show which image moved where.
-    """
+    """Scatter of B against A, one point per image, with the identity line."""
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
@@ -566,21 +395,11 @@ def plot_paired(a_records: Sequence[Dict], b_records: Sequence[Dict], out_path,
     plt.close(fig)
 
 
-# ═════════════════════════════════════════════════════════════════════════════
-#  Figure
-# ═════════════════════════════════════════════════════════════════════════════
-
 def plot_distribution(records: Sequence[Dict], out_path,
                       key: str = "drop_remote",
                       title: str = "Per-image attack strength",
                       highlight: Sequence[int] = ()):
-    """
-    Histogram + per-image strip. Standalone, own title and legend.
-
-    The strip matters as much as the histogram: it shows the individual images,
-    which is what makes the spread legible when n is small enough that the
-    histogram is mostly empty bins.
-    """
+    """Histogram + per-image strip."""
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
@@ -618,7 +437,5 @@ def plot_distribution(records: Sequence[Dict], out_path,
     axs.set_xlabel(f"{key} (mIoU points)")
     axs.grid(axis="x", alpha=0.25)
 
-    # No tight_layout(): the shared-x gridspec with an explicit hspace is not
-    # compatible with it and matplotlib warns. bbox_inches trims the same way.
     fig.savefig(out_path, dpi=130, bbox_inches="tight")
     plt.close(fig)

@@ -1,16 +1,5 @@
 #!/usr/bin/env python
-r"""
-Full-dataset adversarial patch training.
-
-    python scripts/train.py --config configs/experiments/B_architecture.yaml \
-                            --arch internimage --loss_fn cospgd
-
-Every run writes a FLAT directory under results/runs/<run_id>/ containing
-config.json + results.json. analysis/build_index.py walks those into one CSV.
-Nested result paths were tried and broke: each new axis (arch, reach, lap
-alpha, shape, placement) needs another directory level, and untargeted runs
-ended up filed under cls-1. A flat store plus a generated index scales.
-"""
+"""Full-dataset adversarial patch training."""
 from __future__ import annotations
 
 import argparse
@@ -29,9 +18,6 @@ from tqdm import tqdm
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-# Model and patch arguments come from _common so they exist in exactly ONE
-# place. train.py previously redeclared all of them, and three separate bugs
-# came from updating one copy and not the other.
 from _common import (add_model_args, add_patch_args, setup_model,
                      build_patch, tsallis_kwargs, tsallis_tag)
 from _common import make_dataset
@@ -47,18 +33,13 @@ from patchreach.utils import (get_device, seed_everything, increment_path,
 
 
 def build_parser():
-    """
-    Model and patch arguments live in _common.add_model_args / add_patch_args.
-    Only the ones specific to full-dataset TRAINING are declared here.
-    """
+    """Model and patch arguments live in _common.add_model_args / add_patch_args."""
     p = argparse.ArgumentParser(description="Train an adversarial patch")
     p.add_argument("--config", type=str, default=None,
                    help="YAML supplying defaults; CLI flags override it.")
 
-    add_model_args(p)          # arch, cfg_path, weights, cityscapes_root,
-                               # img_h, img_w, num_classes, seed
-    add_patch_args(p)          # patch_mode, size, scale, logit_clip, shape*,
-                               # placement*, reference*, lap_*, init_from
+    add_model_args(p)
+    add_patch_args(p)
 
     p.add_argument("--loss_fn",
                    choices=["ce", "cospgd", "ce_target",
@@ -66,7 +47,6 @@ def build_parser():
                    default="cospgd")
     p.add_argument("--target_class", type=int, default=8)
 
-    # reach-restricted optimisation (training only — evaluation never uses it)
     p.add_argument("--reach_mode", choices=["off", "radial", "empirical"],
                    default="off")
     p.add_argument("--reach_radius", type=float, default=None)
@@ -181,7 +161,7 @@ def load_config(args):
 
 
 def run_id(a) -> str:
-    """Readable, sortable, unique. Encodes the axes that vary across blocks."""
+    """Readable, sortable, unique."""
     bits = [a.arch, a.patch_mode, a.loss_fn, f"{a.img_h}x{a.img_w}"]
     if a.loss_fn == "ipatch_cospgd":
         bits.append(f"cls{a.target_class}")
@@ -203,12 +183,8 @@ def run_id(a) -> str:
         bits.append(f"pl-{a.placement}{a.placement_class}")
     if a.reach_mode != "off":
         bits.append(f"reach-{a.reach_mode}")
-    # The training subset is part of the run's identity, not a detail: two
-    # rows differing only in n_train would otherwise land in the same
-    # directory and be separated by increment_path's numeric suffix alone.
     if getattr(a, "n_train", 0):
         bits.append(f"n{a.n_train}")
-    # The baseline row must not share a directory with the trained one.
     if getattr(a, "raw_init", "grey") != "grey":
         bits.append(f"init-{a.raw_init}")
     if a.lr == 0:
@@ -247,9 +223,6 @@ def evaluate(model, loader, patch, device, K, target_class=None):
             n_hit += int(nt.sum())
             hits += int((nt & (pa == target_class)).sum())
 
-    # See metrics/miou.py: 'gt' fixes the counted class set from the labels so
-    # clean and adv share a denominator. 'union' is kept for continuity with
-    # runs recorded before the distinction existed.
     out = {}
     for scope, ck, ak, tag in (("all", "clean_all", "adv_all", "all"),
                                ("remote", "clean_rem", "adv_rem", "rem")):
@@ -260,9 +233,6 @@ def evaluate(model, loader, patch, device, K, target_class=None):
         out[f"adv_{tag}_union"] = d["adv_union"]
         out[f"drop_{scope}"] = d["drop"]
         out[f"drop_{scope}_union"] = d["drop_union"]
-        # mAcc beside mIoU, because the benchmark this protocol targets
-        # (Nesti et al. WACV 2022, Table 2) quotes both and a row with one
-        # of them cannot be placed next to theirs.
         out[f"clean_acc_{tag}"] = d["clean_acc"]
         out[f"adv_acc_{tag}"] = d["adv_acc"]
         out[f"drop_acc_{scope}"] = d["drop_acc"]
@@ -289,26 +259,12 @@ def main():
                else increment_path(Path(args.out_root) / run_id(args)))
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    # IDEMPOTENCE, which is the whole contract a queue driver relies on.
-    # results.json is written once, at the very end, so its presence means
-    # this run is finished and re-submitting is a no-op rather than a second
-    # 50,000-step run into the same directory.
     if args.resume and (out_dir / "results.json").exists():
         print(f"[resume] {out_dir} already has results.json — nothing to do.")
         return
 
-    # Per-epoch snapshots go in their own directory, not loose in the run:
-    # they are progress, and a 200-epoch run would hide best.pt behind them.
-    # The name is shared with the single-image loop, and deliberately NOT
-    # "patches" -- that is the population run's per-image checkpoint tree.
     (out_dir / INTERMEDIATE_DIR).mkdir(exist_ok=True)
 
-    # CONFIG DRIFT ACROSS A RESUME IS SILENT AND FATAL. The cosine T_max is
-    # epochs x batches and Adam's state was accumulated under one lr, so a
-    # slice relaunched with different --epochs/--lr/--batch_size continues a
-    # DIFFERENT optimisation problem and the run is neither of the two. The
-    # first slice's config.json is the contract; later slices are checked
-    # against it and refused rather than merged.
     cfg_path = out_dir / "config.json"
     if args.resume and cfg_path.exists():
         prev = json.loads(cfg_path.read_text())
@@ -330,8 +286,6 @@ def main():
             json.dump(vars(args), f, indent=2)
     print(f"\n### {out_dir} ###")
 
-    # setup_model resolves the registry entry, loads the segmentor (registering
-    # custom backbones from what the CONFIG declares) and probes the head width.
     model, n_ch, n_active, spec = setup_model(args)
     if n_ch != args.num_classes:
         print(f"[head] NOTE: head emits {n_ch} but num_classes="
@@ -341,12 +295,6 @@ def main():
     train_ds = make_dataset(args, "train")
     val_full = make_dataset(args, "val")
 
-    # THE SAMPLED TRAINING SUBSET (Nesti/Rossolini protocol). Drawn from a
-    # dedicated Random instance rather than the global RNG: seed_everything()
-    # has already run, and drawing here off the global stream would make the
-    # patch initialisation depend on whether this flag was passed — two runs
-    # that differ only in --n_train would then differ in their init too, and
-    # the subset would no longer be the only variable.
     if args.n_train:
         if args.n_train > len(train_ds):
             raise SystemExit(f"--n_train {args.n_train} exceeds the train "
@@ -354,11 +302,6 @@ def main():
         tseed = args.seed if args.train_seed is None else args.train_seed
         train_idx = sorted(random.Random(tseed).sample(range(len(train_ds)),
                                                        args.n_train))
-        # ON RESUME THE SUBSET MUST BE THE ONE THE RUN STARTED WITH. The draw
-        # is deterministic in (tseed, n_train, split size) so it re-derives
-        # identically -- but "it should match" is not the same as checking,
-        # and a slice that silently trained on different images would be
-        # invisible in every output.
         idx_path = out_dir / "train_images.json"
         if idx_path.exists():
             recorded = json.loads(idx_path.read_text())["indices"]
@@ -378,21 +321,6 @@ def main():
 
     train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True,
                               num_workers=args.num_workers, pin_memory=True)
-    # generator=: ITS OWN RNG, so validating does not perturb the global one.
-    # A DataLoader draws its worker base seed from the default generator on
-    # EVERY iteration, even with shuffle=False -- one int64, but enough to
-    # shift the stream. That matters since the checkpoint fix: a job killed
-    # inside a validation resumes from the save taken BEFORE it and skips
-    # that validation, so the resumed run would consume one draw fewer than
-    # an uninterrupted one and every subsequent train shuffle would differ.
-    # The run would still be valid, just no longer bit-identical, and
-    # tests/test_train_resume.py exists to assert exactly that identity.
-    # Validation has no randomness to seed anyway.
-    #
-    # num_workers honours --num_workers rather than the hardcoded 2 it used
-    # to be. The val pass reads 500 native-resolution PNG pairs; at 2 workers
-    # that is ~8x less loader throughput than the training loop gets on the
-    # same 16 allocated CPUs, for no stated reason.
     val_loader = DataLoader(
         Subset(val_full, list(range(min(args.val_images, len(val_full))))),
         batch_size=1, shuffle=False, num_workers=args.num_workers,
@@ -400,7 +328,6 @@ def main():
     print(f"[data] train {len(train_ds)} imgs / {len(train_loader)} batches, "
           f"val {args.val_images} imgs @ {args.img_h}x{args.img_w}")
 
-    # BigGAN only when the mode needs it
     G = None
     if args.patch_mode in ("gan", "raw_ganinit"):
         from GANLatentDiscovery.loading import load_from_dir
@@ -435,10 +362,6 @@ def main():
 
     patch = build_patch(args, device, mean_t, std_t, generator=G)
 
-    # ORDERING: clean forward -> resolve_placement -> first apply().
-    # Semantic placement reads the CLEAN PREDICTION, so it cannot be resolved
-    # before the model has seen an image. Getting this backwards silently
-    # falls back to centre.
     probe_img = val_full[0][0].unsqueeze(0).to(device)
     with torch.no_grad():
         clean_pred = upsample_to(model(probe_img),
@@ -471,17 +394,11 @@ def main():
         args.target_class if args.loss_fn == "ipatch_cospgd" else 8)
     tgt = args.target_class if args.loss_fn == "ipatch_cospgd" else None
 
-    # betas (0.5, 0.999) PASSED EXPLICITLY — this loop has always used
-    # them and optimise.py (0.9, 0.999); routing both through one
-    # builder must not quietly move either.
     opt = optim_mod.build(args.optimiser, [patch.param], args.lr,
                           betas=(0.5, 0.999))
     if args.optimiser != "adam":
         print(f"[optim] {args.optimiser} — step is exactly lr per "
               f"coordinate")
-    # T_max is TOTAL OPTIMISER STEPS, not epochs. Annealing per epoch would
-    # decay ~len(loader) times too slowly and leave the tail exactly as hot as
-    # the flat schedule this exists to replace.
     total_steps = args.epochs * len(train_loader)
     if args.lr_schedule == "plateau":
         sched = torch.optim.lr_scheduler.ReduceLROnPlateau(
@@ -496,12 +413,6 @@ def main():
         print("[sched] none — flat lr. The run will not settle; see "
               "--lr_schedule.")
 
-    # tsallis carries a q schedule that build()'s two-argument form cannot
-    # express. Rebound HERE rather than above because the schedule's horizon is
-    # total_steps, which does not exist until the loader is sized — and the
-    # horizon is the WHOLE RUN, epochs x batches, exactly like the cosine
-    # T_max above. Only this branch is touched; every other loss_fn keeps the
-    # object built earlier.
     if args.loss_fn == "tsallis":
         adv_loss = adversarial.build(args.loss_fn, 8,
                                      **tsallis_kwargs(args, total_steps))
@@ -509,28 +420,8 @@ def main():
 
     history, best, checked, t0 = [], -1e9, False, time.time()
     gstep = 0
-    # Defined before the loop because a resumed slice can find every epoch
-    # already done and fall straight through to the final evaluation, where
-    # the lap branch reads it.
     running = float("nan")
 
-    # ── resume ───────────────────────────────────────────────────────────────
-    # EVERYTHING THE NEXT STEP DEPENDS ON, or the cut is not transparent:
-    #   param          the patch itself
-    #   opt            Adam's first and second moments. Dropping these restarts
-    #                  the optimiser cold at every slice boundary, which under
-    #                  a 30-minute slice means ~20 cold starts in one run.
-    #   sched          the cosine position. T_max is the WHOLE run, so a
-    #                  scheduler rebuilt at zero would re-anneal from the top
-    #                  each slice and the lr would sawtooth instead of decay.
-    #   gstep          the tsallis q schedule reads it, and it is the x-axis
-    #                  of every history row.
-    #   best/history   so best.pt is not re-competed against an empty field.
-    #   RNG            the DataLoader shuffle draws from the global torch
-    #                  stream; restoring it makes the epoch order continue as
-    #                  though nothing had stopped.
-    # elapsed_s carries the wall clock ACROSS slices, so wall_clock_s in
-    # results.json is the run's real cost rather than the last slice's.
     state_path = out_dir / "train_state.pt"
     start_epoch, elapsed_s = 1, 0.0
     if args.resume and state_path.exists():
@@ -573,10 +464,6 @@ def main():
     for epoch in range(start_epoch, args.epochs + 1):
         running = 0.0
         for imgs, labels in tqdm(train_loader, desc=f"epoch {epoch}/{args.epochs}"):
-            # GLOBAL step, deliberately not per-epoch: a universal patch is one
-            # tensor optimised across the whole run, so its q schedule spans the
-            # run. Resetting per epoch would sawtooth q and make every epoch a
-            # different attack.
             if hasattr(adv_loss, "on_step_begin"):
                 adv_loss.on_step_begin(gstep, total_steps)
             gstep += 1
@@ -591,7 +478,6 @@ def main():
                 sup = (~fp) if sup is None else (sup & (~fp))
             la = adv_loss(logits, labels, fp, sup)
 
-            # Fail loudly rather than training 100 epochs on NaN.
             if not torch.isfinite(la):
                 raise RuntimeError(
                     f"non-finite loss at epoch {epoch}; valid remote px this "
@@ -604,8 +490,6 @@ def main():
                 g = patch.param.grad
                 print(f"\n[grad] {'None — GRAPH BROKEN' if g is None else f'abs mean {g.abs().mean():.3e}'}")
                 if patch.cfg.mode == "lap":
-                    # Calibrate on the SAME active set the loop optimises —
-                    # q = M(p), not the full rectangle.
                     magnitude_report(la.item(), patch.render(),
                                      patch.reference, patch.active_mask(),
                                      patch.cfg)
@@ -613,8 +497,6 @@ def main():
 
             opt.step()
             patch.project()
-            # Cosine steps PER BATCH (its T_max is in optimiser steps);
-            # plateau steps per epoch, on the epoch mean, below.
             if args.lr_schedule == "cosine":
                 sched.step()
             running += la.item()
@@ -630,27 +512,6 @@ def main():
         save_image(patch.render().cpu(),
                    out_dir / INTERMEDIATE_DIR / f"epoch{epoch:04d}.png")
 
-        # CHECKPOINT BEFORE THE VALIDATION, and again after it.
-        #
-        # This used to be a single save placed AFTER the validation branch,
-        # reasoning that `best` and `history` are written in there and a
-        # checkpoint taken above them would resume into a state that
-        # re-competes a validation it had already run. That is true and it is
-        # trivial; what it cost is not. Epoch 1 ALWAYS validates, and a
-        # 500-image pass at 1024x2048 under slide takes minutes on b0 and
-        # hours on b5 -- so a job killed inside that pass had never reached
-        # save_state at all. No train_state.pt, every requeue "starting
-        # fresh", epoch 1 again, the same validation, killed again. Observed
-        # on b5: a run that can never advance past epoch 1 no matter how
-        # often it is resubmitted.
-        #
-        # The pre-validation save is what makes the epoch durable. The
-        # post-validation save then captures best/history when the validation
-        # does complete. If the job dies inside the validation, the first
-        # checkpoint stands and the resume skips THIS epoch's validation --
-        # costing one history row and one best.pt comparison, which are
-        # diagnostics. The headline number is the final 500-image evaluation
-        # after the loop, and that always runs.
         ckpt_now = (epoch % args.checkpoint_every == 0
                     or epoch == args.epochs)
         if ckpt_now:
@@ -669,18 +530,10 @@ def main():
                 save_image(patch.render().cpu(), out_dir / "best_patch.png")
                 print(f"           * new best drop_remote {best:+.2f}")
 
-            # Re-save so best/history survive the next kill. Cheap: one more
-            # atomic write of the same small state, only on epochs that both
-            # checkpoint and validate.
             if ckpt_now:
                 save_state(epoch)
 
     final = evaluate(model, val_loader, patch, device, args.num_classes, tgt)
-    # ── calibration for stage 2 ──────────────────────────────────────────────
-    # L_rat at step 1 is ~0 by construction: a stage-1 run starts AT the
-    # reference, so ||q - c|| = 0 and any weight derived from it is a division
-    # by zero. The meaningful scale is the DRIFT the attack produced — measured
-    # here, at the end. Set alpha from this row, not from the step-1 one.
     if patch.cfg.mode == "lap" and patch.reference is not None:
         print("\n[lap] END-OF-RUN magnitudes — set stage-2 alpha from THIS "
               "rat row,\n      not from the step-1 report (where L_rat is 0 "
@@ -691,9 +544,6 @@ def main():
     patch.save(out_dir / "final.pt")
     save_image(patch.render().cpu(), out_dir / "final_patch.png")
 
-    # ── universal_csf: the metrics this mode exists to produce ───────────────
-    # Run on the BEST checkpoint, not the last one, so the reported visibility
-    # describes the patch the headline number came from.
     universal_report = None
     if patch.cfg.mode == "universal_csf":
         from patchreach.diagnostics import universal as univ
@@ -716,8 +566,6 @@ def main():
                "wall_clock_s": time.time() - t0, "history": history}
     if universal_report is not None:
         results["universal_csf"] = universal_report
-    # tsallis ONLY, so the results schema for every other loss_fn is unchanged
-    # and analysis/build_index.py keeps producing the same columns.
     if args.loss_fn == "tsallis":
         results["tsallis_q"] = adv_loss.q
     if patch.cfg.mode == "lap":
@@ -728,12 +576,6 @@ def main():
     if patch.placement is not None:
         results["placement_px"] = list(patch.placement)
 
-    # ── labelled figures ────────────────────────────────────────────────────
-    # Panels: clean / clean-prediction / patched / adv-prediction / change map,
-    # plus a per-class IoU chart. Panel (b) is the CLEAN PREDICTION rather than
-    # ground truth — the attack's effect is (clean pred -> adv pred), and
-    # scoring against GT would fold the model's own errors into what reads as
-    # attack damage.
     if args.panel_images.strip():
         idxs = [int(x) for x in args.panel_images.replace(",", " ").split()]
         idxs = [i for i in idxs if i < len(val_full)]
@@ -746,17 +588,10 @@ def main():
     with open(out_dir / "results.json", "w") as f:
         json.dump(results, f, indent=2)
 
-    # ── post-training figures ────────────────────────────────────────────────
-    # Numbers alone do not show WHERE the attack acted or WHAT it converted
-    # pixels into. The panels and the confusion/flow figures do, and the flip
-    # map is what makes perspective effects legible (a flood that looks
-    # scene-wide is often entirely within a few hundred px of the patch).
     if not args.no_diagnostics:
         print("\n" + "=" * 66)
         print(f" FIGURES on val image #{args.diag_image}")
         print("=" * 66)
-        # Full suite (ERF probe, confusion, margins, curves) on ONE image —
-        # the probe costs n_probes extra forward passes.
         d_img, d_lbl = val_full[args.diag_image]
         d_img = d_img.unsqueeze(0).to(device)
         d_lbl = d_lbl.unsqueeze(0).to(device)

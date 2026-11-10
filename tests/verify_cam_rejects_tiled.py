@@ -1,27 +1,4 @@
-r"""
-What SegmentationCAM ACTUALLY did on a tiled model, before it refused to.
-
-    python tests/verify_cam_rejects_tiled.py
-
-The EVIDENCE behind the 2026-10-17 correction in docs/experiment_log.md, kept
-runnable because the claim it supports is a negative one — that the old
-behaviour was silently wrong rather than loud — and a negative claim nobody can
-re-run is just an assertion.
-
-NOT A PYTEST MODULE (the name is deliberate; pytest collects test_*.py). The
-REFUSAL is tested in tests/test_iap.py::test_the_cam_refuses_a_tiled_model;
-this shows what the refusal is protecting against, which requires slipping past
-it.
-
-Two things matter about the setup. The segmentor's encode_decode resizes logits
-back to the INPUT size, as every mmseg EncoderDecoder does — without that, the
-padding arithmetic in SlidingWindowSegModel.forward is inconsistent and the run
-dies with a tensor-size error, which is what an earlier, sloppier stub showed
-and what the first version of this finding wrongly reported. And the tiled
-module is hand-rolled rather than a SlidingWindowSegModel subclass, purely so
-the isinstance guard does not fire; its forward is the same loop, window for
-window.
-"""
+"""What SegmentationCAM ACTUALLY did on a tiled model, before it refused to."""
 import sys
 from pathlib import Path
 
@@ -37,7 +14,7 @@ from patchreach.models.wrapper import WrappedSegModel, slide_windows
 from patchreach.patch import segmentation_cam
 
 K = 19
-H, W = 64, 256                 # 1:4, so a 64-crop tiles several times across
+H, W = 64, 256
 CROP, STRIDE = (64, 64), (48, 48)
 
 
@@ -145,7 +122,7 @@ class TokenBackbone(nn.Module):
     def forward(self, x):
         f = self.c(x)
         B, C, h, w = f.shape
-        return (f.flatten(2).transpose(1, 2),)      # [B, N, D]
+        return (f.flatten(2).transpose(1, 2),)
 
 
 class TokenSeg(Seg):

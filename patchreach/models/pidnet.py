@@ -1,54 +1,4 @@
-r"""
-PIDNet for mmseg 0.x — backbone, decode head and the blocks they need.
-
-WHY THIS FILE EXISTS AT ALL. PIDNet landed in mmsegmentation **1.0.0**
-("Support PIDNet (#2609)", 04/06/2023). This project is pinned to torch 1.11 +
-mmcv 1.x + mmseg 0.x (see pyproject.toml), where `mmseg.models.backbones` has
-no PIDNet and `mmseg.models.decode_heads` has no PIDHead. Pointing the registry
-at the zoo config would raise "PIDNet is not in the models registry" three
-frames inside build_segmentor. Upgrading mmseg is not an option: 1.x moves to
-mmengine, replaces `Config.fromfile`/`build_segmentor`, and drops the
-`encode_decode(img, img_metas)` entry point that patchreach.models.wrapper and
-~30 call sites are built on. InternImage is already handled by vendoring a
-backbone (mmseg_custom), so vendoring is the established answer here.
-
-PORTED FROM mmsegmentation v1.2.2, MIT licence:
-    mmseg/models/backbones/pidnet.py      (PagFM, Bag, LightBag, PIDNet)
-    mmseg/models/decode_heads/pid_head.py (BasePIDHead, PIDHead)
-    mmseg/models/utils/basic_block.py     (BasicBlock, Bottleneck)
-    mmseg/models/utils/ppm.py             (DAPPM, PAPPM)
-which is itself ported from https://github.com/XuJiacong/PIDNet (MIT).
-
-THE PORT IS DELIBERATELY MECHANICAL. Module names, attribute names and nesting
-are the upstream ones, because that is what makes the state_dict keys of the
-published zoo checkpoint load with no remapping. Only the imports and the
-registration change:
-
-    mmengine.model.BaseModule/ModuleList/Sequential -> mmcv.runner.*
-    MODELS.register_module()                        -> BACKBONES / HEADS
-    MODELS.build(act_cfg)                           -> build_activation_layer
-    mmengine.runner.CheckpointLoader                -> dropped, see init_weights
-
-TWO THINGS ARE *NOT* PORTED, both training-only:
-
-  * `PIDHead.loss_by_feat` and `_stack_batch_gt`. They need a boundary GT map,
-    produced by the 1.x-only `GenerateEdge` pipeline transform, plus the
-    1.x-only `OhemCrossEntropy` and `BoundaryLoss`. `forward_train` therefore
-    raises instead of silently optimising the wrong objective — this project
-    never trains a segmentor (scripts/train.py trains a PATCH; load_segmentor
-    sets `cfg.model.train_cfg = None` and the wrapper calls `.eval()`).
-  * the ImageNet `init_cfg=dict(type='Pretrained', ...)` download. The registry
-    loads the full Cityscapes checkpoint through `load_checkpoint`, so an
-    ImageNet backbone init would be overwritten a line later anyway.
-
-INFERENCE PATH, which is the only path this project uses. In eval mode the
-backbone returns ONE tensor (the fused P/I/D feature at stride 8) rather than
-the training triple, and PIDHead.forward routes it through the integral head
-alone. Both are plain `self.training` branches, inherited unchanged from
-upstream, so `EncoderDecoder.encode_decode` -> `extract_feat` ->
-`_decode_head_forward_test` works with no special-casing and
-`WrappedSegModel`/`SlidingWindowSegModel` need no per-arch branch.
-"""
+"""PIDNet for mmseg 0.x — backbone, decode head and the blocks they need."""
 from __future__ import annotations
 
 from typing import Dict, List, Optional, Tuple, Union
@@ -64,13 +14,8 @@ from mmseg.models.builder import BACKBONES, HEADS
 from mmseg.models.decode_heads.decode_head import BaseDecodeHead
 
 
-# ─── residual blocks ────────────────────────────────────────────────────────
-# Upstream mmseg/models/utils/basic_block.py. NOTE Bottleneck.expansion is 2
-# here, not ResNet's 4 — PIDNet's channel arithmetic depends on it, and a 4
-# would build a model whose state_dict silently does not match the checkpoint.
-
 class BasicBlock(BaseModule):
-    """ResNet basic block. `act_cfg_out=None` leaves the block unactivated."""
+    """ResNet basic block."""
 
     expansion = 1
 
@@ -111,12 +56,6 @@ class BasicBlock(BaseModule):
         if self.downsample:
             residual = self.downsample(x)
 
-        # Out-of-place, where upstream writes `out += residual`. The in-place
-        # form is autograd-legal (add's backward needs neither operand, and
-        # BatchNorm's needs its input, not its output) but this is the one
-        # codebase where every forward exists to be back-propagated through,
-        # often under torch.utils.checkpoint recomputation, so the version
-        # counter is not worth the one saved buffer.
         out = out + residual
 
         if hasattr(self, 'act'):
@@ -178,12 +117,6 @@ class Bottleneck(BaseModule):
         return out
 
 
-# ─── pyramid pooling ────────────────────────────────────────────────────────
-# Upstream mmseg/models/utils/ppm.py. DAPPM is DDRNet's; PAPPM is PIDNet's
-# parallel variant and REPLACES the inherited `processes` ModuleList with one
-# grouped ConvModule, which is why the two have different state_dict shapes
-# under `spp.processes.*`. PIDNet-S/M use PAPPM, PIDNet-L uses DAPPM.
-
 class DAPPM(BaseModule):
     """Deep Aggregation Pyramid Pooling Module (DDRNet)."""
 
@@ -203,7 +136,7 @@ class DAPPM(BaseModule):
         super().__init__()
 
         self.num_scales = num_scales
-        self.unsample_mode = upsample_mode     # upstream's spelling; kept
+        self.unsample_mode = upsample_mode
         self.in_channels = in_channels
         self.branch_channels = branch_channels
         self.out_channels = out_channels
@@ -308,10 +241,6 @@ class PAPPM(DAPPM):
                          num_scales, kernel_sizes, strides, paddings, norm_cfg,
                          act_cfg, conv_cfg, upsample_mode)
 
-        # Overwrites DAPPM's ModuleList with a single grouped conv: all scales
-        # are processed in parallel instead of cascaded. Reassignment (not a
-        # separate name) is upstream's, and it is what keeps the checkpoint key
-        # `spp.processes.conv.weight` — no `.0.` index — matching.
         self.processes = ConvModule(
             self.branch_channels * (self.num_scales - 1),
             self.branch_channels * (self.num_scales - 1),
@@ -336,8 +265,6 @@ class PAPPM(DAPPM):
         return self.compression(torch.cat([x_, scale_out],
                                           dim=1)) + self.shortcut(inputs)
 
-
-# ─── fusion modules ─────────────────────────────────────────────────────────
 
 class PagFM(BaseModule):
     """Pixel-attention-guided fusion: gate the I branch into the P branch."""
@@ -394,7 +321,7 @@ class PagFM(BaseModule):
 
 
 class Bag(BaseModule):
-    """Boundary-attention-guided fusion. PIDNet-L."""
+    """Boundary-attention-guided fusion."""
 
     def __init__(self,
                  in_channels: int,
@@ -423,7 +350,7 @@ class Bag(BaseModule):
 
 
 class LightBag(BaseModule):
-    """Light boundary-attention-guided fusion. PIDNet-S/M."""
+    """Light boundary-attention-guided fusion."""
 
     def __init__(self,
                  in_channels: int,
@@ -454,29 +381,9 @@ class LightBag(BaseModule):
         return f_p + f_i
 
 
-# ─── backbone ───────────────────────────────────────────────────────────────
-
 @BACKBONES.register_module()
 class PIDNet(BaseModule):
-    r"""
-    PIDNet backbone (arXiv:2206.02066), ported to mmseg 0.x. See module header.
-
-    THREE BRANCHES, fused at stride 8. P (detail, held at stride 8 throughout),
-    I (context, strided down to 1/64 and pooled by DAPPM/PAPPM), D (boundary,
-    the "derivative" term). PagFM gates I into P twice; Bag/LightBag then fuses
-    all three under the boundary gate.
-
-    WHAT THIS MEANS FOR THE ERF BRACKET. There is no self-attention anywhere —
-    the receptive field grows only by convolution, striding and the pyramid
-    pooling in PAPPM/DAPPM, much as DeepLab's ASPP does. PIDNet therefore
-    belongs in the "none" bracket of patchreach.models.registry, beside
-    deeplabv3plus and internimage, not with segformer or setr.
-
-    ENTRY STRIDE 2, OUTPUT STRIDE 8. The stem is two stride-2 ConvModules, so
-    the P branch runs the network at 1/8 resolution. `w_out`/`h_out` below are
-    hard-wired to `// 8`, which is why the input must be a multiple of 8 in
-    both axes — 512x1024 and the native 1024x2048 both are.
-    """
+    """PIDNet backbone (arXiv:2206.02066), ported to mmseg 0.x."""
 
     def __init__(self,
                  in_channels: int = 3,
@@ -494,12 +401,10 @@ class PIDNet(BaseModule):
         self.act_cfg = act_cfg
         self.align_corners = align_corners
 
-        # stem layer
         self.stem = self._make_stem_layer(in_channels, channels,
                                           num_stem_blocks)
         self.relu = nn.ReLU()
 
-        # I Branch
         self.i_branch_layers = nn.ModuleList()
         for i in range(3):
             self.i_branch_layers.append(
@@ -510,7 +415,6 @@ class PIDNet(BaseModule):
                     num_blocks=num_branch_blocks if i < 2 else 2,
                     stride=2))
 
-        # P Branch
         self.p_branch_layers = nn.ModuleList()
         for i in range(3):
             self.p_branch_layers.append(
@@ -536,10 +440,6 @@ class PIDNet(BaseModule):
         self.pag_1 = PagFM(channels * 2, channels)
         self.pag_2 = PagFM(channels * 2, channels)
 
-        # D Branch. num_stem_blocks == 2 is PIDNet-S/M, 3 is PIDNet-L, and the
-        # two take DIFFERENT module types (PAPPM + LightBag vs DAPPM + Bag), so
-        # a config that gets num_stem_blocks wrong does not merely mis-size the
-        # weights, it builds a different graph.
         if num_stem_blocks == 2:
             self.d_branch_layers = nn.ModuleList([
                 self._make_single_layer(BasicBlock, channels * 2, channels),
@@ -661,11 +561,7 @@ class PIDNet(BaseModule):
             in_channels, channels, stride, downsample, act_cfg_out=None)
 
     def init_weights(self):
-        """
-        Kaiming init. Upstream also downloads the ImageNet backbone named in
-        `init_cfg`; that is dropped here because load_segmentor loads the full
-        Cityscapes checkpoint immediately afterwards and would overwrite it.
-        """
+        """Kaiming init."""
         for m in self.modules():
             if isinstance(m, nn.Conv2d):
                 nn.init.kaiming_normal_(
@@ -675,19 +571,12 @@ class PIDNet(BaseModule):
                 nn.init.constant_(m.bias, 0)
 
     def forward(self, x: Tensor) -> Union[Tensor, Tuple[Tensor, ...]]:
-        """
-        Eval: ONE tensor, the fused feature at stride 8 — which is what makes
-        `EncoderDecoder.extract_feat` -> `PIDHead.forward` work unchanged.
-        Train: (P, fused, D) for the three-way loss, kept for completeness
-        even though PIDHead.forward_train refuses to use it here.
-        """
+        """Eval: ONE tensor, the fused feature at stride 8 — which is what makes `EncoderDecoder.extract_feat` -> `PIDHead.forward` work unchanged."""
         w_out = x.shape[-1] // 8
         h_out = x.shape[-2] // 8
 
-        # stage 0-2
         x = self.stem(x)
 
-        # stage 3
         x_i = self.relu(self.i_branch_layers[0](x))
         x_p = self.p_branch_layers[0](x)
         x_d = self.d_branch_layers[0](x)
@@ -695,7 +584,6 @@ class PIDNet(BaseModule):
         comp_i = self.compression_1(x_i)
         x_p = self.pag_1(x_p, comp_i)
         diff_i = self.diff_1(x_i)
-        # Out-of-place, where upstream writes `x_d += ...`; see BasicBlock.
         x_d = x_d + F.interpolate(
             diff_i,
             size=[h_out, w_out],
@@ -704,7 +592,6 @@ class PIDNet(BaseModule):
         if self.training:
             temp_p = x_p.clone()
 
-        # stage 4
         x_i = self.relu(self.i_branch_layers[1](x_i))
         x_p = self.p_branch_layers[1](self.relu(x_p))
         x_d = self.d_branch_layers[1](self.relu(x_d))
@@ -720,7 +607,6 @@ class PIDNet(BaseModule):
         if self.training:
             temp_d = x_d.clone()
 
-        # stage 5
         x_i = self.i_branch_layers[2](x_i)
         x_p = self.p_branch_layers[2](self.relu(x_p))
         x_d = self.d_branch_layers[2](self.relu(x_d))
@@ -734,8 +620,6 @@ class PIDNet(BaseModule):
         out = self.dfm(x_p, x_i, x_d)
         return (temp_p, out, temp_d) if self.training else out
 
-
-# ─── decode head ────────────────────────────────────────────────────────────
 
 class BasePIDHead(BaseModule):
     """One branch head: (norm, act, conv), then norm, act, then optional cls."""
@@ -769,20 +653,7 @@ class BasePIDHead(BaseModule):
 
 @HEADS.register_module()
 class PIDHead(BaseDecodeHead):
-    r"""
-    PIDNet decode head, ported to mmseg 0.x.
-
-    THREE HEADS, ONE USED AT TEST TIME. `i_head` + `cls_seg` is the whole
-    inference path; `p_head`/`p_cls_seg` and `d_head`/`d_cls_seg` exist only for
-    the auxiliary P and boundary losses. They are still CONSTRUCTED, because the
-    published checkpoint carries their weights and `load_checkpoint` would
-    otherwise report them as unexpected keys.
-
-    `self.conv_seg` and `self.cls_seg` come from BaseDecodeHead, so the
-    19-channel output and utils.channel_probe behave exactly as for every other
-    arch in the registry. `d_cls_seg` emits 1 channel (a boundary logit), not
-    num_classes — it never reaches the segmentation output.
-    """
+    """PIDNet decode head, ported to mmseg 0.x."""
 
     def __init__(self,
                  in_channels: int,
@@ -798,8 +669,6 @@ class PIDHead(BaseDecodeHead):
             norm_cfg=norm_cfg,
             act_cfg=act_cfg,
             **kwargs)
-        # out_channels only exists on BaseDecodeHead from mmseg 0.21; on older
-        # 0.x it is num_classes by construction.
         out_channels = getattr(self, 'out_channels', None) or num_classes
         self.i_head = BasePIDHead(in_channels, channels, norm_cfg, act_cfg)
         self.p_head = BasePIDHead(in_channels // 2, channels, norm_cfg,
@@ -824,12 +693,7 @@ class PIDHead(BaseDecodeHead):
     def forward(
         self, inputs: Union[Tensor, Tuple[Tensor, ...]]
     ) -> Union[Tensor, Tuple[Tensor, ...]]:
-        """
-        Eval: integral branch only, `inputs` being the backbone's single
-        tensor. Note it does NOT call `_transform_inputs` — there is no feature
-        pyramid to index into, which is why `in_index` / `input_transform` are
-        absent from the config.
-        """
+        """Eval: integral branch only, `inputs` being the backbone's single tensor."""
         if self.training:
             x_p, x_i, x_d = inputs
             x_p = self.p_head(x_p, self.p_cls_seg)
@@ -839,15 +703,7 @@ class PIDHead(BaseDecodeHead):
         return self.i_head(inputs, self.cls_seg)
 
     def forward_train(self, inputs, img_metas, gt_semantic_seg, train_cfg):
-        """
-        REFUSES, rather than training the wrong objective. PIDNet's loss is
-        four terms over (P, I, D) and needs a boundary GT map from the 1.x-only
-        `GenerateEdge` transform plus the 1.x-only `OhemCrossEntropy` and
-        `BoundaryLoss`. None of that is ported, because this project trains
-        patches and never segmentors. Falling through to BaseDecodeHead.losses
-        would quietly optimise the integral branch under a plain CE and look
-        like it had worked.
-        """
+        """REFUSES, rather than training the wrong objective."""
         raise NotImplementedError(
             "PIDHead here is INFERENCE-ONLY. Training PIDNet needs the "
             "boundary GT map from mmseg 1.x's GenerateEdge transform and its "

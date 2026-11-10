@@ -1,13 +1,4 @@
-"""
-Two checks against the observed runs.
-
-A. Is the regulariser alone an OSCILLATOR at lr*w3 = 0.3? Iterate the IAP step
-   with ONLY the regulariser's gradient — no model, no adversarial term — and
-   watch |delta - base|.
-
-B. Under slide at 1024x2048, how much of the frame can a patch at
-   (623, 1792) reach at all?
-"""
+"""Two checks against the observed runs."""
 import sys
 from pathlib import Path
 
@@ -25,7 +16,6 @@ print("=" * 74)
 torch.manual_seed(0)
 P = 64
 base = torch.rand(3, P, P).clamp(0.1, 0.9)
-# the observed sens profile: median 25, max at the 1/eps ceiling
 sens = (torch.rand(P, P) * 50 + 2.0)
 sens[torch.rand(P, P) < 0.05] = 1.0 / iap.SENS_EPS
 
@@ -41,7 +31,6 @@ for lr, w3 in ((0.1, 3.0), (0.1, 1.0), (0.1, 0.3), (0.01, 3.0), (0.003, 3.0)):
     for t in range(1, 201):
         if delta.grad is not None:
             delta.grad = None
-        # ONLY the regulariser. No model, no adversarial term.
         (w3 * iap.regulariser(delta, base, sens, "sum")).backward()
         iap.colour_constant_step_(delta, sens, lr)
         delta.data.clamp_(0.0, 1.0)
@@ -49,7 +38,6 @@ for lr, w3 in ((0.1, 3.0), (0.1, 1.0), (0.1, 0.3), (0.01, 3.0), (0.003, 3.0)):
         hist.append(d)
         if t in (1, 2, 3, 5, 10, 50, 200):
             traj.append(d)
-    # does it settle, or keep swinging? compare the last 50 steps' spread
     tail = hist[-50:]
     swing = max(tail) - min(tail)
     print(f"{lr:>6} {w3:>5} {lr * w3:>7.3f}   "

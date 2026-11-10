@@ -1,49 +1,5 @@
 #!/usr/bin/env python
-r"""
-best.pt, measured: the numbers the run log only ever printed for final.pt.
-
-    python scripts/best_checkpoint_stats.py --cityscapes_root $CS
-    python scripts/best_checkpoint_stats.py --cityscapes_root $CS \
-        --runs results/overfit_464/cospgd/setr_pup_csf_cospgd_img464_t1
-
-WHY. overfit.py writes best.pt whenever the remote drop sets a new record, but
-every aggregate it PRINTS -- whole-image mIoU, remote mIoU, flip rate, realised
-visibility -- belongs to the patch the run ended on. The single best.pt number
-that survives into results.json is `best_drop_remote`. A run that degraded
-after its peak therefore reports a drop from one patch and a flip rate and a
-visibility from another, and those cannot honestly share a row of a table.
-
-This recomputes the WHOLE row from best.pt, on the image the patch was trained
-on, with the architecture, resolution, scale and inference mode that run
-recorded. Nothing is retrained and nothing is overwritten: each run gets
-<run>/best_stats.json, and one collected table lands under --out_root.
-
-WHAT IS MEASURED, per run:
-    clean/best all        whole-image mIoU and its drop
-    clean/best remote     mIoU outside the footprint and its drop
-    any_flip_rate         % of remote pixels whose argmax moved
-    visibility            realised CSF visibility, nominal AND local (csf only)
-
-THE FINAL COLUMNS ARE READ, NOT RECOMPUTED. results.json already holds that
-run's own final numbers; recomputing them is one more chance for this table to
-disagree with the log it is meant to sit beside. The recomputed
-best_drop_remote IS cross-checked against the logged best_drop_remote, because
-that is the one quantity which exists on both sides -- and so the only
-available proof that this script reconstructed the right patch.
-
-PLACEMENT COMES FROM THE CHECKPOINT. best.pt stores where the patch sat and
-this evaluates it on the image it was trained on, so the placement is known
-exactly rather than re-derived. That is also what makes --placement gradcam
-runs readable here: a re-resolve would need the CAM rebuilt, and the stored
-coordinate is the ground truth anyway.
-
-THE BASE IS REBUILT FOR mode='csf'. The checkpoint stores the parameter and the
-placement, never the base -- the base is the image region the patch covers.
-set_reference_from_image() runs for every csf run, and it is not a flag here:
-without it the base is flat grey, the patch becomes a visible square with an
-invisible texture, and both the drop and the visibility would describe
-something other than the residual under test.
-"""
+"""best.pt, measured: the numbers the run log only ever printed for final.pt."""
 from __future__ import annotations
 
 import argparse
@@ -62,12 +18,9 @@ from patchreach.utils import get_device, seed_everything, increment_path
 
 NAN = float("nan")
 
-# Reading order for the printed table: transformers first, then the ResNet
-# depth ladder shallow -> deep. Anything else is appended alphabetically.
 ARCH_ORDER = ["segformer_b0", "segformer_b5", "setr_pup",
               "deeplab_18", "deeplab_50", "deeplab_101"]
 
-# Everything that has to agree before two runs can share one model build.
 MODEL_KEYS = ("arch", "cfg_path", "weights", "img_h", "img_w", "inference",
               "scale", "num_classes", "low_pr")
 
@@ -96,13 +49,7 @@ def load_json(path: Path) -> dict:
 
 
 def run_config(run: Path) -> dict:
-    """
-    The overfit run's own argparse namespace, whichever file holds it.
-
-    config.json is written once per INVOCATION and results.json once per
-    REPEAT, so a --seeds run keeps the config one level up. Both are checked,
-    nearest first.
-    """
+    """The overfit run's own argparse namespace, whichever file holds it."""
     r = load_json(run / "results.json")
     if "config" in r:
         return r["config"]
@@ -123,13 +70,10 @@ def discover(root: Path) -> list:
 @torch.no_grad()
 def measure(model, patch, img, label, num_classes, mean_t, std_t,
             clean_logits) -> dict:
-    """One (best.pt, model, image) row. `clean_logits` is cached by the caller."""
+    """One (best.pt, model, image) row."""
     H, W = img.shape[-2:]
     hw = label.shape[-2:]
 
-    # The checkpoint's placement is the one the attack used on THIS image, so
-    # it is read rather than re-derived. Only a checkpoint that predates the
-    # field falls through to a resolve.
     if patch.placement is None:
         if patch.cfg.placement == "gradcam":
             raise SystemExit(
@@ -137,17 +81,12 @@ def measure(model, patch, img, label, num_classes, mean_t, std_t,
                 "placement, and the sensitivity map is not rebuilt here. "
                 "Nothing can say where the patch sat.")
         patch.resolve_placement(H, W, clean_logits.argmax(1)[0])
-    # AFTER the placement is known, never before: the base is the region at
-    # the RESOLVED placement, exactly as optimise.prepare() took it.
     if patch.cfg.mode == "csf":
         patch.set_reference_from_image(img, mean_t, std_t)
 
     patched, fp = patch.apply(img)
     adv_logits = upsample_to(model(patched), hw)
 
-    # classes='gt' throughout, the default attack_image() ran under, so the
-    # recomputed drop is comparable to the logged one rather than merely
-    # similar to it.
     clean_all = single_image_miou(clean_logits, label, num_classes)
     clean_rem = single_image_miou(clean_logits, label, num_classes, exclude=fp)
     best_all = single_image_miou(adv_logits, label, num_classes)
@@ -263,9 +202,6 @@ def main():
         Path(a.out_root) / "_".join(x for x in ["best_vs_final", a.tag] if x)))
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    # Grouped so the MODEL is built once per (arch, resolution, inference)
-    # rather than once per run: six architectures x two losses x two arms is
-    # 24 runs and 6 builds, and the build is the expensive part.
     def key(cfg):
         return tuple(str(cfg.get(k)) for k in MODEL_KEYS)
     jobs.sort(key=lambda j: (key(j[1]), str(j[0])))
@@ -316,10 +252,6 @@ def main():
 
         res = load_json(run / "results.json")
         logged = res.get("best_drop_remote")
-        # The ONE number that exists on both sides. If the reconstruction
-        # picked up a different patch, a different placement or a different
-        # base, this is where it shows -- and the row is still written, marked,
-        # rather than quietly quoted.
         ok = (logged is None or abs(m["best_drop_remote"] - logged) <= 0.5)
         if not ok:
             print(f"  WARNING {run.name}: recomputed best drop "
@@ -327,9 +259,6 @@ def main():
                   f"{logged:+.2f}. Something about the reconstruction differs "
                   f"from the run; do not quote this row until it is explained.")
 
-        # Recompute final's drop from its own clean/final pair where both are
-        # recorded, so the final column is the SAME difference the best column
-        # is, rather than a key that might predate a change to either.
         fd = res.get("drop_remote")
         if (res.get("clean_remote") is not None
                 and res.get("final_remote") is not None):

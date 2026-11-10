@@ -1,15 +1,4 @@
-r"""
-Invariants for the frequency-resolved sensitivity probe.
-
-The probe's entire claim is ATTRIBUTION: "this flip rate was caused by THIS
-band, at the SAME perceptual cost as every other band." Three things can
-silently destroy that and none of them shows up in the output curve — the
-stimulus leaking outside its band, the rescale moving energy between bands, and
-the cost normalisation being unequal because the local mean was ignored. One
-test each.
-
-Run with: pytest -q tests/test_spectral.py
-"""
+"""Invariants for the frequency-resolved sensitivity probe."""
 import pytest
 
 torch = pytest.importorskip("torch")
@@ -32,15 +21,8 @@ def _band_energy(x, lo, hi):
     return float((p * m).sum())
 
 
-# ═════════════════════════════════════════════════════════════════════════════
-#  The stimulus
-# ═════════════════════════════════════════════════════════════════════════════
-
 def test_band_limited_noise_has_energy_only_in_its_band():
-    """
-    If the stimulus leaks, every flip rate is attributed to the wrong band and
-    the whole probe reports fiction. This is the load-bearing invariant.
-    """
+    """If the stimulus leaks, every flip rate is attributed to the wrong band and the whole probe reports fiction."""
     x = S.band_limited_noise(2, 64, 64, 0.20, 0.35)
     inside = _band_energy(x, 0.20, 0.35)
     outside = _band_energy(x, 0.0, 0.20) + _band_energy(x, 0.35, 0.5001)
@@ -55,14 +37,8 @@ def test_band_limited_noise_is_real_and_finite():
 
 
 def test_dc_is_always_excluded():
-    """
-    barten_csf is EXACTLY zero at f=0, so a DC component costs nothing under
-    visibility_index. Left in, the lowest band would buy an unbounded
-    brightness offset for free and its flip rate would not be comparable with
-    any other band's.
-    """
+    """barten_csf is EXACTLY zero at f=0, so a DC component costs nothing under visibility_index."""
     x = S.band_limited_noise(4, 32, 32, 0.0, 0.10)
-    # A pure offset would show as a non-zero per-image mean.
     assert float(x.mean(dim=(2, 3)).abs().max()) < 1e-6
 
 
@@ -71,18 +47,8 @@ def test_rejects_an_inverted_band():
         S.band_limited_noise(1, 32, 32, 0.3, 0.1)
 
 
-# ═════════════════════════════════════════════════════════════════════════════
-#  Cost normalisation
-# ═════════════════════════════════════════════════════════════════════════════
-
 def test_local_contrast_scale_reproduces_the_repo_constant_at_mid_grey():
-    r"""
-    THE DERIVATION CHECK. Michelson contrast of amplitude A on mean mu is
-    A/mu, and rfft2(norm='forward') reports A/2, so contrast_scale = 2/mu.
-    At mu = 0.5 that must be EXACTLY csf.CONTRAST_SCALE = 4.0, or the local
-    variant is not a generalisation of the fixed one and the two conventions
-    are measuring different things.
-    """
+    """THE DERIVATION CHECK."""
     base = torch.full((2, 3, 16, 16), 0.5)
     scale, floored = S.contrast_scale(base, "local")
     assert floored == 0
@@ -90,11 +56,7 @@ def test_local_contrast_scale_reproduces_the_repo_constant_at_mid_grey():
 
 
 def test_dark_content_costs_more_than_mid_grey():
-    """
-    The asymmetry the fixed mu=0.5 convention misses, and it points the wrong
-    way for this project: placement_class 0 is road, i.e. dark asphalt, so the
-    attack modes UNDER-state visibility exactly where they are usually run.
-    """
+    """The asymmetry the fixed mu=0.5 convention misses, and it points the wrong way for this project: placement_class 0 is road, i.e. dark asphalt, so the attack modes UNDER-state visibility exactly where they are usually run."""
     dark = torch.full((1, 3, 16, 16), 0.15)
     grey = torch.full((1, 3, 16, 16), 0.5)
     s_dark, _ = S.contrast_scale(dark, "local")
@@ -110,20 +72,18 @@ def test_fixed_mode_matches_the_attack_modes():
 
 
 def test_mu_floor_binds_and_is_counted():
-    """A near-black window must not produce an infinite contrast scale, and the
-    floor binding must be reported rather than absorbed."""
+    """A near-black window must not produce an infinite contrast scale, and the floor binding must be reported rather than absorbed."""
     black = torch.zeros(1, 3, 16, 16)
     scale, floored = S.contrast_scale(black, "local")
-    assert floored == 3                       # one sample x three channels
+    assert floored == 3
     assert torch.isfinite(scale).all()
     assert float(scale.max()) == pytest.approx(2.0 / S.MU_FLOOR)
 
 
 def test_local_mean_respects_the_shape_mask():
-    """A cutout's transparent padding must not drag the measured mean toward
-    black — the same failure fit_to_range() had before it took a mask."""
+    """A cutout's transparent padding must not drag the measured mean toward black — the same failure fit_to_range() had before it took a mask."""
     base = torch.zeros(1, 3, 16, 16)
-    base[:, :, :4, :] = 0.6                    # the silhouette
+    base[:, :, :4, :] = 0.6
     mask = torch.zeros(16, 16, dtype=torch.bool)
     mask[:4, :] = True
     scale, _ = S.contrast_scale(base, "local", mask)
@@ -142,32 +102,22 @@ def test_scale_to_cost_hits_the_target_exactly():
 
 
 def test_the_default_bands_cover_the_grid_to_its_radial_maximum():
-    """
-    THE GAP THIS CLOSES. The list stopped at 0.50 while the rfft grid runs to
-    sqrt(2)/2 = 0.7071, so the probe measured six bands holding 0.4% of the
-    budget's power and never touched the band holding the other 99.6%. RQ1 was
-    answered over the frequencies the attack barely uses.
-    """
-    assert S.DEFAULT_BANDS is C.RADIAL_BANDS          # one list, not two
+    """THE GAP THIS CLOSES."""
+    assert S.DEFAULT_BANDS is C.RADIAL_BANDS
     lo0, hi_last = S.DEFAULT_BANDS[0][0], S.DEFAULT_BANDS[-1][1]
     assert lo0 == 0.0
-    assert hi_last > C.MAX_CPP                        # the corner is inside
+    assert hi_last > C.MAX_CPP
     for (a_lo, a_hi), (b_lo, b_hi) in zip(S.DEFAULT_BANDS,
                                           S.DEFAULT_BANDS[1:]):
-        assert a_hi == b_lo                           # no gaps, no overlaps
+        assert a_hi == b_lo
 
-    # every bin of a real grid falls in exactly one band
     f = C.radial_frequency_cpp(64, 64)
     n = sum(int(((f >= lo) & (f < hi)).sum()) for lo, hi in S.DEFAULT_BANDS)
     assert n == f.numel()
 
 
 def test_the_top_band_stimulus_is_non_empty_and_stays_in_band():
-    """
-    A band whose mask selects no bin would silently probe nothing: the stimulus
-    is all-zero, the flip rate is 0.0, and the row reads as "the network cannot
-    see this band" when in fact nothing was shown to it.
-    """
+    """A band whose mask selects no bin would silently probe nothing: the stimulus is all-zero, the flip rate is 0.0, and the row reads as "the network cannot see this band" when in fact nothing was shown to it."""
     lo, hi = S.DEFAULT_BANDS[-1]
     d = S.band_limited_noise(2, 64, 64, lo, hi)
     assert float(d.abs().max()) > 0
@@ -180,12 +130,7 @@ def test_the_top_band_stimulus_is_non_empty_and_stays_in_band():
 
 
 def test_scale_to_cost_does_not_move_energy_between_bands():
-    """
-    A uniform rescale is the ONLY normalisation that leaves the spectrum's
-    shape untouched — the same argument fit_to_range() makes. Anything that
-    reshaped the spectrum would smear the stimulus across bands and destroy
-    the attribution.
-    """
+    """A uniform rescale is the ONLY normalisation that leaves the spectrum's shape untouched — the same argument fit_to_range() makes."""
     S_ = 64
     csf = C.csf_map(S_, S_, C.ViewingGeometry(), "barten")
     raw = S.band_limited_noise(1, S_, S_, 0.20, 0.35)
@@ -195,12 +140,7 @@ def test_scale_to_cost_does_not_move_energy_between_bands():
 
 
 def test_equal_visibility_means_unequal_amplitude():
-    """
-    THE POINT OF THE CONTROL. The eye is far less sensitive near Nyquist, so
-    matching perceptual cost must buy the high band a much larger amplitude.
-    If these came out equal, 'equal cost' would be doing nothing and the sweep
-    would be an equal-amplitude sweep wearing a disguise.
-    """
+    """THE POINT OF THE CONTROL."""
     S_ = 64
     csf = C.csf_map(S_, S_, C.ViewingGeometry(), "barten")
     lo = S.scale_to_cost(S.band_limited_noise(1, S_, S_, 0.02, 0.05),
@@ -220,10 +160,6 @@ def test_rms_normalisation_equalises_amplitude_instead():
     assert float(lo.pow(2).mean().sqrt()) == pytest.approx(0.02, rel=1e-4)
     assert float(hi.pow(2).mean().sqrt()) == pytest.approx(0.02, rel=1e-4)
 
-
-# ═════════════════════════════════════════════════════════════════════════════
-#  The probe end to end
-# ═════════════════════════════════════════════════════════════════════════════
 
 class _TinySeg(nn.Module):
     """Frozen stand-in for WrappedSegModel — stride-4 stem, 19 classes."""
@@ -264,13 +200,7 @@ def test_probe_returns_one_row_per_band_with_the_expected_fields():
 
 
 def test_probe_never_touches_the_patch_parameter():
-    """
-    The documented difference from geometric.receptive_field(), which
-    overwrites patch.param and restores it. This probe reads GEOMETRY ONLY, so
-    it is safe to run against a trained patch — and a future refactor that
-    started writing the parameter would silently corrupt whatever checkpoint it
-    was pointed at.
-    """
+    """The documented difference from geometric.receptive_field(), which overwrites patch.param and restores it."""
     model, img, patch = _setup()
     before = patch.param.detach().clone()
     S.frequency_sensitivity(model, img, patch, MEAN, STD,
@@ -280,11 +210,7 @@ def test_probe_never_touches_the_patch_parameter():
 
 
 def test_full_region_perturbs_everything_and_patch_region_does_not():
-    """
-    region='patch' must leave pixels outside the footprint untouched in the
-    INPUT (whatever the prediction does downstream); region='full' must not.
-    Confusing the two would silently turn a patch result into a UAP result.
-    """
+    """region='patch' must leave pixels outside the footprint untouched in the INPUT (whatever the prediction does downstream); region='full' must not."""
     model, img, patch = _setup()
     kw = dict(bands=[(0.05, 0.20)], n_probes=1, log=lambda *a, **k: None)
     rp = S.frequency_sensitivity(model, img, patch, MEAN, STD,
@@ -292,8 +218,6 @@ def test_full_region_perturbs_everything_and_patch_region_does_not():
     rf = S.frequency_sensitivity(model, img, patch, MEAN, STD,
                                  region="full", **kw)
     assert len(rp) == len(rf) == 1
-    # With no footprint the remote set is the whole frame, so the two rates
-    # coincide by construction in 'full' and generally differ in 'patch'.
     assert rf[0]["flip_remote"] == pytest.approx(rf[0]["flip_all"], abs=1e-6)
 
 
@@ -305,18 +229,13 @@ def test_probe_rejects_an_unknown_region():
                                 log=lambda *a, **k: None)
 
 
-# ═════════════════════════════════════════════════════════════════════════════
-#  The image-boundness verdict
-# ═════════════════════════════════════════════════════════════════════════════
-
 def _rows(rates, realised=0.25):
     return [{"lo": 0.1 * i, "hi": 0.1 * (i + 1), "flip_remote": r,
              "realised": realised} for i, r in enumerate(rates)]
 
 
 def test_summarise_calls_a_stable_peak_not_image_bound():
-    """Every image peaking in the same band means the readable band is a MODEL
-    property, exactly as the ERF is."""
+    """Every image peaking in the same band means the readable band is a MODEL property, exactly as the ERF is."""
     out = S.summarise([_rows([1.0, 2.0, 9.0]),
                        _rows([1.1, 2.2, 8.5]),
                        _rows([0.9, 1.8, 9.4])], 0.25, log=lambda *a, **k: None)
@@ -326,9 +245,7 @@ def test_summarise_calls_a_stable_peak_not_image_bound():
 
 
 def test_summarise_flags_image_bound_when_the_peak_moves():
-    """A peak that moves between scenes means one fixed budget is optimising
-    against the wrong target for some images — the finding this probe exists
-    to be able to state."""
+    """A peak that moves between scenes means one fixed budget is optimising against the wrong target for some images — the finding this probe exists to be able to state."""
     out = S.summarise([_rows([9.0, 2.0, 1.0]),
                        _rows([1.0, 2.0, 9.0]),
                        _rows([1.0, 9.0, 2.0])], 0.25, log=lambda *a, **k: None)
@@ -337,26 +254,16 @@ def test_summarise_flags_image_bound_when_the_peak_moves():
 
 
 def test_summarise_reports_range_limited_bands():
-    """A band that could not be driven to the target cost is a ceiling on the
-    attack, not a nuisance, and must survive into the JSON."""
+    """A band that could not be driven to the target cost is a ceiling on the attack, not a nuisance, and must survive into the JSON."""
     rows = _rows([1.0, 2.0, 3.0])
-    rows[2]["realised"] = 0.05                 # never reached tau=0.25
+    rows[2]["realised"] = 0.05
     out = S.summarise([rows], 0.25, log=lambda *a, **k: None)
     assert out["bands"][2]["realised"] == pytest.approx(0.05)
     assert out["bands"][0]["realised"] == pytest.approx(0.25)
 
 
 def test_summarise_refuses_a_verdict_from_noise():
-    r"""
-    THE GUARD. At a small tau no band may move the prediction at all — and
-    argmax over six near-zero rates still returns a band, every image still
-    "agrees" with it, and the top band still "beats" the bottom one. The first
-    run of this probe printed exactly that:
-
-        -> the gap is REAL: the top band flips 0.00% vs 0.00%
-
-    Below the floor there must be NO claim in either direction.
-    """
+    """THE GUARD."""
     out = S.summarise([_rows([0.00, 0.01, 0.02]),
                        _rows([0.01, 0.00, 0.03])], 0.25,
                       log=lambda *a, **k: None)
@@ -365,7 +272,6 @@ def test_summarise_refuses_a_verdict_from_noise():
     assert out["image_bound"] is None
     assert out["modal_peak"] is None
     assert out["peak_agreement"] is None
-    # the raw numbers still survive for the writeup
     assert out["bands"][2]["flip_remote"] == pytest.approx(0.025)
 
 

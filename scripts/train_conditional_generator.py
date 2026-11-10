@@ -1,48 +1,5 @@
 #!/usr/bin/env python
-r"""
-Dataset-level training of an IMAGE-CONDITIONED adversarial patch generator.
-
-    python scripts/train_conditional_generator.py \
-        --arch segformer --cityscapes_root $CS \
-        --loss_fn cospgd --gen_placement gradcam --epochs 30
-
-WHAT THIS IS, AND WHAT IT IS NOT
---------------------------------
-    theta* = argmin_theta E_{(x,y)~D} [ L_attack(f(x (+) G_theta(x,r,M)), y)
-                                        + lambda_LAP * L_LAP(p_i, r_i) ]
-
-theta is shared across the ENTIRE dataset. The PATCH is not — every image gets
-its own p_i = G_theta(x_i, r_i, M_i) from one forward pass. This is NOT a
-universal patch, and it is not comparable to one:
-
-  train.py     ONE patch tensor optimised over the dataset, applied unchanged
-               to every image. Transfers by construction.
-  overfit.py   ONE patch tensor optimised on ONE image. An approximate upper
-               bound on what direct optimisation achieves (BASELINE B).
-  this script  A shared FUNCTION. At test time an unseen image is attacked with
-               a forward pass and NO gradient-based optimisation of the patch.
-
-The last point is the claim the evaluation has to support, so evaluation runs
-the generator under torch.no_grad() in eval() mode with deterministic noise.
-Nothing in the eval path can optimise a patch even by accident.
-
-HYPOTHESIS UNDER TEST (nothing stronger is claimed)
----------------------------------------------------
-We investigate whether image-conditioned generation combined with
-segmentation-specific sensitivity localisation and LAP constraints can produce
-more perceptually coherent adversarial patches for semantic segmentation.
-Whether it does is an empirical question this script exists to answer; it is
-not assumed anywhere in the code or the logging.
-
-ABLATIONS (all one flag each)
-    A  --gen_placement center        vs   B  --gen_placement gradcam
-    C  --gen_lap_alpha <w>           vs   D  --gen_lap_alpha 0 (default)
-    E  --gen_cond image | image+ref | image+ref+cam
-    F  --cam_objective attack | ce | cospgd | ipatch_cospgd
-
-Existing experiments are untouched: this script shares only add_model_args and
-setup_model with train.py/overfit.py, and never constructs a Patch.
-"""
+"""Dataset-level training of an IMAGE-CONDITIONED adversarial patch generator."""
 from __future__ import annotations
 
 import argparse
@@ -72,10 +29,6 @@ from patchreach.patch.lap import asi, agi, ade, magnitude_report
 from patchreach.patch.spec import PatchConfig
 from patchreach.utils import get_device, seed_everything, increment_path
 
-
-# ═════════════════════════════════════════════════════════════════════════════
-#  CLI
-# ═════════════════════════════════════════════════════════════════════════════
 
 def build_parser():
     p = argparse.ArgumentParser(
@@ -112,8 +65,6 @@ def build_parser():
     p.add_argument("--panel_images", type=str, default="0 2 5",
                    help="val indices to render the full panel for at every "
                         "validation. '' disables.")
-    # Same two flags train.py uses, same meaning, so a conditional run leaves
-    # the same figure suite behind as every other experiment block.
     p.add_argument("--diag_image", type=int, default=2,
                    help="val image used for the post-training figure suite "
                         "(ERF probe, reach curves, confusion/margin).")
@@ -134,7 +85,7 @@ def build_parser():
 
 
 def load_config(args):
-    """YAML supplies defaults; explicit CLI flags win. Same rule as train.py."""
+    """YAML supplies defaults; explicit CLI flags win."""
     if not args.config:
         return args
     import yaml
@@ -149,7 +100,7 @@ def load_config(args):
 
 
 def run_id(a) -> str:
-    """Readable, sortable, unique. Encodes the axes an ablation varies."""
+    """Readable, sortable, unique."""
     bits = ["condgen", a.arch, a.loss_fn, f"{a.img_h}x{a.img_w}",
             f"pl-{a.gen_placement}", f"cond-{a.gen_cond.replace('+', '-')}",
             f"res-{a.gen_residual}"]
@@ -173,27 +124,10 @@ def run_id(a) -> str:
     return "_".join(bits)
 
 
-# ═════════════════════════════════════════════════════════════════════════════
-#  Evaluation
-# ═════════════════════════════════════════════════════════════════════════════
-
 def evaluate(attack: cg.ConditionalAttack, loader, device, K: int,
              adv_loss, exclude_footprint: bool, target_class=None,
              lpips_metric=None) -> dict:
-    r"""
-    Clean vs patched mIoU over the val subset, ALL and REMOTE, plus the LAP
-    realism indicators and the LPIPS distribution.
-
-    NO GRADIENT-BASED OPTIMISATION HAPPENS HERE. The generator runs in eval()
-    under no_grad with the prior-mean noise, so what is measured is exactly
-    x_test -> G_theta* -> p_test. The CAM internally needs grad w.r.t. its own
-    activations and re-enables it locally; it detaches before returning, and
-    the frozen model's parameters never receive a gradient.
-
-    REMOTE is the headline: drop_all conflates occlusion with adversarial
-    influence, drop_remote excludes the footprint and measures only the latter.
-    Same convention as train.py and evaluate.py.
-    """
+    """Clean vs patched mIoU over the val subset, ALL and REMOTE, plus the LAP realism indicators and the LPIPS distribution."""
     was_training = attack.generator.training if attack.generator else False
     if attack.generator is not None:
         attack.generator.eval()
@@ -232,7 +166,6 @@ def evaluate(attack: cg.ConditionalAttack, loader, device, K: int,
             n_hit += int(nt.sum())
             hits += int((nt & (pa == target_class)).sum())
 
-        # Per-image realism, on the patch that image actually received.
         p_batch, r_batch = out["patches"].detach(), out["references"].detach()
         for i in range(p_batch.shape[0]):
             realism["ASI"].append(asi(p_batch[i]))
@@ -243,10 +176,6 @@ def evaluate(attack: cg.ConditionalAttack, loader, device, K: int,
         placements += [list(x) for x in out["placements"]]
         lpips_vals += cg.lpips_distances(lpips_metric, p_batch, r_batch)
 
-    # BOTH class sets. 'gt' counts a class iff it has ground truth, so clean
-    # and adv share one denominator; 'union' is the historical behaviour, where
-    # a rare class leaving the mean once moved drop_remote by -3.6 points and
-    # made an inert attack look as though it IMPROVED the model.
     res = {}
     for scope, ck, ak in (("all", "clean_all", "adv_all"),
                           ("remote", "clean_rem", "adv_rem")):
@@ -270,7 +199,7 @@ def evaluate(attack: cg.ConditionalAttack, loader, device, K: int,
     res["rationality"] = {k: sum(v) / max(len(v), 1) for k, v in realism.items()}
     res["l2_to_reference_mean"] = sum(l2_to_ref) / n
     res["placements"] = placements
-    res["lpips"] = lpips_vals            # the DISTRIBUTION, not just a mean
+    res["lpips"] = lpips_vals
 
     if was_training and attack.generator is not None:
         attack.generator.train()
@@ -281,9 +210,6 @@ def summarise(tag: str, ev: dict, target_class=None, log=print):
     extra = (f"  hit={ev['target_hit_rate']:.1f}%" if target_class is not None
              else f"  flip={ev['any_flip_rate']:.1f}%")
     if ev.get("n_classes_remote_union_clean") != ev.get("n_classes_remote_union_adv"):
-        # A class entered or left the union denominator, so the 'union' numbers
-        # for clean and adv are means over DIFFERENT class sets and their
-        # difference is not a measurement. The 'gt' numbers are unaffected.
         log(f"  [!] class set moved: union counts "
             f"{ev['n_classes_remote_union_clean']} clean vs "
             f"{ev['n_classes_remote_union_adv']} adv — "
@@ -297,19 +223,8 @@ def summarise(tag: str, ev: dict, target_class=None, log=print):
         f"{lp_s}")
 
 
-# ═════════════════════════════════════════════════════════════════════════════
-#  Panels
-# ═════════════════════════════════════════════════════════════════════════════
-
 def frozen_patch_for(attack, dataset, idx, device, scale):
-    """
-    (img, label, Patch, ConditionalAttack output) for ONE validation image.
-
-    The generator's result for a single image IS a patch plus a placement, so
-    it is frozen into a real Patch and handed to the EXISTING diagnostic suite
-    unchanged — same figures, same ERF probe, same reach curves as every other
-    patch mode, and therefore directly comparable with them.
-    """
+    """(img, label, Patch, ConditionalAttack output) for ONE validation image."""
     img, label = dataset[idx]
     img = img.unsqueeze(0).to(device)
     label = label.unsqueeze(0).to(device)
@@ -328,16 +243,7 @@ def frozen_patch_for(attack, dataset, idx, device, scale):
 
 def per_class_panels(attack, model, dataset, indices, device, out_dir, a, tgt,
                      mean_t, std_t, log=print):
-    """
-    The standard labelled panels + per-class IoU chart, per image.
-
-    report.panels_for_images() takes ONE patch for the whole list, which is the
-    assumption this attack breaks — so it is called once per image with that
-    image's own frozen patch. img_h is passed as None deliberately: the
-    generator already resolved placement from its sensitivity map, and letting
-    panels_for_images re-resolve it would overwrite that with the `center`
-    default and silently mis-report where the patch actually sat.
-    """
+    """The standard labelled panels + per-class IoU chart, per image."""
     out = {}
     for i in indices:
         _, _, patch, _ = frozen_patch_for(attack, dataset, i, device,
@@ -350,16 +256,7 @@ def per_class_panels(attack, model, dataset, indices, device, out_dir, a, tgt,
 
 def run_diagnostics(attack, model, dataset, idx, device, out_dir, a, tgt,
                     mean_t, std_t, log=print):
-    """
-    The full diagnostic suite on ONE image — ERF probe, reach curves, confusion
-    or margin suite, entropy, winner margin.
-
-    The ERF probe overwrites the frozen patch's param with random noise and
-    restores it, so it measures the architecture's reach AT THE PLACEMENT THE
-    GENERATOR CHOSE. Under `--gen_placement gradcam` that is the honest control:
-    it answers "how far could ANY patch reach from here", separating the
-    geometric ceiling from what this generator achieved.
-    """
+    """The full diagnostic suite on ONE image — ERF probe, reach curves, confusion or margin suite, entropy, winner margin."""
     img, label, patch, out = frozen_patch_for(attack, dataset, idx, device,
                                               a.patch_scale)
     log(f"\n[diag] val image #{idx}  placement {tuple(out['placements'][0])}  "
@@ -391,10 +288,6 @@ def render_panels(attack, dataset, indices, device, out_dir, mean_t, std_t,
     if was_training and attack.generator is not None:
         attack.generator.train()
 
-
-# ═════════════════════════════════════════════════════════════════════════════
-#  Main
-# ═════════════════════════════════════════════════════════════════════════════
 
 def main():
     a = load_config(build_parser().parse_args())
@@ -428,13 +321,8 @@ def main():
           f"val {min(a.val_images, len(val_full))} imgs "
           f"@ {a.img_h}x{a.img_w}")
 
-    # ── the attack objective, shared by training, the CAM and evaluation ─────
     adv_loss = adversarial.build(
         a.loss_fn, a.target_class if a.loss_fn == "ipatch_cospgd" else 8)
-    # theta is shared across the dataset, so the q schedule spans the whole
-    # run: epochs x batches, not epochs. Rebound BEFORE the CAM is built so
-    # --cam_objective attack really does share the training objective rather
-    # than a default-constructed copy of it.
     total_steps = a.epochs * max(len(train_loader), 1)
     if a.loss_fn == "tsallis":
         adv_loss = adversarial.build(a.loss_fn, 8,
@@ -455,7 +343,6 @@ def main():
               "strictly stronger than --placement semantic, which reads only "
               "the clean prediction. Declare this in the writeup.")
 
-    # ── the generator: the ONLY trainable component ─────────────────────────
     gcfg = build_generator_config(a)
     generator = cg.ConditionalPatchGenerator(gcfg).to(device)
     gcfg.describe()
@@ -489,10 +376,6 @@ def main():
     panel_idx = [int(x) for x in a.panel_images.replace(",", " ").split()
                  if int(x) < len(val_full)] if a.panel_images.strip() else []
 
-    # ── BASELINE A, measured BEFORE training ────────────────────────────────
-    # The zero-initialised generator emits Delta == 0, so p_i == r_i exactly.
-    # Baseline A is therefore the generator's own starting point and the
-    # comparison is exact rather than approximate.
     baseline_a = None
     if a.eval_baseline_reference:
         print("\n[base] BASELINE A — p_i = r_i, raw centre crop, no generator")
@@ -510,7 +393,6 @@ def main():
                           out_dir / "panels" / "baseline_reference",
                           mean_t, std_t, title="BASELINE A (p_i = r_i)")
 
-    # ── training ────────────────────────────────────────────────────────────
     history, best, checked, t0 = [], -1e9, False, time.time()
     gstep = 0
     generator.train()
@@ -519,36 +401,31 @@ def main():
         running_att = running_lap = 0.0
         for imgs, labels in tqdm(train_loader,
                                  desc=f"epoch {epoch}/{a.epochs}"):
-            # GLOBAL step: theta is one shared parameter set optimised across
-            # the whole run, so q sweeps the run, not each epoch.
             if hasattr(adv_loss, "on_step_begin"):
                 adv_loss.on_step_begin(gstep, total_steps)
             gstep += 1
             imgs, labels = imgs.to(device), labels.to(device)
             opt.zero_grad()
 
-            out = attack(imgs, labels)               # steps 1-6
-            logits = upsample_to(model(out["patched"]), labels.shape[-2:])  # 7
+            out = attack(imgs, labels)
+            logits = upsample_to(model(out["patched"]), labels.shape[-2:])
 
             fp = out["footprint"]
             sup = (~fp) if a.exclude_footprint else None
-            l_att = adv_loss(logits, labels, fp, sup)                       # 8
-            lap = cg.lap_terms(out["patches"], out["references"],           # 9
+            l_att = adv_loss(logits, labels, fp, sup)
+            lap = cg.lap_terms(out["patches"], out["references"],
                                a.gen_lap_alpha, a.gen_lap_beta,
                                a.gen_lap_gamma)
-            total = l_att + lap["total"]                                    # 10
+            total = l_att + lap["total"]
 
             if not torch.isfinite(total):
                 raise RuntimeError(
                     f"non-finite loss at epoch {epoch}; valid remote px this "
                     f"batch = {int(((labels != 255) & (~fp)).sum())}")
 
-            total.backward()                                                # 11
+            total.backward()
 
             if not checked:
-                # The graph is longer here than in train.py — it runs back
-                # through the compositor AND the whole generator — so verify it
-                # once rather than discovering a dead head after an epoch.
                 gs = [q.grad for q in generator.parameters() if q.grad is not None]
                 if not gs:
                     raise RuntimeError(
@@ -560,8 +437,6 @@ def main():
                 print(f"[grad] output head    {float(head.abs().mean()):.3e}"
                       + ("   <- ZERO: nothing reaches the patch"
                          if float(head.abs().mean()) == 0.0 else ""))
-                # Same calibration train.py prints, on the SAME quantities the
-                # loop optimises. LAP terms are sums; the attack loss is a mean.
                 magnitude_report(
                     l_att.item(), out["patches"][0].detach(),
                     out["references"][0].detach(), None,
@@ -572,7 +447,7 @@ def main():
                                 reference="<per-image centre crop>"))
                 checked = True
 
-            opt.step()                                                      # 12
+            opt.step()
             running_att += float(l_att)
             running_lap += float(lap["total"])
 
@@ -608,16 +483,9 @@ def main():
                               out_dir / "panels" / f"epoch{epoch:04d}",
                               mean_t, std_t, title=f"epoch {epoch}")
 
-    # ── final ───────────────────────────────────────────────────────────────
     final = evaluate(attack, val_loader, device, a.num_classes, adv_loss,
                      a.exclude_footprint, tgt, lpips_metric)
 
-    # ── calibration for a LAP-constrained rerun ─────────────────────────────
-    # Same reasoning as train.py's end-of-run report, and it applies MORE
-    # strongly here: the head is zero-initialised, so p_i == r_i exactly at
-    # step 0 and L_rat is identically 0. Any alpha derived from the step-1
-    # report is a division by ~0. The meaningful scale is the DRIFT training
-    # produced, measured here on a real generated patch.
     generator.eval()
     with torch.no_grad():
         cal_img, cal_lbl = val_full[0]
@@ -663,7 +531,6 @@ def main():
         "wall_clock_s": time.time() - t0,
         "history": history,
     }
-    # tsallis ONLY — the schema for every other loss_fn is unchanged.
     if a.loss_fn == "tsallis":
         results["tsallis_q"] = adv_loss.q
     if panel_idx:
@@ -671,10 +538,6 @@ def main():
                       out_dir / "panels" / "final", mean_t, std_t,
                       title="final")
 
-    # ── labelled figures, same suite as train.py ────────────────────────────
-    # Panel (b) is the CLEAN PREDICTION rather than ground truth: the attack's
-    # effect is (clean pred -> adv pred), and scoring against GT would fold the
-    # model's own errors into what reads as attack damage.
     if panel_idx:
         print(f"\n[panels] rendering {len(panel_idx)} labelled image(s)")
         results["per_class_iou"] = {
@@ -683,11 +546,6 @@ def main():
                 out_dir / "panels" / "labelled", a, tgt, mean_t,
                 std_t).items()}
 
-    # ── post-training figure suite ──────────────────────────────────────────
-    # Numbers alone do not show WHERE the attack acted or WHAT it converted
-    # pixels into, and for this attack family they also cannot show whether the
-    # sensitivity-guided placement bought anything. The ERF probe answers the
-    # second question directly.
     if not a.no_diagnostics and a.diag_image < len(val_full):
         print("\n" + "=" * 70)
         print(f" FIGURES on val image #{a.diag_image}")
@@ -700,7 +558,6 @@ def main():
         json.dump(results, f, indent=2)
     cam.close()
 
-    # ── report ──────────────────────────────────────────────────────────────
     print("\n" + "=" * 70)
     print(f"  CONDITIONAL GENERATOR — {generator.n_parameters():,} shared params")
     print(f"  placement {a.gen_placement}   cond {a.gen_cond}   "

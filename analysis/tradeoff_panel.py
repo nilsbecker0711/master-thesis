@@ -1,71 +1,5 @@
 #!/usr/bin/env python
-r"""
-The ATTACK-SUCCESS / VISIBILITY TRADE-OFF, one panel per architecture.
-
-    python analysis/tradeoff_panel.py results/tradeoff/*/ \
-        --out figures/tradeoff_panel.png
-
-    python analysis/tradeoff_panel.py results/tradeoff/*/ \
-        --metrics any_flip_rate,drop_remote,final_visibility \
-        --x realised --normalise --out figures/tradeoff_realised.png
-
-WHAT IT DRAWS
--------------
-Rows are metrics (flip rate, mIoU drop, ...), columns are architectures. In
-each cell: the csf attack's effect against the perceptual budget it was given,
-with the UNCONSTRAINED arm (--patch_mode raw, same images, same optimiser) as a
-horizontal ceiling. The question the figure answers is not "does the attack
-work" but "how much of the unconstrained attack survives at a budget a human
-cannot see" -- and, for the architectures where the constrained attack
-currently does nothing, whether the curve is flat because the budget binds or
-flat all the way up to the ceiling because something else does.
-
-The ceiling is what makes the panel readable. A csf curve alone cannot
-distinguish "this architecture resists the attack" from "this architecture
-resists the CONSTRAINT", because both look like a small number. Run the raw arm
-on the same images or the panel is one curve and no claim.
-
-TAU IS A REQUEST, NOT AN OUTCOME
---------------------------------
-Above some tau the dynamic-range fit binds: the residual cannot grow further
-inside [0,1] on the content it covers, realised visibility stops tracking the
-request, and every larger tau produces the same residual as the last feasible
-one. This script finds that knee and SHADES EVERYTHING ABOVE IT, by the same
-rule scripts/sweep_operating_point.py:decide_tau_range() uses, so the flat
-right-hand end of a curve is never read as "the attack saturates" when what
-saturated was the budget. Nothing in the shaded region is a valid operating
-point.
-
-    --x tau        the requested budget. What you asked for.
-    --x realised   the visibility actually measured (final_visibility).
-                   The honest axis: it is monotone by construction and the
-                   knee cannot hide in it. Use it for the thesis figure and
-                   keep --x tau as the diagnostic.
-
-WHAT IT READS
--------------
-Any run directory this repository writes, in any of three layouts, told apart
-by which files are present:
-
-    summary.json with "records"    overfit_population.py  -> per-image spread,
-                                   mean with a bootstrap 95% CI
-    summary.json with "per_seed"   overfit.py --seeds N   -> mean +/- 1 sd
-    results.json                   overfit.py --seeds 1   -> a single sample,
-                                   drawn without an interval and labelled n=1
-
-Directories are classified by their config: --patch_mode csf/universal_csf
-becomes a point on the curve at its --csf_threshold, --patch_mode raw becomes
-the ceiling. Anything else (lap, gan) is skipped with a message rather than
-silently folded into one of the two.
-
-WHAT IT REFUSES TO DO QUIETLY
------------------------------
-A trade-off curve is only a curve if every point differs in tau ALONE. The
-loader records the other axes (steps, lr, loss, placement, image set,
-csf_param, enforcement) per point and warns, by name, about any that moves
-within an architecture. It still draws -- you may have a reason -- but the
-warning goes to the console and into the sidecar JSON.
-"""
+"""The ATTACK-SUCCESS / VISIBILITY TRADE-OFF, one panel per architecture."""
 from __future__ import annotations
 
 import argparse
@@ -79,8 +13,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from patchreach.metrics.population import describe
 
-# The two families this figure is about. lap/gan runs are a different
-# constraint and are skipped rather than plotted as though they were csf.
 CSF_MODES = ("csf", "universal_csf")
 CEILING_MODES = ("raw",)
 
@@ -93,9 +25,6 @@ METRIC_LABEL = {
     "final_visibility_local": "realised visibility, local contrast (JND)",
 }
 
-# The same metrics without their units, for --normalise, where the numbers are
-# no longer in those units. Carrying "(%)" onto an axis running 0 to 1 is a
-# mislabelled figure, not a cosmetic slip.
 METRIC_SHORT = {
     "any_flip_rate": "remote flip rate",
     "drop_remote": "remote mIoU drop",
@@ -105,17 +34,11 @@ METRIC_SHORT = {
     "final_visibility_local": "realised visibility, local contrast",
 }
 
-# The fields that must NOT move between two points of one curve. Printed by
-# name when they do -- "the curve mixes lr 0.01 and lr 0.2" is actionable,
-# "the curve is inconsistent" is not.
 AXES = ("loss_fn", "steps", "lr", "lr_schedule", "placement", "csf_param",
         "csf_enforce", "img_h", "img_w", "patch_scale", "image", "n_images",
         "sample_seed", "csf_lref")
 
 
-# -----------------------------------------------------------------------------
-#  reading a run
-# -----------------------------------------------------------------------------
 def load_run(d: Path) -> dict | None:
     """(config, rows, kind) for one run directory, or None if it is not one."""
     cfg, rows, kind = None, None, None
@@ -143,18 +66,7 @@ def load_run(d: Path) -> dict | None:
 
 
 def stat(rows: list, key: str, seed: int = 0) -> dict | None:
-    r"""
-    (mean, lo, hi, n) for one metric over a run's rows.
-
-    THE INTERVAL DEPENDS ON WHAT THE ROWS ARE, and the three cases are not
-    interchangeable. A population run's rows are images -- a sample of the
-    validation set -- so the bootstrap CI is the right interval and n is large
-    enough to earn one. A --seeds run's rows are repeats of ONE image: they
-    measure optimiser spread, not scene spread, so the band is +/- 1 sd and
-    must not be called a confidence interval. A single run has no interval at
-    all and is drawn without one, rather than with a zero-width one that would
-    read as a precise measurement.
-    """
+    """(mean, lo, hi, n) for one metric over a run's rows."""
     vals = [float(x[key]) for x in rows if x.get(key) is not None]
     if not vals:
         return None
@@ -173,23 +85,7 @@ def stat(rows: list, key: str, seed: int = 0) -> dict | None:
 
 
 def from_sweep(sweep_dir: Path, metrics: list, seed: int):
-    r"""
-    The tau ladder of a scripts/sweep_operating_point.py sweep, AT ITS OWN
-    OPERATING POINT, plus any raw arm dropped into the same cells/ directory.
-
-    A GLOB OVER cells/ CANNOT DO THIS, and the reason is the sweep's own
-    dedup. The star's centre lies on several stages at once, so the rung at the
-    incumbent tau is run ONCE and keeps whichever stage's tag reached it first
-    -- usually the lr stage's. Globbing cells/*_tau* therefore silently drops
-    that rung, while globbing cells/* picks up the whole lr ladder as a dozen
-    extra points stacked at one tau.
-
-    So the manifest is read instead: decisions[loss]["operating_point"] names
-    the lr, run length and enforcement the sweep chose for that objective, and
-    only cells matching it become curve points. That is also the only reading
-    under which the curve means anything -- a tau ladder assembled from cells
-    at four different learning rates is a picture of the lr grid.
-    """
+    """The tau ladder of a scripts/sweep_operating_point.py sweep, AT ITS OWN OPERATING POINT, plus any raw arm dropped into the same cells/ directory."""
     man_p = sweep_dir / "sweep.json"
     if not man_p.exists():
         return [], [], [(sweep_dir, "no sweep.json -- not a sweep directory")]
@@ -258,29 +154,8 @@ def collect(dirs: list, metrics: list, seed: int):
     return curve, ceiling, skipped
 
 
-# -----------------------------------------------------------------------------
-#  where tau stops controlling anything
-# -----------------------------------------------------------------------------
 def knee(points: list, slack: float) -> dict:
-    r"""
-    The largest tau the run actually held, and the rule that decided it.
-
-    TWO RULES, because the enforcement mode changes what "held" can mean.
-
-    enforce=realised   the run rescales every step to put realised visibility
-                       AT tau, so the test is realised/requested ~ 1. This is
-                       scripts/sweep_operating_point.py:decide_tau_range()'s
-                       rule, deliberately identical: two definitions of the
-                       usable range is one too many.
-
-    enforce=nominal    the bound is per-bin and realised visibility sits below
-                       the request by a factor nobody chose, so a ratio test
-                       would flag every rung. The operational question is the
-                       same either way -- does asking for more still GET
-                       more -- so the fallback is saturation: the last rung
-                       whose realised visibility grew by at least `slack` over
-                       the rung below it.
-    """
+    """The largest tau the run actually held, and the rule that decided it."""
     rows = sorted([p for p in points if p.get("final_visibility")],
                   key=lambda p: p["tau"])
     if not rows:
@@ -316,19 +191,7 @@ def knee(points: list, slack: float) -> dict:
 
 
 def dedup_identical(points: list) -> tuple:
-    r"""
-    Collapse points that are the SAME CONFIGURATION at the same tau.
-
-    The sweep dedups its overlapping stages, so this should be a no-op on a
-    clean sweep -- but a --force re-run, or a sweep resumed after its manifest
-    was lost, leaves two directories holding the same cell, and a curve drawn
-    through both zig-zags between two samples of one condition. Identical
-    configurations are one point; the run with the most rows behind it wins.
-
-    Points that share a tau but DIFFER in some axis are left alone: those are
-    two conditions, the caller warns about them by name, and silently keeping
-    one would be choosing a result.
-    """
+    """Collapse points that are the SAME CONFIGURATION at the same tau."""
     by_key: dict = {}
     for p in points:
         key = (p["tau"], json.dumps(p["axes"], sort_keys=True, default=str))
@@ -340,7 +203,7 @@ def dedup_identical(points: list) -> tuple:
 
 
 def axis_drift(points: list) -> dict:
-    """Fields that move between points of one curve. Empty is what you want."""
+    """Fields that move between points of one curve."""
     drift = {}
     for k in AXES:
         vals = {json.dumps(p["axes"].get(k)) for p in points if k in p["axes"]}
@@ -350,9 +213,6 @@ def axis_drift(points: list) -> dict:
     return drift
 
 
-# -----------------------------------------------------------------------------
-#  the figure
-# -----------------------------------------------------------------------------
 def draw(by_arch: dict, metrics: list, x_key: str, normalise: bool,
          slack: float, out: Path, title, ceiling_pick: str,
          share_y: bool) -> dict:
@@ -363,12 +223,6 @@ def draw(by_arch: dict, metrics: list, x_key: str, normalise: bool,
     archs = list(by_arch)
     nrow, ncol = len(metrics), len(archs)
 
-    # THE LEGEND IS FIGURE-LEVEL, so its labels cannot carry per-column
-    # numbers. Previously it lived inside the top-left cell, which made it one
-    # architecture's legend describing three, and cost that cell the corner the
-    # annotation now uses. Sample sizes move to the column titles, where they
-    # belong to the column they describe; anything that happens to be uniform
-    # across the whole figure is folded into the shared label instead.
     bands = {p[m]["band"] for d in by_arch.values() for p in d["curve"]
              for m in metrics if p.get(m)}
     n_ceil = {len(d["ceiling"]) for d in by_arch.values()}
@@ -379,10 +233,6 @@ def draw(by_arch: dict, metrics: list, x_key: str, normalise: bool,
     CEIL_LABEL = f"unconstrained (raw){ceil_txt}"
     SHADE_LABEL = "tau no longer held (range fit binds)"
     unnormalised: list = []
-    # sharey="row" BY DEFAULT, because the columns are architectures and the
-    # comparison the panel exists for is across them. Per-axis autoscaling
-    # makes a 25-point drop and a 55-point drop draw the same curve, which is
-    # the one reading of this figure that must not be possible by accident.
     fig, axes = plt.subplots(nrow, ncol, squeeze=False, sharex=True,
                              sharey=("row" if share_y else False),
                              figsize=(4.3 * ncol, 3.1 * nrow))
@@ -405,7 +255,6 @@ def draw(by_arch: dict, metrics: list, x_key: str, normalise: bool,
             else:
                 xs = [p["tau"] for p in rows]
 
-            # THE CEILING FIRST, because --normalise needs its denominator.
             cy = None
             cand = [c for c in ceil if c.get(m)]
             if cand:
@@ -423,9 +272,6 @@ def draw(by_arch: dict, metrics: list, x_key: str, normalise: bool,
 
             den = cy if (normalise and cy and abs(cy) > 1e-9) else 1.0
             if normalise and den == 1.0:
-                # A column with no ceiling stays in raw units while its
-                # neighbours become fractions -- and the row shares a y axis,
-                # so the two are drawn on one scale. Silently unreadable.
                 unnormalised.append(f"{arch}/{m}")
             if rows:
                 ys = np.array([p[m]["mean"] / den for p in rows])
@@ -438,33 +284,16 @@ def draw(by_arch: dict, metrics: list, x_key: str, normalise: bool,
                             color="#4c72b0", ecolor="#4c72b0", elinewidth=1,
                             zorder=3, label=CSF_LABEL)
 
-            # EVERYTHING ABOVE THE KNEE IS SHADED. Those runs happened and are
-            # still drawn, but a flat tail inside the shading is the budget
-            # saturating, not the attack.
             if x_key == "tau" and k.get("tau_max_tracking") and xs:
                 tmax = k["tau_max_tracking"]
                 if tmax < max(xs):
                     ax.axvspan(tmax, max(xs) * 1.15, color="#888", alpha=0.13,
                                zorder=0, label=SHADE_LABEL)
 
-            # 1 JND IS THE ONLY LANDMARK ON EITHER AXIS. Both are visibility
-            # in JND, and 1.0 is the detection threshold -- the same number
-            # analysis/pick_lr.py defaults its ceiling to. Left of it the
-            # perturbation is below threshold, which is the entire claim of
-            # this attack family; right of it the figure is measuring how
-            # strong a VISIBLE perturbation can be, which is a different
-            # question. Drawn so the reader does not have to hold that
-            # boundary in their head while reading a log axis.
             if xs and min(xs) < 1.0 < max(xs) * 1.15:
                 ax.axvline(1.0, color="#555", lw=1.0, ls=":", zorder=1,
                            label="1 JND (detection threshold)")
 
-            # LOG ON BOTH AXES CHOICES. Requested tau spans 0.05 to 16 and
-            # realised visibility spans the same two decades, because it is
-            # the same quantity measured instead of asked for. On a linear
-            # realised axis every rung below 1 JND -- which is every rung that
-            # is actually invisible, i.e. the entire operating range -- piles
-            # up against the left spine.
             ax.set_xscale("log")
             if i == 0:
                 ns = {p[mm]["n"] for p in pts for mm in metrics if p.get(mm)}
@@ -478,19 +307,8 @@ def draw(by_arch: dict, metrics: list, x_key: str, normalise: bool,
                 ax.set_xlabel("requested tau (JND)" if x_key == "tau"
                               else "realised visibility (JND)", fontsize=9)
             ax.grid(alpha=0.25, lw=0.6)
-            # EVERY ROW KEEPS ITS TICK LABELS. sharex hides them on all but the
-            # bottom row by default, which leaves the middle rows as curves
-            # against an unlabelled axis -- the reader has to count gridlines
-            # down to the bottom row to find out what x is. The rows are
-            # different METRICS, not different slices of one plot, so each has
-            # to be readable where it sits. The axis NAME stays on the bottom
-            # row only: it is the same axis three times over and repeating the
-            # words adds nothing the numbers do not already say.
             ax.tick_params(labelsize=8, labelbottom=True)
 
-            # The number the figure exists to produce: how much of the
-            # unconstrained attack survives at the strongest budget that was
-            # actually held.
             held = [p for p in rows
                     if k.get("tau_max_tracking") is not None
                     and p["tau"] <= k["tau_max_tracking"]]
@@ -500,12 +318,6 @@ def draw(by_arch: dict, metrics: list, x_key: str, normalise: bool,
                 notes[arch].setdefault("frac_of_ceiling", {})[m] = {
                     "tau": top["tau"], "value": top[m]["mean"],
                     "ceiling": cy, "percent": frac}
-                # BOTTOM RIGHT, not top left. These curves rise from the
-                # bottom left, and the ceiling line they are quoted against
-                # runs across the TOP -- which is exactly where the annotation
-                # used to sit, printed over the line it refers to. Under the
-                # plateau on the right is the one region of an increasing
-                # curve that is reliably empty.
                 ax.annotate(f"{frac:.0f}% of ceiling\nat tau={top['tau']:g}",
                             xy=(0.97, 0.04), xycoords="axes fraction",
                             fontsize=8, ha="right", va="bottom", color="#333",
@@ -525,11 +337,6 @@ def draw(by_arch: dict, metrics: list, x_key: str, normalise: bool,
     else:
         fig.tight_layout()
 
-    # ONE LEGEND, UNDER THE WHOLE FIGURE, built from whichever artists actually
-    # got drawn -- a panel with no ceiling arm contributes no ceiling entry,
-    # and a figure where tau never stopped tracking gets no shading entry
-    # rather than a key to a band that is not there. Placed after
-    # tight_layout and below the axes; savefig's tight bbox picks it up.
     handles, labels = [], []
     for row in axes:
         for ax in row:
@@ -549,7 +356,6 @@ def draw(by_arch: dict, metrics: list, x_key: str, normalise: bool,
     return notes
 
 
-# -----------------------------------------------------------------------------
 def main():
     p = argparse.ArgumentParser(
         description="Attack-success / visibility trade-off panel, one column "
@@ -647,9 +453,6 @@ def main():
                   "    Run --patch_mode raw on the same images.")
         dupes = sorted({t for t in taus if taus.count(t) > 1})
         if dupes:
-            # TWO POINTS AT ONE TAU IS NOT A CURVE, it is two conditions drawn
-            # as one. Almost always a glob that swept up an lr ladder or an
-            # enforcement arm; the drift warning below names which field moved.
             print(f"    WARNING: {len(dupes)} tau value(s) appear more than "
                   f"once ({', '.join(f'{t:g}' for t in dupes)}). The line "
                   f"will zig-zag through them.")

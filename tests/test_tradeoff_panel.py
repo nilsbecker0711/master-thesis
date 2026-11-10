@@ -1,32 +1,4 @@
-r"""
-Invariants for the trade-off panel — analysis/tradeoff_panel.py.
-
-The figure this script draws is read as an argument: "the constrained attack
-reaches X% of the unconstrained one at a budget the eye cannot see". Every
-failure below produces a plausible-looking panel and no error, which is the
-only kind worth a test here:
-
-  a curve assembled at mixed learning rates   a picture of the lr grid, filed
-                                              as a picture of tau. The sweep's
-                                              stage overlap makes this the
-                                              DEFAULT outcome of globbing
-                                              cells/, so from_sweep() reads the
-                                              manifest instead.
-  the knee missed                             the flat tail then reads as "the
-                                              attack saturates" when what
-                                              saturated was the budget, and
-                                              every tau above it gets quoted as
-                                              an operating point.
-  a seed spread drawn as a confidence
-  interval                                    +/- 1 sd over three repeats of
-                                              ONE image is not an interval over
-                                              scenes, and the two must not
-                                              share a label.
-  a raw arm folded into the curve             the ceiling would become a point
-                                              on the thing it is meant to bound.
-
-Run with: pytest -q tests/test_tradeoff_panel.py
-"""
+"""Invariants for the trade-off panel — analysis/tradeoff_panel.py."""
 import importlib.util
 import json
 import sys
@@ -44,9 +16,6 @@ sys.modules["tradeoff_panel"] = TP
 _spec.loader.exec_module(TP)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-#  fixtures
-# ─────────────────────────────────────────────────────────────────────────────
 def cfg(arch="segformer_b0", mode="csf", tau=0.25, lr=0.01, steps=1000,
         enforce="realised", **kw):
     d = {"arch": arch, "patch_mode": mode, "csf_threshold": tau,
@@ -92,9 +61,6 @@ def write_single(root, name, c, drop=10.0, vis=0.25):
 METRICS = ["any_flip_rate", "drop_remote"]
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-#  the three layouts, and the interval each one earns
-# ─────────────────────────────────────────────────────────────────────────────
 def test_population_gets_a_bootstrap_interval(tmp_path):
     d = write_population(tmp_path, "pop", cfg())
     run = TP.load_run(d)
@@ -126,9 +92,6 @@ def test_a_directory_with_no_results_is_not_a_run(tmp_path):
     assert TP.load_run(d) is None
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-#  classification
-# ─────────────────────────────────────────────────────────────────────────────
 def test_raw_becomes_the_ceiling_and_lap_is_skipped(tmp_path):
     write_population(tmp_path, "csf", cfg(tau=0.5))
     write_population(tmp_path, "raw", cfg(mode="raw"), drop=40.0)
@@ -141,9 +104,6 @@ def test_raw_becomes_the_ceiling_and_lap_is_skipped(tmp_path):
     assert len(skipped) == 1 and "lap" in skipped[0][1]
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-#  the knee
-# ─────────────────────────────────────────────────────────────────────────────
 def _pt(tau, vis, enforce="realised"):
     return {"tau": tau, "enforce": enforce,
             "final_visibility": {"mean": vis, "lo": None, "hi": None, "n": 1,
@@ -151,7 +111,6 @@ def _pt(tau, vis, enforce="realised"):
 
 
 def test_knee_under_realised_is_where_the_request_stops_being_met():
-    # realised tracks tau to 2.0, then the range fit pins it there
     pts = [_pt(0.25, 0.25), _pt(0.5, 0.5), _pt(1.0, 1.0), _pt(2.0, 2.0),
            _pt(4.0, 2.05), _pt(8.0, 2.05)]
     k = TP.knee(pts, 0.05)
@@ -179,20 +138,17 @@ def test_knee_reports_rather_than_guesses_without_visibility():
     assert k["tau_max_tracking"] is None and "no realised" in k["rule"]
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-#  duplicates and drift
-# ─────────────────────────────────────────────────────────────────────────────
 def test_identical_cells_collapse_but_differing_ones_do_not(tmp_path):
     write_population(tmp_path, "a", cfg(tau=0.5), n=12)
-    write_population(tmp_path, "b", cfg(tau=0.5), n=9)      # same config
-    write_population(tmp_path, "c", cfg(tau=0.5, lr=0.2))   # a real difference
+    write_population(tmp_path, "b", cfg(tau=0.5), n=9)
+    write_population(tmp_path, "c", cfg(tau=0.5, lr=0.2))
     dirs = sorted(p for p in tmp_path.iterdir() if p.is_dir())
     curve, _, _ = TP.collect(dirs, METRICS, 0)
 
     kept, collapsed = TP.dedup_identical(curve)
-    assert collapsed == 1                       # a and b were one cell
-    assert len(kept) == 2                       # c is a second condition
-    assert max(p["n_rows"] for p in kept) == 12  # the fuller run won
+    assert collapsed == 1
+    assert len(kept) == 2
+    assert max(p["n_rows"] for p in kept) == 12
     assert "lr" in TP.axis_drift(kept)
 
 
@@ -204,25 +160,15 @@ def test_axis_drift_is_silent_on_a_clean_ladder(tmp_path):
     assert TP.axis_drift(curve) == {}
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-#  reading a sweep at its operating point
-# ─────────────────────────────────────────────────────────────────────────────
 def test_sweep_is_read_at_the_operating_point_not_globbed(tmp_path):
-    r"""
-    The sweep's stage overlap means the incumbent-tau rung lives under the lr
-    stage's tag and the lr ladder shares its tau. Globbing cells/ therefore
-    yields a curve at four learning rates; the manifest is what disambiguates.
-    """
+    """The sweep's stage overlap means the incumbent-tau rung lives under the lr stage's tag and the lr ladder shares its tau."""
     root = tmp_path / "sweep"
     cells = root / "cells"
     cells.mkdir(parents=True)
-    # the lr ladder, all at tau 0.25 — only lr 0.01 is the operating point
     for lr in (0.003, 0.01, 0.03):
         write_seeds(cells, f"lr{lr}_tau0.25", cfg(tau=0.25, lr=lr))
-    # the tau ladder at the chosen lr, with NO tau 0.25 cell (deduped away)
     for t in (0.5, 1.0, 2.0):
         write_seeds(cells, f"tau{t}", cfg(tau=t, lr=0.01))
-    # a cell at another run length, which must not enter either
     write_seeds(cells, "steps200", cfg(tau=0.25, lr=0.01, steps=200))
     write_population(cells, "ceiling", cfg(mode="raw"), drop=40.0)
     (root / "sweep.json").write_text(json.dumps({
@@ -240,8 +186,7 @@ def test_sweep_is_read_at_the_operating_point_not_globbed(tmp_path):
 
 def test_sweep_without_a_decision_keeps_everything_rather_than_nothing(
         tmp_path):
-    """An aborted sweep still has cells; it must not silently plot an empty
-    panel."""
+    """An aborted sweep still has cells; it must not silently plot an empty panel."""
     root = tmp_path / "sweep"
     cells = root / "cells"
     cells.mkdir(parents=True)
@@ -260,9 +205,6 @@ def test_a_directory_that_is_not_a_sweep_says_so(tmp_path):
     assert "sweep.json" in skipped[0][1]
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-#  the figure itself
-# ─────────────────────────────────────────────────────────────────────────────
 def test_draw_writes_a_figure_and_reports_the_fraction_of_the_ceiling(
         tmp_path):
     pytest.importorskip("matplotlib")
@@ -283,7 +225,7 @@ def test_draw_writes_a_figure_and_reports_the_fraction_of_the_ceiling(
     assert out.exists() and out.with_suffix(".pdf").exists()
 
     n = notes["segformer_b0"]
-    assert n["knee"]["tau_max_tracking"] == 1.0        # 2.0 did not track
+    assert n["knee"]["tau_max_tracking"] == 1.0
     frac = n["frac_of_ceiling"]["drop_remote"]
-    assert frac["tau"] == 1.0                          # quoted at the knee...
-    assert 45 < frac["percent"] < 60                   # ...not at tau 2.0
+    assert frac["tau"] == 1.0
+    assert 45 < frac["percent"] < 60

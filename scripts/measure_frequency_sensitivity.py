@@ -1,39 +1,5 @@
 #!/usr/bin/env python
-r"""
-Frequency-resolved sensitivity probe — WHICH BANDS DOES THE NETWORK READ?
-NO TRAINING.
-
-    python scripts/measure_frequency_sensitivity.py --arch segformer_b0 \
-        --cityscapes_root $CS --img_h 512 --img_w 1024 --n_images 5
-
-THIS IS A RESULT, NOT SETUP, and it tests the premise the whole CSF attack
-family rests on. csf.py bounds a perturbation by what the EYE can see and
-assumes the NETWORK still reads it. That assumption has never been measured,
-and csf.py's own header names the way it could fail: SegFormer's patch
-embedding has stride 4, so the highest frequencies may be attenuated before the
-first attention block ever sees them.
-
-The instrument is measure_erf.py's, moved from the spatial domain to the
-frequency domain: maximal random stimulus, prediction change, no ground truth
-and no target class. LABEL-FREE AND DATASET-INDEPENDENT, so ADE20K weights are
-valid here exactly as they are for the ERF probe — which is what makes the
-three-bracket comparison possible without Cityscapes weights for every arch.
-
-THE CONTROL: every band is normalised to the same perceptual cost before it is
-injected, so the question is "per unit of visibility, which band buys the most
-prediction change?" rather than the uninterpretable equal-amplitude version.
-Run --normalise rms to get the equal-amplitude control alongside it.
-
-READ THE TWO TABLES TOGETHER. The run prints csf.report()'s amplitude budget by
-band, then the sensitivity by the SAME bands. The exploitable gap is where a
-large budget meets a high flip rate. A large budget meeting a dead band is the
-premise failing.
-
-PREDICTION: if the CSF premise holds, flip rate should stay substantial toward
-Nyquist, where the budget is orders of magnitude larger. If it collapses there,
-the attack is bounded by the backbone's input stride rather than by tau, and
-better to know that before the tau ladder is run.
-"""
+"""Frequency-resolved sensitivity probe — WHICH BANDS DOES THE NETWORK READ?"""
 from __future__ import annotations
 
 import argparse
@@ -125,15 +91,9 @@ def main():
     geometry = csf_mod.ViewingGeometry(a.csf_pixel_size_cm,
                                        a.csf_viewing_distance_cm)
 
-    # The budget table FIRST, over a patch-sized grid, so the sensitivity table
-    # below can be read directly against it. A large budget meeting a dead band
-    # is the premise failing; a large budget meeting a live band is the gap.
     print(f"\n{'=' * 72}")
     print(" WHAT THE EYE ALLOWS — amplitude budget by band")
     print(f"{'=' * 72}")
-    # The table must describe THIS run. a.csf_threshold is the attack modes'
-    # default and is unrelated to --target, so printing it made all four rungs
-    # of a tau ladder show an identical header reading "tau = 0.25".
     header_tau = target if a.normalise == "visibility" else a.csf_threshold
     csf_report = csf_mod.report(a.patch_size, a.patch_size, geometry,
                                 a.csf_model, header_tau, a.csf_min_cycles)
@@ -147,9 +107,6 @@ def main():
     for i in idxs:
         img = ds[i][0].unsqueeze(0).to(device)
         print(f"\n--- image {i} ---")
-        # ORDERING: clean forward -> resolve_placement -> probe. Semantic
-        # placement reads the CLEAN PREDICTION; backwards it silently uses
-        # centre. train.py documents the same sequence.
         with torch.no_grad():
             clean_logits = upsample_to(model(img), (a.img_h, a.img_w))
         patch.resolve_placement(a.img_h, a.img_w, clean_logits.argmax(1)[0])

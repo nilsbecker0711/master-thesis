@@ -1,68 +1,5 @@
 #!/usr/bin/env python
-r"""
-Per-image attacks over a POPULATION of images — overfit.py at sample size.
-
-    python scripts/overfit_population.py --arch segformer --cityscapes_root $CS \
-        --patch_mode csf --from_image --loss_fn cospgd \
-        --images random --n_images 100 --steps 300
-
-WHAT THIS IS
-------------
-ONE PATCH PER IMAGE, optimised independently, exactly as scripts/overfit.py
-does it — the same function, patchreach/patch/optimise.attack_image(), so the
-two cannot drift. This is BASELINE B at sample size: the approximate upper
-bound on what direct optimisation achieves, now with an interval around it
-instead of an anecdote.
-
-It is NOT a universal patch. train.py optimises one tensor across the dataset
-and applies it unchanged to every image; that is a different threat model with
-a different (much harder) problem, and the two sets of numbers must never be
-merged. See the note in train_conditional_generator.py for the three-way
-distinction.
-
-HOW MANY IMAGES
----------------
-Cityscapes val is 500 images. Two reference points from the literature:
-
-  Nesti et al., WACV 2022   patches optimised on 250 images sampled from the
-                            training set; "the entire validation set was used
-                            to evaluate the effectiveness of the patches".
-  Gu et al., ECCV 2024      "Following general practice, we evaluate over the
-    (Trying Harder Pays Off) validation sets of PASCAL VOC 2012 and
-                            Cityscapes" — i.e. the full set, no subsampling.
-
-The convention is therefore the FULL validation set where the attack is cheap
-enough, and a sampled subset where it is not. A per-image patch at 300 steps is
-in between, so the run reports the precision it achieved and the n that would
-be needed for a given interval — see population.images_needed(). Quote the
-interval, not a bare mean, and record --sample_seed so the subset is
-reproducible.
-
-DIAGNOSTICS COME IN TWO KINDS AND ONLY ONE IS PER IMAGE
--------------------------------------------------------
-AGGREGATED, over every image in the population, into <out_dir>/aggregate/.
-Everything that is pure post-processing on the clean and adversarial logits —
-the confusion flows, the reach curve, the ring profiles, contestability, the
-pooled per-class IoU, the realised CSF visibility, the convergence band — costs
-a few [H,W] reductions per image and is therefore run on all of them. Those
-figures are what a mechanism claim should be quoted from. See
-patchreach/diagnostics/aggregate.py. --no_aggregate turns it off.
-
-PER IMAGE, into <out_dir>/diagnostics/imgNNNN/, for --n_panels images only.
-The panel suite additionally costs an ERF probe (n_probes forward passes, and a
-MODEL property that does not vary by image) and a dozen figures, which over
-hundreds of images dominates the run and produces figures nobody opens.
---panel_select decides which images those are; the default is `spread`
-(best + median + worst) rather than `best`, because a panel figure showing only
-the strongest attacks contradicts the distribution the summary reports. With
-the aggregate suite on, `best` becomes defensible — the panels then illustrate
-a claim the pooled figures carry, rather than being the evidence for it — but
-that is a decision to make deliberately, so the default does not change.
-
-RESUMABLE. Every image's record and the pooled confusion matrices are
-checkpointed as the run proceeds, so a job killed at the walltime continues
-from where it stopped with --resume.
-"""
+"""Per-image attacks over a POPULATION of images — overfit.py at sample size."""
 from __future__ import annotations
 
 import argparse
@@ -122,10 +59,6 @@ def build_parser():
                         "9.6 points of remote drop (see "
                         "attack_image's lr_schedule note). Pair with "
                         "--pixel_param direct for the full PGD recipe.")
-    # Same default as overfit.py, deliberately. optimise.py's header states the
-    # rule: anything that changes the attack changes BOTH callers or neither,
-    # or the population numbers stop matching the single-image numbers and
-    # nothing says why.
     p.add_argument("--lr_schedule", default="cosine",
                    choices=["none", "cosine"],
                    help="Anneal lr to zero over each image's run. 'none' "
@@ -193,9 +126,6 @@ def main():
     if a.out_dir:
         out_dir = Path(a.out_dir)
     else:
-        # Non-default arms only, so directories written before these flags
-        # existed keep their names and results/population does not fork
-        # into two conventions.
         arm = "_".join(x for x in
                        ["" if a.optimiser == "adam" else a.optimiser,
                         "" if a.pixel_param == "sigmoid"
@@ -212,11 +142,6 @@ def main():
 
     target = a.target_class if a.loss_fn == "ipatch_cospgd" else None
     pop = pop_mod.Population(a.num_classes, device=device, target_class=target)
-    # Its own checkpoint, not a field on Population — see the note in
-    # aggregate.PopulationDiagnostics. That also means a run resumed into a
-    # directory written before this existed has pooled metrics for every image
-    # and pooled DIAGNOSTICS for none, which is a silent half-measurement if
-    # nobody says so.
     diag = aggregate.PopulationDiagnostics(a.num_classes) if a.aggregate else None
 
     if a.resume and state_path.exists():
@@ -248,9 +173,6 @@ def main():
           f"{a.arch} ({spec.bracket} attention)")
     print(f"{'=' * 72}")
 
-    # ONE CAM for the whole run. It registers a forward hook on the backbone,
-    # so rebuilding it per image would stack hundreds of live hooks on a frozen
-    # model and silently slow every forward pass in the run.
     cam = None
     if a.placement == "gradcam":
         cam = segmentation_cam.build(
@@ -268,9 +190,6 @@ def main():
         img = img.unsqueeze(0).to(device)
         label = label.unsqueeze(0).to(device)
 
-        # A FRESH patch per image. Carrying one over would make image k's
-        # result depend on image k-1 and turn this into a sequential universal
-        # patch by accident — a different threat model, silently.
         patch = build_patch(a, device, mean_t, std_t)
         clean_logits = optimise.prepare(model, img, patch, a.img_h, a.img_w,
                                         a.from_image, mean_t, std_t,
@@ -291,15 +210,9 @@ def main():
             patched, fp = patch.apply(img)
             adv_logits = upsample_to(model(patched), label.shape[-2:])
         pop.update(clean_logits, adv_logits, label, fp, rec)
-        # BEFORE the record is written out: records.jsonl and summary.json both
-        # strip `history`, and the convergence band is built from it.
         if diag is not None:
             diag.update(clean_logits, adv_logits, label, fp, rec)
 
-        # Checkpoint after EVERY image: the pooled confusion matrices are not
-        # recoverable from the per-image records, so losing them to a walltime
-        # kill would cost the whole run rather than the current image. The same
-        # is true of every tensor in the aggregate suite.
         atomic_save(pop.state_dict(), state_path)
         if diag is not None:
             atomic_save(diag.state_dict(), agg_path)
@@ -317,9 +230,6 @@ def main():
 
     if cam is not None:
         if getattr(cam, "n_degenerate", 0):
-            # A fully-suppressed map carries no localisation information, so
-            # those images were CENTRED. Saying so matters: silently counting
-            # them as gradcam-placed would dilute the very effect being measured.
             print(f"\n  NOTE: the sensitivity map was degenerate (ReLU "
                   f"suppressed every channel) on {cam.n_degenerate} images;")
             print(f"        those fell back to CENTRE placement and are not "
@@ -335,10 +245,6 @@ def main():
                               title=f"{a.arch} — {a.patch_mode} / {a.loss_fn}",
                               highlight=[r["image"] for r in panels])
 
-    # ── the pooled suite, over every image ───────────────────────────────────
-    # Written BEFORE the panels, because the panels are the expensive part and
-    # the aggregate is the part the claims are quoted from. If a walltime kill
-    # lands between the two, the run still produced its evidence.
     agg = None
     if diag is not None and diag.n_images:
         agg_dir = out_dir / "aggregate"
@@ -389,10 +295,6 @@ def main():
             print(f"    image {i}: no checkpoint, skipped")
             continue
         patch = Patch.load(ck, device, mean_t, std_t)
-        # Patch.save() stores the parameter, the config and the placement — NOT
-        # the reference. For --from_image the base is the image region, so it
-        # has to be re-derived here or render() silently falls back to 0.5 grey
-        # and the panels show a patch that was never optimised.
         if a.from_image:
             patch.set_reference_from_image(img, mean_t, std_t)
 
@@ -405,8 +307,6 @@ def main():
         report.per_class_iou_figure(clean_logits, adv_logits, label,
                                     a.num_classes, d / "per_class_iou.png",
                                     target, title=f"val image {i}")
-        # The ERF probe is a MODEL property, not an image one, so it runs once
-        # rather than once per panel — report.run's own flag for exactly this.
         report.run(model, img, label, patch, d, a.loss_fn, a.num_classes,
                    target, mean_t, std_t, skip_geometric=(rank > 0),
                    log=lambda *_, **__: None)
@@ -415,9 +315,6 @@ def main():
     with open(out_dir / "summary.json", "w") as f:
         json.dump({"config": {**vars(a), "images": idxs},
                    "summary": summary,
-                   # A POINTER, not a copy. aggregate.json is the file that
-                   # holds the pooled diagnostics; duplicating a few hundred
-                   # numbers here is how the two would come to disagree.
                    "aggregate": ({"n_images": agg["n_images"],
                                   "file": "aggregate/aggregate.json"}
                                  if agg else None),

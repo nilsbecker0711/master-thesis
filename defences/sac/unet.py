@@ -1,31 +1,4 @@
-r"""
-The SAC patch segmenter's U-Net topology.
-
-THIS FILE EXISTS ONLY SO THE RELEASED state_dict LOADS. It reproduces the
-module tree of SegmentAndComplete's `unet/` (itself the standard
-milesial/Pytorch-UNet layout) exactly — same attribute names, same channel
-schedule, same bilinear upsampling — because a checkpoint is keyed by attribute
-path and any rename turns loading into a silent partial load. Nothing here is
-ours and nothing here should be "improved": the parameter names ARE the
-interface.
-
-CHANNEL SCHEDULE for base_filter=f, bilinear=True (the released coco_at.pth is
-f=16, which is what SAC's own eval script passes as --n_filter 16):
-
-    inc    3 -> f          down1  f   -> 2f      down2  2f -> 4f
-    down3  4f -> 8f        down4  8f  -> 8f      (bilinear halves the bottleneck)
-    up1  16f -> 4f         up2  8f -> 2f         up3  4f -> f
-    up4   2f -> f          outc  f -> 1
-
-The decoder's in_channels are post-concatenation, which is why up1 takes 16f
-(8f from down4 + 8f from the down3 skip) and emits 4f.
-
-VERIFY ON LOAD, NEVER ASSUME. load_sac_unet() calls load_state_dict with
-strict=True and reports the parameter count. base_filter is the one number that
-can be wrong without an exception — a mismatched f raises on shape, but a
-checkpoint trained at a different f with coincidentally compatible shapes would
-not, so the count is printed.
-"""
+"""The SAC patch segmenter's U-Net topology."""
 from __future__ import annotations
 
 from pathlib import Path
@@ -81,7 +54,6 @@ class Up(nn.Module):
 
     def forward(self, x1, x2):
         x1 = self.up(x1)
-        # Odd input sizes make the upsampled tensor one short of the skip.
         dy = x2.size(2) - x1.size(2)
         dx = x2.size(3) - x1.size(3)
         x1 = F.pad(x1, [dx // 2, dx - dx // 2, dy // 2, dy - dy // 2])
@@ -98,7 +70,7 @@ class OutConv(nn.Module):
 
 
 class UNet(nn.Module):
-    """Emits a ONE-channel LOGIT map. The sigmoid is applied by the caller."""
+    """Emits a ONE-channel LOGIT map."""
 
     def __init__(self, n_channels=3, n_classes=1, bilinear=True,
                  base_filter=64):
@@ -134,19 +106,7 @@ class UNet(nn.Module):
 
 def load_sac_unet(ckpt: str, base_filter: int = 16, device="cpu",
                   log=print) -> UNet:
-    r"""
-    Build the segmenter and load a released SAC checkpoint, strictly.
-
-    `ckpt` is SAC's `ckpts/coco_at.pth` (4,385,199 bytes — the self
-    adversarially trained COCO segmenter, base_filter=16) or the APRICOT-Mask
-    checkpoint (base_filter=64, and SAC runs that one at HALF resolution; pass
-    --sac_image_scale 0.5 if you use it).
-
-    strict=True ON PURPOSE. A U-Net loaded non-strictly with a few missing
-    decoder weights still runs, still emits a mask, and that mask is noise.
-    There is no symptom downstream except a defence that mysteriously does
-    nothing, which reads exactly like a successful attack.
-    """
+    """Build the segmenter and load a released SAC checkpoint, strictly."""
     p = Path(ckpt)
     if not p.is_file():
         raise SystemExit(
@@ -159,8 +119,6 @@ def load_sac_unet(ckpt: str, base_filter: int = 16, device="cpu",
             f"/main/ckpts/coco_at.pth\n")
     net = UNet(3, 1, bilinear=True, base_filter=base_filter)
     sd = torch.load(str(p), map_location="cpu")
-    # SAC saves detector.unet.state_dict() directly, but a checkpoint that went
-    # through DataParallel or through the whole PatchDetector carries a prefix.
     if not any(k.startswith("inc.") for k in sd):
         for pre in ("module.", "unet.", "module.unet."):
             if any(k.startswith(pre) for k in sd):

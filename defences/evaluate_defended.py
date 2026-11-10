@@ -1,58 +1,5 @@
 #!/usr/bin/env python
-r"""
-Evaluate a trained patch WITH a defence in front of the model. NO TRAINING.
-
-    # the 2x2: clean/attacked x undefended/defended, on the fixed ten
-    python defences/evaluate_defended.py --defence sac --sac_ckpt $SAC/coco_at.pth \
-        --checkpoint results/overfit/<run>/best.pt --arch segformer_b0 \
-        --cityscapes_root $CS --img_h 512 --img_w 1024 --from_image
-
-    # the clean-image price alone, over the whole val split (no --checkpoint)
-    python defences/evaluate_defended.py --defence sac --sac_ckpt $SAC/coco_at.pth \
-        --arch segformer_b0 --cityscapes_root $CS --img_h 512 --img_w 1024 \
-        --images all
-
-THIS SCRIPT EXISTS SO scripts/ STAYS UNTOUCHED. It imports the shared plumbing
-(`add_model_args`, `setup_model`, `make_dataset`, `image_indices`) from
-scripts/_common.py without modifying it, then wraps the model it gets back. No
-existing entry point gains a flag, so no existing run changes by a single digit.
-
-TWO MODES, ONE SETUP PATH:
-  --checkpoint given    the full 2x2. Four forwards per image.
-  --checkpoint omitted  CLEAN-COST mode. No patch is composited, so every pixel
-                        the defence erases is a false positive by construction
-                        and the mIoU delta against your existing undefended
-                        clean_baseline.py run is the price of the defence.
-
-WHY THE 2x2 AND NOT JUST A DEFENDED ATTACK NUMBER. A defence can recover mIoU
-while localising nothing (it blanked enough of the frame that the patch went with
-it) and it can localise perfectly while recovering nothing. It can also buy both
-by damaging every clean image it sees. One defended number cannot separate those;
-four can.
-
-BOTH COLUMNS COME FROM ONE MODEL INSTANCE. setup_model is called once and
-DefendedSegModel.bypassed() turns the defence off for the undefended pass, so the
-two columns share weights, images and process. Rebuilding the model to get the
-undefended column would reintroduce every load-order and seeding difference the
-comparison exists to exclude, and cost a second checkpoint load per architecture.
-
-GRADIENTS ARE REFUSED. Every defence here thresholds somewhere, so the gradient
-through it is zero. An attack optimised through one does not crash: it gets no
-signal, the patch stops moving, and the run reports a robust model with nothing
-in the logs to say otherwise. This script never differentiates, the training
-entry points have no --defence flag to pass, and DefendedSegModel.forward()
-raises if a grad-carrying tensor reaches it anyway. An ADAPTIVE attack through
-the defence (SAC ships a straight-through estimator for it) is a different threat
-model and separate work.
-
-THE PER-IMAGE SEQUENCE IS COPIED FROM scripts/evaluate.py AND MUST TRACK IT:
-resolve_placement against the UNDEFENDED clean prediction, then
-set_reference_from_image, then apply. Semantic and gradcam placement read the
-clean prediction and training read it from the undefended model, so resolving
-against a defended prediction would move the patch for the defended column only
-and the two columns would describe different attacks. test_defences.py pins the
-ordering; it cannot notice a change made only in evaluate.py.
-"""
+"""Evaluate a trained patch WITH a defence in front of the model."""
 from __future__ import annotations
 
 import argparse
@@ -126,16 +73,11 @@ def add_defence_args(p):
                         "the entropy threshold from the 0.5%%-of-frame area "
                         "floor, which at 512x1024 is a 51px side and is a hard "
                         "detection limit on small patches.")
-    # The optional mask autoencoder is deliberately NOT a flag. Their weights are
-    # not released and the topology is resolution-locked, so any usable one has
-    # to be TRAINED at our resolution on our patch geometry — a square prior,
-    # which is a modelling decision deserving its own script, not a switch.
-    # Reach it as JediDefence(autoencoder=...) from defences.jedi.
     return p
 
 
 def defence_tag(a) -> str:
-    """Short slug for output paths. Empty when no defence is active."""
+    """Short slug for output paths."""
     if a.defence == "none":
         return ""
     if a.defence == "sac":
@@ -153,9 +95,6 @@ def defence_tag(a) -> str:
             bits.append(a.jedi_fill)
         if a.jedi_no_blobs:
             bits.append("noblob")
-        # The calibration MUST appear in the path. A run on the authors'
-        # constants and a run on ours are different measurements and must never
-        # land on the same output directory.
         bits.append("cal-" + (Path(a.jedi_calibration).stem
                               if a.jedi_calibration else "stock"))
         return "_".join(bits)
@@ -163,7 +102,7 @@ def defence_tag(a) -> str:
 
 
 def wrap(a, model, device):
-    """Wrap `model` in DefendedSegModel. Returns it untouched for 'none'."""
+    """Wrap `model` in DefendedSegModel."""
     if a.defence == "none":
         return model
     kw = {}
@@ -188,16 +127,7 @@ def wrap(a, model, device):
 
 
 def load_patch(a, device, mean_t, std_t):
-    """
-    The patch under test, with evaluate.py's mode='csf' refusal kept verbatim.
-
-    A csf checkpoint stores the parameter and the placement, never the BASE —
-    the base is the image region the patch covers. Rendered with reference=None
-    it takes the 0.5 grey fallback, the patch becomes a visible square with an
-    invisible texture, and every number below would silently describe that
-    square instead of the residual under test. Which, with a defence in front,
-    would also hand the segmenter a far easier target than the real patch.
-    """
+    """The patch under test, with evaluate.py's mode='csf' refusal kept verbatim."""
     ck = torch.load(a.checkpoint, map_location="cpu")
     pcfg = ck["config"]
     G = None
@@ -298,9 +228,6 @@ def main():
 
             fp = None
             if attacked:
-                # ORDER MATTERS AND MATCHES evaluate.py. See the module
-                # docstring: placement off the undefended clean prediction,
-                # reference copied at the RESOLVED placement, then composite.
                 patch.resolve_placement(a.img_h, a.img_w, lc.argmax(1)[0])
                 if a.from_image:
                     patch.set_reference_from_image(img, mean_t, std_t)
@@ -345,11 +272,6 @@ def main():
                 m["dadv_all"].update(daa.argmax(1), label)
                 m["dadv_rem"].update(daa.argmax(1), label, exclude=fp)
                 dar = single_image_miou(daa, label, a.num_classes, exclude=fp)
-                # RECOVERY runs from the undefended attack (0.0) to the
-                # UNDEFENDED clean score (1.0). Its denominator is the attack's
-                # own effect, which is near zero on an image the attack failed
-                # on — a ratio there is noise amplified, so it is NaN rather
-                # than a large number that would dominate a mean.
                 gap = cr - ar
                 row.update(def_adv_remote=dar, def_drop_remote=dcr - dar,
                            recovery=((dar - ar) / gap if gap > 1.0 else NAN),
@@ -386,15 +308,7 @@ def main():
 
 
 def _read_empty_mask(da) -> str:
-    r"""
-    An empty mask has three causes with different conclusions. Say which one
-    this is, rather than leaving the reader a table of zeros.
-
-    The deciding quantity is the IN-OUT GAP, not the raw score: a detector
-    scoring 0.4 inside the footprint and 0.4 everywhere else has found nothing,
-    it is uniformly uncertain, and no threshold can create signal that is not
-    there.
-    """
+    """An empty mask has three causes with different conclusions."""
     if da["in_max"] < 0.1:
         return f"""    READ THIS AS: OUT OF DOMAIN. The segmenter scored the
     patch {da['in_max']:.4f} at best, so no threshold, no shape prior and no
@@ -473,10 +387,6 @@ def report(a, m, per_image, idxs, out_dir, attacked, defended, detection,
             nz = fpa[fpa > 0]
             print(f"    on the {n_fire} it fired on: mean {100*nz.mean():.2f}% "
                   f" min {100*nz.min():.3f}%  max {100*nz.max():.2f}%")
-        # THE DISTRIBUTION IS BIMODAL — see sac.defence.completion_pass. The
-        # pair (how often it fired, how much it took when it did) is the
-        # summary; a mean over all images is a near-zero number averaged over
-        # mostly-zero and says nothing.
         print(f"    ^ bimodal by construction. Read the pair, not the mean.")
 
         if attacked:
@@ -495,10 +405,6 @@ def report(a, m, per_image, idxs, out_dir, attacked, defended, detection,
             print(f"    completed mask: coverage {da['coverage']:.3f}   "
                   f"precision {da['precision']:.3f}   IoU {da['mask_iou']:.3f}"
                   f"   located {100*da['detected']:.0f}% of images")
-            # SEGMENT vs COMPLETE, separated. Raw coverage near zero with high
-            # completed coverage means the square prior did the work and the
-            # segmenter only had to fire somewhere plausible. Both low means the
-            # segmenter never saw the patch and no prior can rescue it.
             print(f"    raw mask (segmenter only): coverage "
                   f"{dr['coverage']:.3f}   area "
                   f"{100*dr['pred_area_frac']:.2f}% of frame")
