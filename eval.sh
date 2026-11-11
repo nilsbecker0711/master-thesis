@@ -1,7 +1,7 @@
 #!/bin/bash
 #SBATCH -p gpu_a100_short   # Use the dev_gpu_4_a100 partition with A100 GPUs dev_gpu_4
 #SBATCH -n 1                   # Number of tasks (1 for single node)
-#SBATCH -t 00:05:00            # Time limit (10 minutes for debugging purposes)
+#SBATCH -t 0:10:00            # Time limit (10 minutes for debugging purposes)
 #SBATCH --mem=40000        # Memory request (adjust as needed)
 #SBATCH --gres=gpu:1           # Request 1 GPU (adjust if you need more)
 #SBATCH --cpus-per-task=16     # Number of CPUs per GPU (16 for A100)
@@ -39,6 +39,6 @@ CS="/hkfs/work/workspace/scratch/ma_nilbecke-thesis/data/cityscapes"
 #python scripts/evaluate.py --checkpoint ${CHECKPOINT} \
  #       --arch segformer --cityscapes_root ${CS} --img_h 512 --img_w 1024
 
-python scripts/evaluate.py --checkpoint "/pfs/work9/workspace/scratch/ma_nilbecke-thesis/master-thesis/results/overfit/segformer_b0_raw_cospgd_img420_sliding_window_to_fail/best.pt" \
-        --arch segformer_b0 --cityscapes_root "/pfs/work9/workspace/scratch/ma_nilbecke-thesis/data/cityscapes" --img_h 1024 --img_w 2048 \
-        --image 420 --inference auto --tag window
+python scripts/evaluate.py --checkpoint "results/final_b5_csf.pt" \
+        --arch segformer_b5 --cityscapes_root "/pfs/work9/workspace/scratch/ma_nilbecke-thesis/data/cityscapes"  \
+       --img_h 512 --img_w 1024 --image 0 --inference auto --tag uni_csf_b5

@@ -1,7 +1,7 @@
 #!/bin/bash
-#SBATCH -p dev_gpu_a100_il
+#SBATCH -p gpu_a100_short
 #SBATCH -n 1
-#SBATCH -t 00:30:00
+#SBATCH -t 00:20:00
 #SBATCH --mem=40000
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=8
@@ -29,19 +29,27 @@ python --version
 
 # ONE invocation for every run: the metric models load once, not once per
 # directory. Score the csf runs AND an opaque raw one — a perceptual number
-# only means something next to what it is low relative to.
-RUNS=(
-    results/overfit_464/LAP/Dog_parameterized/cospgd/segformer_b5/segformer_b5_lap_cospgd_img464_from_paper_real
-    results/overfit_464/LAP/Dog_parameterized/cospgd/segformer_b5/segformer_b5_lap_cospgd_img464_from_paper_train
-    results/overfit_464/LAP/Dog_parameterized/cospgd/segformer_b5/segformer_b5_lap_cospgd_img464_from_run
-    results/overfit_464/LAP/Sign_parameterized/cospgd/segformer_b5/segformer_b5_lap_cospgd_img464_from_paper_real
-    results/overfit_464/LAP/Sign_parameterized/cospgd/segformer_b5/segformer_b5_lap_cospgd_img464_from_paper_train
-    results/overfit_464/LAP/Sign_parameterized/cospgd/segformer_b5/segformer_b5_lap_cospgd_img464_from_run
+RUNS2=(
+results/overfit_464/ce/setr_pup_raw_ce_img464
+results/overfit_464/ce/segformer_b0_raw_ce_img464
+results/overfit_464/ce/segformer_b5_raw_ce_img464
+results/overfit_464/ce/deeplab_18_raw_ce_img464
+results/overfit_464/ce/deeplab_101_raw_ce_img464
+results/overfit_464/ce/deeplab_50_raw_ce_img464
+results/overfit_464/cospgd/setr_pup_raw_cospgd_img464
+results/overfit_464/cospgd/segformer_b0_raw_cospgd_img464
+results/overfit_464/cospgd/segformer_b5_raw_cospgd_img464
+results/overfit_464/cospgd/deeplab_18_raw_cospgd_img464
+results/overfit_464/cospgd/deeplab_101_raw_cospgd_img464
+results/overfit_464/cospgd/deeplab_50_raw_cospgd_img464
+
 )
+RUNS=(/pfs/work9/workspace/scratch/ma_nilbecke-thesis/master-thesis/results/overfit_464/cospgd/segformer_b0_raw_cospgd_img464
+/pfs/work9/workspace/scratch/ma_nilbecke-thesis/master-thesis/results_wrong_res/unconstrained/segformer_b5_raw_cospgd_img420)
 
 python scripts/lpips_eval.py "${RUNS[@]}" \
     --source checkpoint --checkpoint best --cityscapes_root "$CS" \
-    --metrics all --anchors --tag ckpt \
-    --out_csv results/perc_eval/overfit_464_lap_ckpt.csv
+    --metrics all --anchors --tag ckpt
+    #--out_csv results/perc_eval/overfit_464_lap_ckpt.csv
 
 echo "Done: $(date)"
