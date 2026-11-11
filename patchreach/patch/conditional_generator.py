@@ -1,60 +1,4 @@
-r"""
-Image-conditioned adversarial patch generator.
-
-    p_i = G_theta(C_i, r_i, M_i, z_i)
-
-    C_i  the target image (global scene context)
-    r_i  a fixed-size CENTRE CROP of x_i, resized to the patch resolution
-    M_i  the segmentation sensitivity map from segmentation_cam.py, DETACHED
-    z_i  optional noise, OFF by default (deterministic generation)
-
-    theta* = argmin_theta  E_{(x,y)~D} [ L_attack(f(x (+) G_theta(x,r,M)), y)
-                                         + lambda_LAP * L_LAP(p_i, r_i) ]
-
-A DIFFERENT THREAT MODEL FROM EVERY EXISTING MODE
--------------------------------------------------
-raw / lap / gan / raw_ganinit all optimise ONE patch tensor. Here the patch is
-not a parameter at all: theta is shared across the whole dataset and the patch
-is a FUNCTION of the image. At test time an unseen image gets its own patch
-from one forward pass — there is NO gradient-based optimisation at test time.
-That is what separates this from the universal patch, and it is the claim the
-evaluation has to support.
-
-WHY NOT Patch.apply()
----------------------
-Patch.apply() renders ONE [3,S,S] and broadcasts it across the batch under ONE
-self.placement. Per-image patches with per-image placement cannot be expressed
-through it. composite_batch() below therefore MIRRORS its semantics exactly —
-same interpolate -> normalise -> F.pad order, same top/left clamping, same
-`> 0.5` footprint rule, same reason for using F.pad rather than slice
-assignment (in-place slicing into a no-grad tensor creates no backward node,
-so the gradient silently vanishes). tests/test_conditional_generator.py
-asserts the two agree numerically in the degenerate shared-patch case, so this
-mirror cannot drift from the original unnoticed.
-
-WHY THE SIGMOID RESIDUAL IS THE DEFAULT
----------------------------------------
-spec.py unified every pixel mode on `patch = sigmoid(param)` specifically
-because a hard clamp to [0,1] zeroes the gradient for any pixel sitting on the
-bound — which is exactly where an adversarial patch wants to live. The same
-argument applies to the residual head, so:
-
-    logit (default)  p = sigmoid( logit_seed(r) + Delta )
-    clip             p = clamp( r + Delta, 0, 1 )       <- the literal formula
-    none             p = sigmoid( Delta )               <- ignores r as a base
-
-All three give p == r (or 0.5 grey for `none`, matching `raw` mode's init) at
-step 0, because the final conv is ZERO-INITIALISED. The untrained generator is
-therefore EXACTLY baseline A, which makes the baseline comparison exact rather
-than approximate.
-
-NORMALISATION CONVENTION
-------------------------
-The dataloader emits IMAGENET-NORMALISED tensors. The generator works entirely
-in [0,1] RGB — references, patches and LAP losses all live there, matching
-Patch.render(). composite_batch() applies (x - mean)/std at the last moment,
-exactly where Patch.apply() does.
-"""
+"""Image-conditioned adversarial patch generator."""
 from __future__ import annotations
 
 import math
@@ -76,39 +20,21 @@ PLACEMENT_MODES = ("center", "gradcam", "semantic", "fixed")
 REFERENCE_MODES = ("center", "window")
 
 
-# ═════════════════════════════════════════════════════════════════════════════
-#  Config
-# ═════════════════════════════════════════════════════════════════════════════
-
 @dataclass
 class GeneratorConfig:
-    """
-    ARCHITECTURE ONLY — everything needed to rebuild G_theta from a checkpoint.
-
-    Placement policy, patch scale and LAP weights are TRAINING configuration,
-    not architecture, and are stored separately in the checkpoint so an
-    ablation can re-evaluate one generator under several placement policies
-    without implying the weights changed.
-    """
-    size: int = 128                  # output resolution S (p_i is [3,S,S])
+    """ARCHITECTURE ONLY — everything needed to rebuild G_theta from a checkpoint."""
+    size: int = 128
     base_ch: int = 32
-    depth: int = 3                   # downsampling levels
-    cond: str = "image+ref+cam"      # ablation E
-    residual: str = "logit"          # logit | clip | none
+    depth: int = 3
+    cond: str = "image+ref+cam"
+    residual: str = "logit"
     residual_scale: float = 1.0
-    noise_dim: int = 0               # 0 = deterministic
+    noise_dim: int = 0
 
-    # ── perceptual (residual='csf') ──────────────────────────────────────────
-    # Only read when residual == 'csf'. Kept on the ARCHITECTURE config because
-    # the CSF and budget maps are buffers sized by `size`, so a checkpoint
-    # cannot be rebuilt without them.
-    # tau = 1.0 is NOT the operating point. Measured at 128px: tau 0.25 gives
-    # |delta| rms ~0.025 (about 6/255); above tau 0.5 the range fit starts
-    # binding and tau stops controlling anything. Usable range is ~0.05-0.5.
-    csf_threshold: float = 0.25      # tau, in nominal JND — THE knob
-    csf_min_cycles: float = 2.0      # lowest frequency allowed, cycles/patch
-    csf_model: str = "barten"        # barten | sso
-    csf_beta: float = 3.0            # Minkowski summation exponent
+    csf_threshold: float = 0.25
+    csf_min_cycles: float = 2.0
+    csf_model: str = "barten"
+    csf_beta: float = 3.0
     csf_pixel_size_cm: float = 0.0114
     csf_viewing_distance_cm: float = 50.0
 
@@ -131,11 +57,11 @@ class GeneratorConfig:
 
     @property
     def in_channels(self) -> int:
-        ch = 3                                    # C_i, always present
+        ch = 3
         if "ref" in self.cond:
-            ch += 3                               # r_i
+            ch += 3
         if "cam" in self.cond:
-            ch += 2                               # M_i global + M_i at the window
+            ch += 2
         return ch + self.noise_dim
 
     def describe(self, log=print):
@@ -152,21 +78,8 @@ class GeneratorConfig:
             self.geometry.describe(log)
 
 
-# ═════════════════════════════════════════════════════════════════════════════
-#  Architecture
-# ═════════════════════════════════════════════════════════════════════════════
-
 def _norm(ch: int) -> nn.Module:
-    """
-    GroupNorm, NOT BatchNorm.
-
-    Two reasons that both bite in this setup: batch sizes are small (4 by
-    default, 1 at export time), and BatchNorm behaves differently in train()
-    and eval(). The generator is trained in train() and run in eval() at test
-    time, so a BatchNorm would make the reported test-time patch differ from
-    the one the attack loss actually optimised. gcd keeps the group count legal
-    for any channel width.
-    """
+    """GroupNorm, NOT BatchNorm."""
     return nn.GroupNorm(math.gcd(8, ch), ch)
 
 
@@ -182,23 +95,7 @@ class _Block(nn.Module):
 
 
 class ConditionalPatchGenerator(nn.Module):
-    r"""
-    U-Net over the conditioning stack, emitting a RESIDUAL Delta at [3,S,S].
-
-    Shared across the entire dataset: ONE theta, no per-image parameter tensor.
-    The output is a function of the inputs only, so an unseen image produces its
-    patch in a single forward pass.
-
-    forward(image, reference, cam_global, cam_local, noise) -> p in [0,1]^{B,3,S,S}
-
-    All conditioning inputs are [B,*,S,S] in [0,1] and are expected to arrive
-    DETACHED — none of them is optimised. `reference` is required whenever
-    residual != 'none' because it is the base of the residual, even under
-    cond='image' where it is not fed in as an input channel (ablation E: the
-    generator is denied the reference as INFORMATION while the residual base
-    stays fixed, so the comparison isolates conditioning rather than confounding
-    it with a change of parameterisation).
-    """
+    """U-Net over the conditioning stack, emitting a RESIDUAL Delta at [3,S,S]."""
 
     def __init__(self, cfg: GeneratorConfig):
         super().__init__()
@@ -215,13 +112,6 @@ class ConditionalPatchGenerator(nn.Module):
 
         self.head = nn.Conv2d(chans[0], 3, 3, padding=1)
         if cfg.residual == "csf":
-            # NOT zero-init here, and the baseline-A identity does NOT hold for
-            # this mode. csf_residual normalises to EXACTLY tau, so a zero raw
-            # tensor is a 0/0 and its gradient is undefined. The natural init
-            # is instead "random noise at the full visibility budget", which is
-            # the maximally-camouflaged starting point and is what the mode is
-            # about. The reparameterisation is scale-invariant, so the init
-            # magnitude does not matter — only its shape.
             nn.init.normal_(self.head.weight, std=0.05)
             nn.init.zeros_(self.head.bias)
             cmap, budget = csf_mod.patch_budget(
@@ -230,13 +120,8 @@ class ConditionalPatchGenerator(nn.Module):
             self.register_buffer("csf_values", cmap)
             self.register_buffer("csf_budget", budget)
         else:
-            # ZERO-INIT: Delta == 0 at step 0, so p_i == r_i exactly and the
-            # untrained generator IS baseline A. Any drift from the reference is
-            # then attributable to training, not to initialisation noise.
             nn.init.zeros_(self.head.weight)
             nn.init.zeros_(self.head.bias)
-
-    # ── conditioning ─────────────────────────────────────────────────────────
 
     def _stack(self, image, reference, cam_global, cam_local, noise):
         cfg = self.cfg
@@ -257,21 +142,13 @@ class ConditionalPatchGenerator(nn.Module):
         return torch.cat(parts, dim=1)
 
     def sample_noise(self, B: int, device, deterministic: bool = False):
-        """
-        z_i ~ N(0,1) during training; ZEROS (the prior mean) at evaluation.
-
-        Deterministic evaluation matters here: the whole claim is "one frozen
-        generator, one patch per image". A resampled z would make the reported
-        test-time patch irreproducible.
-        """
+        """z_i ~ N(0,1) during training; ZEROS (the prior mean) at evaluation."""
         if not self.cfg.noise_dim:
             return None
         shape = (B, self.cfg.noise_dim, self.cfg.size, self.cfg.size)
         if deterministic:
             return torch.zeros(shape, device=device)
         return torch.randn(shape, device=device)
-
-    # ── forward ──────────────────────────────────────────────────────────────
 
     def forward(self, image, reference=None, cam_global=None, cam_local=None,
                 noise=None) -> torch.Tensor:
@@ -292,7 +169,7 @@ class ConditionalPatchGenerator(nn.Module):
 
     def compose(self, delta: torch.Tensor,
                 reference: Optional[torch.Tensor]) -> torch.Tensor:
-        """Delta -> p in [0,1]. Split out so tests can drive it directly."""
+        """Delta -> p in [0,1]."""
         mode = self.cfg.residual
         if mode == "none":
             return torch.sigmoid(delta)
@@ -301,14 +178,6 @@ class ConditionalPatchGenerator(nn.Module):
         if mode == "clip":
             return (reference + torch.tanh(delta)).clamp(0.0, 1.0)
         if mode == "csf":
-            # ADDITIVE AND CLIPPED, deliberately breaking the repository's
-            # sigmoid convention. The spectral guarantee is a statement about a
-            # residual in LINEAR pixel space; sigmoid(logit(r)+d) != r+d, so
-            # composing through a sigmoid would distort exactly the spectrum
-            # the budget was computed for and the invisibility claim would no
-            # longer hold. The clamp can violate the budget where r is already
-            # near 0 or 1 — that is measured and reported rather than assumed
-            # away (see realised_visibility()).
             d = csf_mod.csf_residual(delta, self.csf_budget, self.csf_values,
                                      self.cfg.csf_threshold, self.cfg.csf_beta)
             d = csf_mod.fit_to_range(d, reference)
@@ -319,33 +188,14 @@ class ConditionalPatchGenerator(nn.Module):
         return sum(p.numel() for p in self.parameters() if p.requires_grad)
 
 
-# ═════════════════════════════════════════════════════════════════════════════
-#  Conditioning inputs
-# ═════════════════════════════════════════════════════════════════════════════
-
 def denormalise_batch(imgs: torch.Tensor, mean_t, std_t) -> torch.Tensor:
-    """
-    [B,3,H,W] normalised -> [B,3,H,W] in [0,1].
-
-    The batched counterpart of data.cityscapes.denormalise, which only handles
-    a single [1,3,H,W] and moves the result to CPU. mean_t/std_t are the
-    [1,3,1,1] tensors from norm_tensors(), so this broadcasts as-is.
-    """
+    """[B,3,H,W] normalised -> [B,3,H,W] in [0,1]."""
     return (imgs * std_t + mean_t).clamp(0.0, 1.0)
 
 
 def patch_side(H: int, scale: float, W: Optional[int] = None,
                ref: str = "height") -> int:
-    """
-    Delegates to placement.footprint_side — the SAME rule Patch.apply() uses,
-    now in one place so the two cannot drift.
-
-    The generator pipeline is height-scaled only: train_conditional_generator
-    and export_conditional_patches build their parser from add_generator_args,
-    not add_patch_args, so --patch_scale_ref never reaches them and argparse
-    REJECTS it there rather than ignoring it. W and ref exist so a future
-    area-scaled generator has a door, not so this path uses it today.
-    """
+    """Delegates to placement.footprint_side — the SAME rule Patch.apply() uses, now in one place so the two cannot drift."""
     if ref != "height" and W is None:
         raise ValueError(f"scale_ref={ref!r} needs W")
     return placement_mod.footprint_side(H, W if W is not None else H,
@@ -354,18 +204,7 @@ def patch_side(H: int, scale: float, W: Optional[int] = None,
 
 def center_crop_reference(imgs01: torch.Tensor, p: int, size: int
                           ) -> torch.Tensor:
-    r"""
-        r_i = Resize( CenterCrop(x_i) )
-
-    Fixed-size spatial centre crop of side p, resized to the generator's output
-    resolution, kept in [0,1] RGB. NOT optimised and NOT searched for — the
-    first implementation must not dynamically locate an object. Detached, so no
-    gradient can reach the image.
-
-    Note the crop is taken at the image CENTRE while the patch may be PLACED
-    elsewhere (gradcam placement). See window_reference() for the variant that
-    removes that mismatch.
-    """
+    """r_i = Resize( CenterCrop(x_i) )"""
     _, _, H, W = imgs01.shape
     top, left = (H - p) // 2, (W - p) // 2
     crop = imgs01[:, :, top:top + p, left:left + p]
@@ -375,34 +214,7 @@ def center_crop_reference(imgs01: torch.Tensor, p: int, size: int
 
 def window_reference(imgs01: torch.Tensor, placements: Sequence[Tuple[int, int]],
                      p: int, size: int) -> torch.Tensor:
-    r"""
-        r_i = Resize( Crop_{t_i, l_i}(x_i) )   — the content the patch REPLACES
-
-    Same fixed rule as center_crop_reference, applied at the placement window
-    instead of the image centre. This is NOT the dynamic object search the
-    specification rules out: nothing is searched for, and the location comes
-    from the placement policy that was going to be used anyway.
-
-    WHY IT MATTERS. A centre crop of a 512x1024 dashcam frame depicts
-    MID-DISTANCE content — building fronts, signs, the far end of the street.
-    Grad-CAM placement puts the patch in the NEAR field, where the same objects
-    would appear several times larger. A measured run sampled the reference at
-    (256, 512) and pasted it at (448, 159): ~400 px away and at a different
-    depth entirely. The result cannot look plausible however well the generator
-    behaves, because the reference violates the scene's perspective.
-
-    That handicaps the central hypothesis: LAP pulls the patch toward a
-    reference that is geometrically incompatible with its destination, so
-    "perceptually coherent" is unreachable by construction rather than by
-    failure of the method. Sampling at the window makes coherence attainable —
-    at step 0 the patch is EXACTLY the content it covers, i.e. invisible.
-
-    COST, and it is real: the attack now starts from a perfect reconstruction
-    of the scene, so baseline A becomes a literal no-op (drop_remote = 0 by
-    construction, not merely small). Every point of degradation is then
-    attributable to the generator. That is a cleaner experiment but a different
-    one, which is why `center` remains the default.
-    """
+    """r_i = Resize( Crop_{t_i, l_i}(x_i) ) — the content the patch REPLACES"""
     outs = [F.interpolate(imgs01[i:i + 1, :, t:t + p, l:l + p],
                           size=(size, size), mode="bilinear",
                           align_corners=False)
@@ -412,12 +224,7 @@ def window_reference(imgs01: torch.Tensor, placements: Sequence[Tuple[int, int]]
 
 def crop_windows(maps: torch.Tensor, placements: Sequence[Tuple[int, int]],
                  p: int, size: int) -> torch.Tensor:
-    """
-    Per-image crop of [B,C,H,W] at each (top,left), resized to size x size.
-
-    Used for M_i restricted to the window the patch will actually occupy — the
-    only part of the sensitivity map that is spatially aligned with the output.
-    """
+    """Per-image crop of [B,C,H,W] at each (top,left), resized to size x size."""
     outs = [F.interpolate(maps[i:i + 1, :, t:t + p, l:l + p], size=(size, size),
                           mode="bilinear", align_corners=False)
             for i, (t, l) in enumerate(placements)]
@@ -429,10 +236,6 @@ def resize_to_patch(maps: torch.Tensor, size: int) -> torch.Tensor:
                          align_corners=False).detach()
 
 
-# ═════════════════════════════════════════════════════════════════════════════
-#  Placement
-# ═════════════════════════════════════════════════════════════════════════════
-
 @torch.no_grad()
 def resolve_batch_placement(policy: str, H: int, W: int, p: int,
                             cam: Optional[torch.Tensor] = None,
@@ -441,19 +244,7 @@ def resolve_batch_placement(policy: str, H: int, W: int, p: int,
                             xy: Tuple[float, float] = (0.5, 0.5),
                             margin: int = 0
                             ) -> List[Tuple[int, int]]:
-    r"""
-    One (top, left) PER IMAGE.
-
-    center   : image centre. Identical to placement.resolve('center', ...).
-    gradcam  : argmax_{(u,v)} MeanPool( M_i[u:u+p, v:v+p] ) — the patch-sized
-               window of highest average segmentation sensitivity.
-    semantic : the EXISTING policy, per image, on the clean prediction.
-    fixed    : the EXISTING policy — a normalised (y,x) centre.
-
-    Existing modes are untouched: this function is only ever reached from the
-    conditional-generator entry points, and center/fixed/semantic delegate to
-    placement.py rather than reimplementing it.
-    """
+    """One (top, left) PER IMAGE."""
     if policy not in PLACEMENT_MODES:
         raise ValueError(f"placement must be one of {PLACEMENT_MODES}, "
                          f"got {policy!r}")
@@ -461,9 +252,6 @@ def resolve_batch_placement(policy: str, H: int, W: int, p: int,
     if policy == "gradcam":
         if cam is None:
             raise ValueError("placement='gradcam' needs the sensitivity map")
-        # `margin` keeps the window off the image border, where roughly half a
-        # patch's receptive field falls outside the image. Only the gradcam
-        # path applies it — the existing policies are untouched.
         return [placement_mod.find_max_response_placement(
             cam[i, 0], p, centre_if_constant=True, margin=margin)
             for i in range(cam.shape[0])]
@@ -479,30 +267,10 @@ def resolve_batch_placement(policy: str, H: int, W: int, p: int,
     return [placement_mod.resolve(policy, H, W, p, None, cls, xy)] * B
 
 
-# ═════════════════════════════════════════════════════════════════════════════
-#  Compositing
-# ═════════════════════════════════════════════════════════════════════════════
-
 def composite_batch(imgs: torch.Tensor, patches: torch.Tensor,
                     placements: Sequence[Tuple[int, int]], p: int,
                     mean_t, std_t) -> Tuple[torch.Tensor, torch.Tensor]:
-    r"""
-        x_i^adv = Apply(x_i, p_i)
-
-    Returns (patched [B,3,H,W] normalised, footprint [B,H,W] bool).
-
-    SEMANTICS ARE Patch.apply()'s, PER IMAGE. Same order (interpolate to p x p
-    -> (x-mean)/std -> F.pad), same clamping of top/left into [0, H-p] /
-    [0, W-p], same `> 0.5` footprint rule.
-
-    GRADIENT SAFETY: built with F.pad, never in-place slice assignment — see
-    the note in Patch.apply(). The per-image loop plus torch.cat keeps that
-    property; F.pad cannot take per-sample padding, and the alternative
-    (scattering into a preallocated canvas) is exactly the slice-assignment
-    pattern that silently breaks the backward graph. The loop costs nothing
-    measurable: the frozen segmentation forward pass dominates by orders of
-    magnitude at these batch sizes.
-    """
+    """x_i^adv = Apply(x_i, p_i)"""
     B, _, H, W = imgs.shape
     if patches.shape[0] != B or len(placements) != B:
         raise ValueError(
@@ -528,31 +296,8 @@ def composite_batch(imgs: torch.Tensor, patches: torch.Tensor,
     return patched, (mask[:, 0] > 0.5)
 
 
-# ═════════════════════════════════════════════════════════════════════════════
-#  Orchestration
-# ═════════════════════════════════════════════════════════════════════════════
-
 class ConditionalAttack:
-    r"""
-    One batch, end to end:
-
-        x_i -> M_i (detached) -> r_i -> placement -> p_i = G(x_i,r_i,M_i)
-            -> x_i^adv = Apply(x_i, p_i)
-
-    Shared by training, evaluation and export so the three cannot drift. That
-    matters more than usual here: the central claim is that TEST-TIME
-    behaviour is a pure forward pass of the same function trained at
-    train-time, and two separate implementations of the pipeline would make
-    that unverifiable.
-
-    `method`:
-        generator  p_i = G_theta(...)            — the proposed attack
-        reference  p_i = r_i                     — BASELINE A, no generator at
-                                                   all. Runs through identical
-                                                   placement and compositing,
-                                                   so the comparison isolates
-                                                   the generator.
-    """
+    """One batch, end to end"""
 
     def __init__(self, model, cam, generator, mean_t, std_t,
                  scale: float, size: int, placement: str = "gradcam",
@@ -583,18 +328,9 @@ class ConditionalAttack:
         B, _, H, W = imgs.shape
         p = patch_side(H, self.scale)
 
-        # 1-2. clean prediction + sensitivity. Both come out of ONE forward
-        #      pass, and both are DETACHED — M_i is a conditioning signal, and
-        #      no gradient may run back through the frozen segmentation model
-        #      into the generator by this route.
         cam, clean_logits = self.cam(imgs, labels)
         imgs01 = denormalise_batch(imgs, self.mean_t, self.std_t).detach()
 
-        # 3. placement FIRST. reference='window' samples r_i at the placement,
-        #    so the ordering is load-bearing; reference='center' does not care.
-        # upsample BEFORE argmax — the head emits below input resolution and
-        # placement is measured in image pixels. Same order as everywhere else
-        # in the repo (upsample_to(...).argmax(1)).
         clean_pred = (upsample_to(clean_logits, (H, W)).argmax(1)
                       if self.placement == "semantic" else None)
         places = resolve_batch_placement(
@@ -602,14 +338,12 @@ class ConditionalAttack:
             cls=self.placement_class, xy=self.placement_xy,
             margin=self.placement_margin)
 
-        # 4. reference in [0,1], never optimised
         refs = (window_reference(imgs01, places, p, self.size)
                 if self.reference == "window"
                 else center_crop_reference(imgs01, p, self.size))
 
-        # 4. generate
         if self.method == "reference":
-            patches = refs                       # BASELINE A
+            patches = refs
         else:
             noise = self.generator.sample_noise(B, imgs.device,
                                                 deterministic_noise)
@@ -620,7 +354,6 @@ class ConditionalAttack:
                 cam_local=crop_windows(cam, places, p, self.size),
                 noise=noise)
 
-        # 6. composite
         patched, footprint = composite_batch(imgs, patches, places, p,
                                              self.mean_t, self.std_t)
         return {"patches": patches, "references": refs, "cam": cam,
@@ -629,34 +362,10 @@ class ConditionalAttack:
                 "patch_side": p}
 
 
-# ═════════════════════════════════════════════════════════════════════════════
-#  LAP constraint, per image
-# ═════════════════════════════════════════════════════════════════════════════
-
 def lap_terms(patches: torch.Tensor, references: torch.Tensor,
               alpha: float = 0.0, beta: float = 0.0, gamma: float = 0.0
               ) -> dict:
-    r"""
-        L_LAP(p_i, r_i) = alpha*L_rat + beta*L_tv + gamma*L_nps
-
-    scored per image against its OWN reference and averaged over the batch.
-
-    Reuses lap.py's implementations unchanged. It cannot go through
-    Patch.regularisers(), which is hardcoded to mode=='lap' and to ONE static
-    self.reference — here the reference is image-specific.
-
-    active_mask() has no analogue: shape masking derives a silhouette from a
-    reference FILE (shape.py) and there is none here, so q == p over the full
-    square. That is the same situation Patch.describe() reports as "q = M(p) :
-    FULL RECTANGLE".
-
-    SCALE WARNING (lap.py's, unchanged): L_rat and L_tv are SUMS over the
-    patch, order 1e2-1e4, while the attack losses are per-pixel MEANS of order
-    1e-2 to 20. Weights default to 0; read magnitude_report() before setting
-    them or the constraint swamps the attack by orders of magnitude.
-
-    Zero-weighted terms are skipped, so an unconstrained run costs nothing.
-    """
+    """L_LAP(p_i, r_i) = alpha*L_rat + beta*L_tv + gamma*L_nps"""
     z = torch.zeros((), device=patches.device)
     out = {"rat": z, "tv": z, "nps": z, "total": z}
     B = patches.shape[0]
@@ -673,23 +382,8 @@ def lap_terms(patches: torch.Tensor, references: torch.Tensor,
     return out
 
 
-# ═════════════════════════════════════════════════════════════════════════════
-#  LPIPS — EVALUATION ONLY
-# ═════════════════════════════════════════════════════════════════════════════
-
 def build_lpips(device, net: str = "alex", log=print):
-    r"""
-    LPIPS(r_i, p_i), or None when the package is unavailable.
-
-    NEVER A TRAINING LOSS. Training is L_attack + lambda*L_LAP only. Keeping
-    LPIPS out of the objective is what makes it an INDEPENDENT perceptual
-    measurement — optimising against it would make a low reported LPIPS a
-    restatement of the objective rather than evidence about the patch.
-
-    lpips is not in pyproject dependencies (the cluster env is pinned around
-    torch 1.11 + mmcv 1.x), so the import is lazy and a miss degrades to
-    "metric not reported" instead of killing a finished training run.
-    """
+    """LPIPS(r_i, p_i), or None when the package is unavailable."""
     try:
         import lpips as _lpips
     except ImportError:
@@ -703,48 +397,16 @@ def build_lpips(device, net: str = "alex", log=print):
 @torch.no_grad()
 def lpips_distances(metric, patches: torch.Tensor, references: torch.Tensor
                     ) -> List[float]:
-    """
-    Per-image LPIPS, returned as a LIST so the caller can report the
-    DISTRIBUTION rather than only a mean. LPIPS expects [-1,1].
-    """
+    """Per-image LPIPS, returned as a LIST so the caller can report the DISTRIBUTION rather than only a mean."""
     if metric is None:
         return []
     d = metric(patches * 2.0 - 1.0, references * 2.0 - 1.0)
     return d.reshape(-1).cpu().tolist()
 
 
-# ═════════════════════════════════════════════════════════════════════════════
-#  Diagnostics bridge
-# ═════════════════════════════════════════════════════════════════════════════
-
 def as_patch(patch01: torch.Tensor, placement: Tuple[int, int], scale: float,
              device, mean_t, std_t, reference: Optional[torch.Tensor] = None):
-    r"""
-    Freeze ONE generated patch into a real `Patch` object.
-
-    WHY THIS EXISTS
-    ---------------
-    For a single image the generator's output IS a patch plus a placement —
-    exactly what `Patch` already models. Freezing it into one lets the ENTIRE
-    existing diagnostic suite (report.run, report.panels_for_images, the ERF
-    probe, reach curves, confusion/flow tables, margin and entropy figures) run
-    on the conditional attack with no parallel implementation and no changes to
-    diagnostics code.
-
-    The alternative — a duck-typed adapter — would have to re-expose .param,
-    .apply(), .render(), .cfg, .placement and .shape_mask, and would silently
-    drift from Patch's semantics. This returns the real thing instead.
-
-    `param` is seeded through logit_seed so sigmoid(param) == patch01 exactly,
-    which matters for the ERF probe: geometric.receptive_field() overwrites
-    param with noise and restores it afterwards, so the probe measures the
-    architecture's reach AT THE PLACEMENT THE GENERATOR CHOSE. That is the
-    correct control for this attack and is directly comparable with the probe
-    run for every other patch mode.
-
-    NOT for training or checkpointing — it is a diagnostic snapshot of one
-    image's result. The generator is the model; this is one of its outputs.
-    """
+    """Freeze ONE generated patch into a real `Patch` object."""
     from .spec import Patch, PatchConfig
 
     S = int(patch01.shape[-1])
@@ -757,24 +419,13 @@ def as_patch(patch01: torch.Tensor, placement: Tuple[int, int], scale: float,
     return obj
 
 
-# ═════════════════════════════════════════════════════════════════════════════
-#  Checkpointing
-# ═════════════════════════════════════════════════════════════════════════════
-
 CHECKPOINT_FORMAT = "conditional_generator_v1"
 
 
 def save_checkpoint(path, generator: ConditionalPatchGenerator, optimizer,
                     epoch: int, train_config: dict, patch_geometry: dict,
                     extra: Optional[dict] = None):
-    """
-    theta, the optimiser state, the epoch, and BOTH configurations.
-
-    Deliberately NOT a rendered patch: a single image's patch is an OUTPUT of
-    this model, not the model. Saving one would make the artefact
-    indistinguishable from a universal-patch checkpoint and would lose the only
-    thing that generalises.
-    """
+    """theta, the optimiser state, the epoch, and BOTH configurations."""
     from pathlib import Path
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -791,7 +442,7 @@ def save_checkpoint(path, generator: ConditionalPatchGenerator, optimizer,
 
 
 def load_checkpoint(path, device):
-    """(generator in eval mode, checkpoint dict). Architecture from the file."""
+    """(generator in eval mode, checkpoint dict)."""
     ck = torch.load(path, map_location="cpu")
     fmt = ck.get("format")
     if fmt != CHECKPOINT_FORMAT:

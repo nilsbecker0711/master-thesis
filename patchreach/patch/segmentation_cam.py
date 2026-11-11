@@ -1,51 +1,4 @@
-r"""
-Segmentation-specific sensitivity / Grad-CAM.
-
-WHY NOT A CLASSIFICATION GRAD-CAM
----------------------------------
-Classification Grad-CAM differentiates a single logit y_c. A segmentation model
-emits F(x) in R^{CxHxW} — there is no single scalar to differentiate, and the
-per-class-channel variant ("sum the target channel") answers a different
-question than the one this project asks.
-
-The scalar used here is the EXISTING attack objective, taken in the direction
-that STRENGTHENS the attack:
-
-    S_seg = - L_existing(F(x), y)
-
-THE SIGN IS THE WHOLE POINT. Every objective in losses/adversarial.py is
-defined so that MINIMISING it strengthens the attack:
-
-    ce      -> -CE(logits, y)          (minimise => CE rises => wrong)
-    cospgd  -> -cos.detach() * CE      (same)
-    ipatch  -> +CE(logits, target)     (minimise => driven to target)
-
-Grad-CAM's construction assumes a score to be INCREASED. Feeding L directly
-would produce the exact inverse map: high where the attack is already winning,
-low where there is headroom. Negating once, uniformly, fixes all three.
-
-FEATURE LAYER
--------------
-models/wrapper.py exposes only encode_decode, so the internal features are
-reached with a forward hook on the backbone rather than by re-implementing the
-forward pass. mmseg backbones return a TUPLE of multi-scale maps; `layer`
-selects one (-1 = deepest/coarsest, the standard Grad-CAM choice — largest
-receptive field, most semantic).
-
-Do not assume a CNN-style [B,K,h,w]. SegFormer's MiT backbone already reshapes
-its tokens back to 2-D before returning, so it lands in the 4-D path. A
-backbone that returns [B,N,D] tokens is reshaped by FACTORISING N against the
-INPUT ASPECT RATIO — sqrt(N) is wrong at 512x1024 (a 2:1 grid is not square)
-and would silently produce a transposed, meaningless map.
-
-GRADIENT SEPARATION
--------------------
-WrappedSegModel sets requires_grad_(False) on every parameter. With a non-grad
-input PyTorch builds NO graph at all, so autograd.grad(S, A) raises. The pass
-therefore runs under enable_grad() on a requires_grad_(True) CLONE of the
-input. The model is never unfrozen — only activations carry grad — and the
-returned map is detached before it can reach the generator.
-"""
+"""Segmentation-specific sensitivity / Grad-CAM."""
 from __future__ import annotations
 
 from typing import List, Optional, Sequence, Tuple
@@ -56,18 +9,8 @@ import torch.nn.functional as F
 from ..data.cityscapes import upsample_to
 
 
-# ═════════════════════════════════════════════════════════════════════════════
-#  Feature-map normalisation
-# ═════════════════════════════════════════════════════════════════════════════
-
 def _token_grid(n_tokens: int, H: int, W: int) -> Tuple[int, int]:
-    """
-    (h, w) for a flat token sequence, factorised against the INPUT aspect.
-
-    sqrt(N) is only correct for square inputs. At 512x1024 the grid is 2:1, so
-    a square reshape transposes the map and every downstream conclusion is
-    wrong. Candidate strides cover every patch size in common use.
-    """
+    """(h, w) for a flat token sequence, factorised against the INPUT aspect."""
     for stride in (2, 4, 8, 16, 32, 64):
         h = -(-H // stride)
         w = -(-W // stride)
@@ -81,11 +24,7 @@ def _token_grid(n_tokens: int, H: int, W: int) -> Tuple[int, int]:
 
 
 def as_spatial(a: torch.Tensor, H: int, W: int) -> torch.Tensor:
-    """
-    [B,K,h,w] from either a CNN feature map or a [B,N,D] token sequence.
-
-    A leading class token is detected by N-1 factorising when N does not.
-    """
+    """[B,K,h,w] from either a CNN feature map or a [B,N,D] token sequence."""
     if a.dim() == 4:
         return a
     if a.dim() != 3:
@@ -98,33 +37,12 @@ def as_spatial(a: torch.Tensor, H: int, W: int) -> torch.Tensor:
         h, w = _token_grid(N, H, W)
         return a.transpose(1, 2).reshape(B, D, h, w)
     except ValueError:
-        h, w = _token_grid(N - 1, H, W)          # drop a leading cls token
+        h, w = _token_grid(N - 1, H, W)
         return a[:, 1:].transpose(1, 2).reshape(B, D, h, w)
 
 
-# ═════════════════════════════════════════════════════════════════════════════
-#  The CAM
-# ═════════════════════════════════════════════════════════════════════════════
-
 class SegmentationCAM:
-    r"""
-    M_i in [0,1]^{HxW}, one map per image, DETACHED.
-
-        w_k   = GAP( dS_seg / dA_k )
-        M_raw = ReLU( sum_k w_k A_k )
-        M     = per-sample min-max normalise( upsample(M_raw) )
-
-    Per-SAMPLE normalisation, not batch-wide: a batch-wide min-max makes every
-    map depend on which other images happen to share the batch, which is not
-    reproducible at inference where batch composition differs.
-
-    Usage:
-        cam = SegmentationCAM(model, adv_loss)
-        M, clean_logits = cam(imgs, labels)      # M [B,1,H,W], both detached
-
-    `clean_logits` is returned so the caller does not pay for a second clean
-    forward pass — the CAM pass already computed it.
-    """
+    """M_i in [0,1]^{HxW}, one map per image, DETACHED."""
 
     def __init__(self, model, adv_loss, layer: int = -1,
                  module: str = "backbone", target: str = "pred",
@@ -134,51 +52,11 @@ class SegmentationCAM:
         self.layer = layer
         self.target = target
         self.eps = eps
-        self.n_degenerate = 0          # maps that came out constant
+        self.n_degenerate = 0
 
         if target not in ("gt", "pred"):
             raise ValueError(f"cam_target must be 'gt' or 'pred', got {target!r}")
 
-        # A TILED MODEL CANNOT PRODUCE A CAM, AND IT DOES NOT SAY SO.
-        # SlidingWindowSegModel runs the segmentor once per window, so the
-        # forward hook below fires n_windows times and `self._feats = out`
-        # ASSIGNS rather than appends: what survives is the LAST window's
-        # feature map — the bottom-right tile, since slide_windows yields
-        # row-major. Everything downstream then describes the whole frame.
-        #
-        # MEASURED, on a hand-rolled tiled model whose encode_decode returns
-        # input-sized logits as mmseg's does, at 64x256 with a 64-crop (5
-        # windows). It does NOT raise:
-        #
-        #   4-D backbone (SegFormer's MiT, ConvNeXt): the hooked map is one
-        #     window's [1,8,16,16], as_spatial passes a 4-D tensor through
-        #     untouched, and F.interpolate stretches the tile's CAM across the
-        #     full [1,1,64,256]. Mean abs disagreement with the whole-frame
-        #     map: 0.055 on a min-max normalised map. No error.
-        #   token backbone [B,N,D]: WORSE. _token_grid factorises the WINDOW's
-        #     256 tokens against the FRAME's 64x256 and finds stride 8 ->
-        #     (8, 32), which is not the real (16, 16) grid, so the tokens are
-        #     reshaped into a transposed, meaningless map. Also no error.
-        #
-        # So the pre-guard behaviour was a plausible map of the wrong region,
-        # which is the failure class this module's own header exists to prevent
-        # ("a plausible number for a placement policy that never ran"). An
-        # earlier version of this comment claimed a RuntimeError in the
-        # weighted sum; that was an artefact of a stub whose encode_decode did
-        # not resize logits to the input, and it understated the problem.
-        #
-        # AUDIT NOTE: --placement gradcam with --inference slide/auto and
-        # WITHOUT --slide_checkpoint therefore produced a silently wrong
-        # placement. With --slide_checkpoint it failed instead, because the
-        # reentrant checkpoint does not support autograd.grad through a window.
-        #
-        # Stitching per-window CAMs is not a fix to make quietly: the windows
-        # overlap, each one's min-max normalisation is local, and the result
-        # would be a different quantity from the whole-frame map every existing
-        # gradcam run was measured with. Refuse, and name the two ways out.
-        # Imported locally and by TYPE rather than by class name: wrapper.py
-        # imports nothing from patchreach, so there is no cycle, and a name
-        # comparison would miss a subclass and break on a rename.
         from ..models.wrapper import SlidingWindowSegModel
         if isinstance(model, SlidingWindowSegModel):
             raise ValueError(
@@ -196,17 +74,9 @@ class SegmentationCAM:
         self._feats: Optional[Sequence[torch.Tensor]] = None
         self._handle = self.module.register_forward_hook(self._hook)
 
-    # ── plumbing ─────────────────────────────────────────────────────────────
-
     @staticmethod
     def _resolve(model, dotted: str):
-        """
-        Walk a dotted path from the mmseg segmentor INSIDE WrappedSegModel.
-
-        The wrapper holds the segmentor at `.model`, so 'backbone' resolves to
-        model.model.backbone. Raising with the available children beats an
-        AttributeError three frames deep.
-        """
+        """Walk a dotted path from the mmseg segmentor INSIDE WrappedSegModel."""
         obj = getattr(model, "model", model)
         for part in dotted.split("."):
             if not hasattr(obj, part):
@@ -244,16 +114,10 @@ class SegmentationCAM:
         except Exception:
             pass
 
-    # ── the map ──────────────────────────────────────────────────────────────
-
     def __call__(self, imgs: torch.Tensor, labels: torch.Tensor
                  ) -> Tuple[torch.Tensor, torch.Tensor]:
         B, _, H, W = imgs.shape
 
-        # enable_grad because callers legitimately sit inside no_grad (eval,
-        # export). requires_grad_ on the INPUT because every model parameter is
-        # frozen — without a grad-requiring leaf, no graph is built and
-        # autograd.grad() below raises "element 0 does not require grad".
         with torch.enable_grad():
             x = imgs.detach().clone().requires_grad_(True)
             self._feats = None
@@ -270,20 +134,16 @@ class SegmentationCAM:
             if self.target == "gt":
                 y = labels
             else:
-                # Label-free attacker: the model's own argmax as pseudo-labels.
-                # Same information --placement semantic already assumes.
                 y = lg.argmax(1).detach()
 
-            # SIGN: every objective in adversarial.py is minimised to attack.
-            # Grad-CAM wants a score to INCREASE, so negate exactly once.
             score = -self.adv_loss(lg, y, None, None)
             grads = torch.autograd.grad(score, A, retain_graph=False)[0]
 
         A = as_spatial(A.detach(), H, W)
         G = as_spatial(grads.detach(), H, W)
 
-        weights = G.mean(dim=(2, 3), keepdim=True)              # [B,K,1,1]
-        cam = F.relu((weights * A).sum(dim=1, keepdim=True))    # [B,1,h,w]
+        weights = G.mean(dim=(2, 3), keepdim=True)
+        cam = F.relu((weights * A).sum(dim=1, keepdim=True))
         cam = F.interpolate(cam, size=(H, W), mode="bilinear",
                             align_corners=False)
 
@@ -292,10 +152,6 @@ class SegmentationCAM:
         hi = flat.max(dim=1).values.view(B, 1, 1, 1)
         span = hi - lo
 
-        # A fully-suppressed map (ReLU killed everything) would normalise to
-        # all-zeros, and an argmax over a constant map returns index 0 — i.e.
-        # the top-left corner, silently. Emit a constant 0.5 instead and let
-        # find_max_response_placement() fall back to centre explicitly.
         degenerate = span <= self.eps
         self.n_degenerate += int(degenerate.sum())
         cam = torch.where(degenerate,
@@ -307,22 +163,7 @@ class SegmentationCAM:
 def build(model, loss_fn: str, target_class: int = 8, layer: int = -1,
           module: str = "backbone", target: str = "pred",
           attack_loss=None, tsallis=None) -> SegmentationCAM:
-    """
-    Convenience constructor.
-
-    `attack_loss` lets the caller pass the SAME callable the training loop
-    optimises (ablation F: "different segmentation targets for the sensitivity
-    map"). Otherwise one is built from `loss_fn` via losses.adversarial.build,
-    so the CAM and the attack share one implementation.
-
-    `tsallis` is the keyword dict from _common.tsallis_kwargs(), forwarded to
-    that build. Only read when loss_fn == 'tsallis' AND no attack_loss was
-    handed in. NOTE what the map then is: the CAM runs ONCE, before the loop,
-    so a scheduled q contributes its value at step 0 (q_start under 'linear').
-    That is the honest reading — the sensitivity map is a pre-optimisation
-    artefact and cannot depend on progress that has not happened yet — but it
-    means the map and a late-run attack step are not scored at the same q.
-    """
+    """Convenience constructor."""
     if attack_loss is None:
         from ..losses import adversarial
         attack_loss = adversarial.build(loss_fn, target_class,

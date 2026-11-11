@@ -1,20 +1,4 @@
-"""
-train.py --resume: slicing a universal run must be transparent.
-
-A population run is N independent per-image attacks and slices for free. This
-is ONE continuous optimisation, so the cut has to carry Adam's moments, the
-cosine schedule's position, the epoch counter and the RNG. If any of those is
-dropped the run still completes and still writes plausible numbers — it just
-silently becomes a different optimisation, restarted cold at every slice
-boundary. That is the failure this file exists to catch.
-
-Slices are simulated by killing the process immediately after a checkpoint
-write, which is the realistic case: the driver hands out 30-minute dev-GPU
-slices and SLURM terminates whatever is running when the wall clock expires.
-
-The model and the dataset are stubs. What is under test is the state machine,
-not the segmentor.
-"""
+"""train.py --resume: slicing a universal run must be transparent."""
 from __future__ import annotations
 
 import json
@@ -34,8 +18,7 @@ H, W, K = 32, 64, 4
 
 
 class _StubModel(torch.nn.Module):
-    """A tiny conv, genuinely differentiable w.r.t. its input, so the patch
-    receives a real gradient and Adam accumulates real moments."""
+    """A tiny conv, genuinely differentiable w.r.t. its input, so the patch receives a real gradient and Adam accumulates real moments."""
 
     def __init__(self):
         super().__init__()
@@ -72,11 +55,6 @@ def stub(monkeypatch):
     monkeypatch.setattr(train_mod, "make_dataset",
                         lambda a, split: _StubDS(8 if split == "train" else 4))
 
-    # The val loader hardcodes num_workers=2 (train.py). That is fine on the
-    # cluster, where DataLoader forks; under pytest on Windows it spawns
-    # subprocesses that re-import the test module and the run hangs. Force
-    # single-process loading for both loaders — it changes nothing about the
-    # state machine under test.
     real_dl = train_mod.DataLoader
     monkeypatch.setattr(train_mod, "DataLoader",
                         lambda *a, **kw: real_dl(*a, **{**kw,
@@ -85,9 +63,7 @@ def stub(monkeypatch):
 
 
 def _argv(out_dir, epochs, *extra):
-    """Note --epochs is ALWAYS the full run, exactly as the driver passes it;
-    a slice stops early because it is killed, never because it was told to do
-    less work. Telling it to do less would change the cosine T_max."""
+    """Note --epochs is ALWAYS the full run, exactly as the driver passes it; a slice stops early because it is killed, never because it was told to do less work."""
     return ["train.py", "--arch", "segformer", "--cityscapes_root", "/none",
             "--img_h", str(H), "--img_w", str(W), "--num_classes", str(K),
             "--patch_mode", "raw", "--patch_size", "8", "--patch_scale", "0.25",
@@ -122,11 +98,8 @@ def _final(out_dir):
     return torch.load(out_dir / "final.pt", map_location="cpu")["param"]
 
 
-# ── the one that matters ─────────────────────────────────────────────────────
-
 def test_sliced_run_reproduces_the_uninterrupted_one(stub, tmp_path):
-    """Six epochs in one go versus 2 + 1 + 3, with the process state thrown
-    away in between, must land on the same patch."""
+    """Six epochs in one go versus 2 + 1 + 3, with the process state thrown away in between, must land on the same patch."""
     whole = tmp_path / "whole"
     _slice(stub, _argv(whole, 6))
     assert (whole / "results.json").exists()
@@ -142,27 +115,22 @@ def test_sliced_run_reproduces_the_uninterrupted_one(stub, tmp_path):
 
 
 def test_a_cold_resume_would_fail_this_suite(stub, tmp_path):
-    """Guard on the guard: if the state carried only the parameter and Adam
-    restarted cold, the patches would differ. Confirms the test above is
-    actually sensitive to what it claims to test."""
+    """Guard on the guard: if the state carried only the parameter and Adam restarted cold, the patches would differ."""
     whole = tmp_path / "whole"
     _slice(stub, _argv(whole, 6))
 
     cold = tmp_path / "cold"
     _slice(stub, _argv(cold, 6, "--resume"), kill_after=3)
     st = torch.load(cold / "train_state.pt", map_location="cpu")
-    st["opt"]["state"] = {}                      # drop the moments
+    st["opt"]["state"] = {}
     torch.save(st, cold / "train_state.pt")
     _slice(stub, _argv(cold, 6, "--resume"))
 
     assert not torch.equal(_final(whole), _final(cold))
 
 
-# ── the driver's contract ────────────────────────────────────────────────────
-
 def test_resume_is_idempotent_once_results_exist(stub, tmp_path):
-    """The driver relaunches until the sentinel appears; a relaunch after it
-    appears must not start a second run into the same directory."""
+    """The driver relaunches until the sentinel appears; a relaunch after it appears must not start a second run into the same directory."""
     d = tmp_path / "r"
     _slice(stub, _argv(d, 2))
     before = _final(d).clone()
@@ -174,8 +142,7 @@ def test_resume_is_idempotent_once_results_exist(stub, tmp_path):
 
 
 def test_resume_with_no_state_yet_starts_fresh(stub, tmp_path):
-    """The driver's FIRST slice passes --resume too; it must not need a
-    special case."""
+    """The driver's FIRST slice passes --resume too; it must not need a special case."""
     d = tmp_path / "first"
     _slice(stub, _argv(d, 2, "--resume"))
     assert (d / "results.json").exists()
@@ -190,9 +157,7 @@ def test_resume_without_out_dir_is_refused(stub, tmp_path):
 
 
 def test_resume_refuses_a_config_that_drifted(stub, tmp_path):
-    """A slice relaunched with a different --lr or --epochs continues a
-    DIFFERENT optimisation: cosine T_max and Adam's moments both depend on
-    them, and nothing downstream would show the seam."""
+    """A slice relaunched with a different --lr or --epochs continues a DIFFERENT optimisation: cosine T_max and Adam's moments both depend on them, and nothing downstream would show the seam."""
     d = tmp_path / "drift"
     _slice(stub, _argv(d, 6), kill_after=2)
 
@@ -205,13 +170,7 @@ def test_resume_refuses_a_config_that_drifted(stub, tmp_path):
         train_mod.main()
 
 
-# ── what the state has to contain ────────────────────────────────────────────
-
 def test_state_carries_everything_the_next_step_needs(stub, tmp_path):
-    # Run to completion rather than killing after N checkpoints: the number
-    # of saves per epoch is an implementation detail (it is two on an epoch
-    # that also validates, one otherwise), and this test is about the
-    # CONTENTS of the state, not when it is written.
     d = tmp_path / "s"
     _slice(stub, _argv(d, 3))
     st = torch.load(d / "train_state.pt", map_location="cpu")
@@ -219,14 +178,13 @@ def test_state_carries_everything_the_next_step_needs(stub, tmp_path):
               "opt", "sched", "py_rng", "torch_rng"):
         assert k in st, f"train_state.pt is missing {k}"
     assert st["epoch"] == 3
-    assert st["gstep"] == 3 * 4                  # 8 train imgs / batch 2
+    assert st["gstep"] == 3 * 4
     assert st["sched"] is not None and st["sched"]["T_max"] == 3 * 4
     assert st["opt"]["state"], "Adam's moments are missing"
 
 
 def test_wall_clock_accumulates_across_slices(stub, tmp_path):
-    """wall_clock_s is a cost column in the index; per-slice it understates
-    the run by however many slices it took."""
+    """wall_clock_s is a cost column in the index; per-slice it understates the run by however many slices it took."""
     d = tmp_path / "w"
     _slice(stub, _argv(d, 4, "--resume"), kill_after=2)
     part = torch.load(d / "train_state.pt", map_location="cpu")["elapsed_s"]
@@ -243,8 +201,6 @@ def test_the_sampled_subset_is_pinned_across_a_resume(stub, tmp_path):
     rec = json.loads((d / "train_images.json").read_text())
     assert len(rec["indices"]) == 4 and rec["train_seed"] == 68
 
-    # Tamper with the record: a resume that quietly trained on other images
-    # would be invisible in every output, so it must refuse.
     (d / "train_images.json").write_text(
         json.dumps(dict(rec, indices=[1, 2, 3, 5])))
     stub.setattr(sys, "argv", _argv(d, 3, "--n_train", "4",
@@ -253,20 +209,13 @@ def test_the_sampled_subset_is_pinned_across_a_resume(stub, tmp_path):
         train_mod.main()
 
 
-# ── killed inside a validation ───────────────────────────────────────────────
-
 def test_a_kill_inside_the_epoch1_validation_still_checkpoints(stub, tmp_path):
-    """THE b5 BUG. Epoch 1 always validates, and at native resolution that
-    pass can run for hours. save_state used to come AFTER the validation
-    branch, so a job killed inside it had never checkpointed at all: no
-    train_state.pt, every requeue "starting fresh", epoch 1 again, same
-    validation, killed again -- a run that can never advance however often it
-    is resubmitted."""
+    """THE b5 BUG."""
     d = tmp_path / "killed_in_val"
     real_eval = train_mod.evaluate
 
     def die(*a, **kw):
-        raise _Killed                      # stands in for the walltime kill
+        raise _Killed
     stub.setattr(train_mod, "evaluate", die)
     _slice(stub, _argv(d, 4, "--resume"))
 
@@ -274,7 +223,6 @@ def test_a_kill_inside_the_epoch1_validation_still_checkpoints(stub, tmp_path):
     assert st["epoch"] == 1, "epoch 1's training work was not checkpointed"
     assert not (d / "results.json").exists()
 
-    # The requeue must now CONTINUE, not restart.
     stub.setattr(train_mod, "evaluate", real_eval)
     _slice(stub, _argv(d, 4, "--resume"))
     assert (d / "results.json").exists()
@@ -282,8 +230,7 @@ def test_a_kill_inside_the_epoch1_validation_still_checkpoints(stub, tmp_path):
 
 
 def test_the_post_validation_save_keeps_best_and_history(stub, tmp_path):
-    """The pre-validation save must not cost best/history on epochs whose
-    validation does complete."""
+    """The pre-validation save must not cost best/history on epochs whose validation does complete."""
     d = tmp_path / "hist"
     _slice(stub, _argv(d, 2, "--val_every", "1"), kill_after=4)
     st = torch.load(d / "train_state.pt", map_location="cpu")
@@ -292,10 +239,7 @@ def test_the_post_validation_save_keeps_best_and_history(stub, tmp_path):
 
 
 def test_validating_does_not_perturb_the_global_rng(stub, tmp_path):
-    """The val loader draws its worker base seed from the default generator
-    on every iteration, even with shuffle=False. Before it was given its own
-    generator, a resume that skipped a validation consumed one draw fewer
-    than an uninterrupted run and every later train shuffle diverged."""
+    """The val loader draws its worker base seed from the default generator on every iteration, even with shuffle=False."""
     import torch.utils.data as tud
     ds = tud.TensorDataset(torch.arange(4).float().view(4, 1))
 
@@ -312,8 +256,7 @@ def test_validating_does_not_perturb_the_global_rng(stub, tmp_path):
 
 
 def test_a_kill_inside_a_validation_still_resumes_bit_exactly(stub, tmp_path):
-    """With the val loader on its own RNG, skipping a validation on resume
-    costs history and best.pt but NOT the trajectory."""
+    """With the val loader on its own RNG, skipping a validation on resume costs history and best.pt but NOT the trajectory."""
     whole = tmp_path / "whole"
     _slice(stub, _argv(whole, 4, "--val_every", "1"))
 
@@ -323,7 +266,7 @@ def test_a_kill_inside_a_validation_still_resumes_bit_exactly(stub, tmp_path):
 
     def die_once(*a, **kw):
         calls["n"] += 1
-        if calls["n"] == 2:            # die inside epoch 2's validation
+        if calls["n"] == 2:
             raise _Killed
         return real_eval(*a, **kw)
     stub.setattr(train_mod, "evaluate", die_once)

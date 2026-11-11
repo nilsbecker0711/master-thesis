@@ -1,16 +1,4 @@
-r"""
-UNTARGETED diagnostics — "where does the patch cause confusion, and what kind?"
-
-Targeted diagnostics ask "can the patch impose class t here?". These ask a
-different question and need different instruments.
-
-THE FINDING THESE EXIST TO SURFACE: an untargeted loss has no class objective,
-yet it converges on ONE confusion channel. Measured here: ~97% of all remote
-flips went road -> car, with car IoU dropping ~68 points in every image. The
-loss is an IMPLICIT CLASS SELECTOR, not a broad disruptor — it finds the most
-exploitable boundary and exploits only that. The confusion matrix is what makes
-that visible; aggregate mIoU hides it completely.
-"""
+"""UNTARGETED diagnostics — "where does the patch cause confusion, and what kind?" """
 from __future__ import annotations
 
 import numpy as np
@@ -25,19 +13,7 @@ RINGS = [(0, 150), (150, 300), (300, 450), (450, 650), (650, 900)]
 
 @torch.no_grad()
 def winner_margin(clean_logits, adv_logits, footprint, K: int, log=print):
-    """
-    max_logit - second_max_logit, clean vs patched.
-
-    This is the most SENSITIVE reach measurement available. The argmax-flip map
-    shows completed flips; the margin delta shows pixels the patch has pushed
-    toward a flip WITHOUT completing one. The blue region in the delta reliably
-    extends past the flip zone — the attack's influence is wider than its
-    effect, which is what motivated testing untargeted attacks in the first
-    place.
-
-    topk is capped at K: heads emitting 150 channels would otherwise compute
-    the runner-up from inert channels.
-    """
+    """max_logit - second_max_logit, clean vs patched."""
     H, W = clean_logits.shape[-2:]
 
     def margin(lg):
@@ -67,15 +43,7 @@ def winner_margin(clean_logits, adv_logits, footprint, K: int, log=print):
 
 @torch.no_grad()
 def confusion(clean_logits, adv_logits, labels, footprint, K: int, log=print):
-    """
-    What did flipped pixels become?
-
-    Returns per-class flip rate plus the source->destination flow table. A
-    STRUCTURED matrix (a few flows dominating) means the untargeted loss is
-    behaving like a weak targeted attack; a DIFFUSE one means genuine
-    broad-spectrum confusion. These have completely different security
-    implications and mIoU cannot tell them apart.
-    """
+    """What did flipped pixels become?"""
     hw = labels.shape[-2:]
     pc = upsample_to(clean_logits, hw).argmax(1)[0]
     pa = upsample_to(adv_logits, hw).argmax(1)[0]
@@ -120,13 +88,7 @@ def confusion(clean_logits, adv_logits, labels, footprint, K: int, log=print):
 
 @torch.no_grad()
 def entropy(clean_logits, adv_logits, footprint, K: int, log=print):
-    """
-    Normalised Shannon entropy, clean vs patched.
-
-    Complements the winner margin: margin measures the top-2 gap, entropy
-    measures uncertainty across ALL classes. They can disagree — a patch can
-    narrow the top-2 gap while leaving the rest of the distribution untouched.
-    """
+    """Normalised Shannon entropy, clean vs patched."""
     H, W = clean_logits.shape[-2:]
 
     def ent(lg):
@@ -153,14 +115,7 @@ def entropy(clean_logits, adv_logits, footprint, K: int, log=print):
 @torch.no_grad()
 def reach_by_source_class(clean_logits, adv_logits, labels, footprint, K: int,
                           n_bins: int = 8, log=print):
-    """
-    Flip rate vs distance, split by what was predicted BEFORE the attack.
-
-    If high-confidence classes (road, sky) flip as readily as low-confidence
-    ones, the attack overcomes the network. If only naturally-uncertain classes
-    flip, it merely exploits pre-existing uncertainty. That distinction decides
-    how the result should be framed.
-    """
+    """Flip rate vs distance, split by what was predicted BEFORE the attack."""
     hw = labels.shape[-2:]
     pc = upsample_to(clean_logits, hw).argmax(1)[0]
     pa = upsample_to(adv_logits, hw).argmax(1)[0]

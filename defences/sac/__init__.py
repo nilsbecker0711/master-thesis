@@ -1,4 +1,4 @@
-"""SAC — Segment and Complete (Liu et al., CVPR 2022). See defence.py."""
+"""SAC — Segment and Complete (Liu et al., CVPR 2022)."""
 from __future__ import annotations
 
 from .defence import (SAC_BREAK_ITS, SAC_DECLARED_SQUARE_SIZES,

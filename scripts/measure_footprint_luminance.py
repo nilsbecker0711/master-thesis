@@ -1,70 +1,5 @@
 #!/usr/bin/env python
-r"""
-STEP 0 for the universal CSF patch — HOW DARK IS THE GROUND THE PATCH SITS ON?
-NO MODEL, NO TRAINING, NO GPU.
-
-    python scripts/measure_footprint_luminance.py \
-        --cityscapes_root $CS --img_h 512 --img_w 1024 --split train
-
-WHAT THIS SETTLES
------------------
-The universal patch is bounded by a CSF evaluated at ONE fixed reference
-luminance, because a universal patch cannot look at the image it lands on. The
-per-image attack that this is the control for CAN. The entire case for that
-extra machinery rests on one number: how much does the amplitude budget move
-across the luminance range the footprint actually encounters?
-
-If the answer is "barely", the fixed-luminance simplification is a footnote and
-the content-adaptive variant has no perceptual justification to stand on — it
-would have to earn its place on attack strength alone. If the answer is "a lot",
-the fixed reference is systematically wrong on most frames and the spread is
-itself the result.
-
-TWO EFFECTS, DECOMPOSED, because they fight each other and a single ratio hides
-that:
-
-  MICHELSON DENOMINATOR   contrast is A / Y_ref, so budget is EXACTLY linear in
-                          Y_ref. The large term.
-  BARTEN SENSITIVITY      CSF(f) shifts with retinal illuminance via the pupil.
-                          Flat across the photopic range, and it moves the
-                          OTHER way — a darker background is a less sensitive
-                          observer, which partly cancels the first effect.
-
-The table below prints both factors separately alongside their product. Read
-the product, but quote the decomposition: "the budget moves 7x, of which 21x is
-the contrast denominator and 0.34x is Barten pushing back" is a real finding.
-"the budget moves 7x" is not.
-
-PLACEMENT IS RESTRICTED TO center/fixed, AND THAT IS A COST, NOT A VERDICT.
-Cityscapes has a consistent camera geometry, so fixed pixel coordinates keep the
-patch genuinely universal, and the geometry here is resolved through
-placement.resolve() — the SAME helper Patch.apply() uses — so the window
-measured is the window the attack will occupy, not an approximation of it.
-
-Grad-CAM placement is a legitimate later rung, but it is NOT free here and it
-is not free downstream:
-
-  COST      the CAM is per image, so measuring its footprint means a forward
-            AND backward pass over the whole split. This script currently needs
-            no model, no GPU and no weights; adding gradcam moves it to a GPU
-            partition and from minutes to hours.
-  MEANING   a universal residual placed at each image's hotspot IS content-
-            adaptive — through placement rather than through the residual. That
-            is a defensible middle rung between the fixed control and the
-            per-image attack, but it is not the non-adaptive control, and
-            reporting it as one would give away the comparison.
-
-USE --placement fixed --placement_xy 0.75 0.5 AS THE CHEAP PROXY. The repo
-documents the CAM's hottest ridge as the near-field road boundary along the
-bottom of a dashcam frame, which is why --placement_margin exists at all. Road
-surface straight ahead lands in the same dark asphalt without costing a model
-pass, so it brackets what gradcam would measure.
-
-sRGB IS LINEARISED BEFORE WEIGHTING. Averaging gamma-encoded RGB over-states
-the luminance of a dark region, which would flatter the fixed-reference
-simplification. The legacy mu = 0.5 convention is printed alongside so the size
-of the existing calibration error is visible rather than inferred.
-"""
+"""STEP 0 for the universal CSF patch — HOW DARK IS THE GROUND THE PATCH SITS ON?"""
 from __future__ import annotations
 
 import argparse
@@ -84,13 +19,9 @@ from patchreach.patch import csf as csf_mod
 from patchreach.patch import placement as placement_mod
 from patchreach.utils import seed_everything
 
-# The bands csf.report() prints its budget over. Reused verbatim so this
-# script's table can be laid next to that one without re-binning.
 BANDS = ((0.0, 0.02), (0.02, 0.05), (0.05, 0.1),
          (0.1, 0.2), (0.2, 0.35), (0.35, 0.5001))
 
-# Three representative point frequencies, in cycles/pixel: low, mid, and just
-# short of Nyquist. Named rather than indexed so the report reads.
 PROBE_CPP = (("low", 0.02), ("mid", 0.10), ("near-Nyquist", 0.49))
 
 
@@ -135,24 +66,9 @@ def build_parser():
     return p
 
 
-# ═════════════════════════════════════════════════════════════════════════════
-#  Measurement
-# ═════════════════════════════════════════════════════════════════════════════
-
 def footprint_luminance(root, split, img_h, img_w, scale, policy, xy,
                         n_images, batch_size, num_workers):
-    """
-    Per-image mean luminance inside the footprint.
-
-    Returns (Y_linear [N], Y_encoded [N], window, n_total).
-
-    Y_linear   : linearise, then weight by Rec.709. The physically correct one
-                 and the only one a Michelson contrast may be divided by.
-    Y_encoded  : mean of the gamma-encoded channels — WRONG, and computed only
-                 so the report can show how wrong. This is what the existing
-                 local_contrast_scale() effectively assumes, and it is the
-                 quantity the mu = 0.5 convention is a stand-in for.
-    """
+    """Per-image mean luminance inside the footprint."""
     ds = CityscapesSeg(root, split, img_h, img_w)
     n_total = len(ds)
     if n_images and n_images < n_total:
@@ -168,9 +84,6 @@ def footprint_luminance(root, split, img_h, img_w, scale, policy, xy,
 
     lin, enc = [], []
     for img, _ in tqdm(loader, desc=f"{split} footprint"):
-        # Undo the ImageNet normalisation to recover sRGB code values. The
-        # clamp matters: bilinear resize can overshoot slightly outside [0,1]
-        # and srgb_to_linear is only defined on the unit interval.
         rgb = (img * std_t + mean_t).clamp(0, 1)
         crop = rgb[:, :, top:top + p, left:left + p]
         lin.append(csf_mod.relative_luminance(crop).mean(dim=(-2, -1)))
@@ -185,10 +98,6 @@ def distribution(x: torch.Tensor) -> dict:
             "p5": p5, "p95": p95, "min": float(x.min()), "max": float(x.max()),
             "std": float(x.std())}
 
-
-# ═════════════════════════════════════════════════════════════════════════════
-#  Budget sensitivity
-# ═════════════════════════════════════════════════════════════════════════════
 
 def band_budget(size, Y_ref, geometry, model, tau, min_cycles):
     """Mean budget and mean CSF per radial band, at background luminance Y_ref."""
@@ -206,18 +115,7 @@ def band_budget(size, Y_ref, geometry, model, tau, min_cycles):
 
 
 def probe_budget(Y_ref, geometry, model, tau):
-    r"""
-    Budget at the three probe frequencies, DECOMPOSED.
-
-    Evaluated pointwise rather than by band so the two effects stay separable:
-
-        budget(f; Y) = tau * Y / (2 * CSF(f; Y))     [linear luminance units]
-
-    The luminance factor is the Y in the numerator, the CSF factor is the
-    CSF(f; Y) in the denominator, and only their product is the budget. A
-    band-averaged budget cannot be decomposed this way because the two factors
-    average differently.
-    """
+    """Budget at the three probe frequencies, DECOMPOSED."""
     f_cpd = geometry.to_cycles_per_degree(
         torch.tensor([v for _, v in PROBE_CPP]))
     params, L_abs = csf_mod.barten_params_at_luminance(Y_ref, geometry)
@@ -235,10 +133,6 @@ def probe_budget(Y_ref, geometry, model, tau):
                               "budget_srgb": float(srgb[i])}
                        for i, (name, v) in enumerate(PROBE_CPP)}}
 
-
-# ═════════════════════════════════════════════════════════════════════════════
-#  Reporting
-# ═════════════════════════════════════════════════════════════════════════════
 
 def plot_histogram(y_lin, y_enc, stats, path):
     import matplotlib
@@ -352,11 +246,6 @@ def main():
     for band, v in bands["median"].items():
         print(f"  {band:<14}{v['csf']:>10.2f}{v['budget']:>12.4e}")
 
-    # csf_model BELONGS IN THIS PATH. Without it the barten and sso runs of the
-    # same split/placement collide, and the second silently overwrites the
-    # first -- which is exactly what happened on the first cluster sweep: the
-    # sso control clobbered the headline barten run and only the luminance
-    # half, which is model-independent, survived.
     out_dir = (Path(a.out_dir)
                / f"{a.split}_{a.img_h}x{a.img_w}_{a.placement}_p{size}_{a.csf_model}")
     out_dir.mkdir(parents=True, exist_ok=True)

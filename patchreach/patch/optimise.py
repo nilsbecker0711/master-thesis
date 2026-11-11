@@ -1,32 +1,4 @@
-r"""
-The single-image attack procedure, in ONE place.
-
-WHY THIS EXISTS
----------------
-scripts/overfit.py owned this loop inline. The moment a second caller needed it
-— running the same per-image attack over N images to get a population rather
-than an anecdote — the choice was to copy forty lines or to extract them.
-
-This repository has already paid for the copy-paste answer twice: three bugs
-came from redeclaring the argument parsers in train.py and overfit.py and
-updating one copy, which is why they now live in _common.py; and
-composite_batch() carries a test asserting it still agrees with Patch.apply()
-precisely because a mirrored implementation drifts silently. A second copy of
-the optimisation loop would drift the same way, and the drift would look like a
-result: the population numbers would stop matching the single-image numbers and
-nothing would say why.
-
-So overfit.py and overfit_population.py call the SAME function here. Anything
-that changes the attack changes both, or neither.
-
-WHAT IT DOES NOT DO
--------------------
-No argument parsing, no model construction, no diagnostics. It takes a built
-model and a built Patch, runs the attack, and returns numbers. Diagnostics are
-the caller's business — which is the whole point for the population run, where
-the suite is far too expensive to run on every image and is deliberately
-restricted to a handful afterwards.
-"""
+"""The single-image attack procedure, in ONE place."""
 from __future__ import annotations
 
 from pathlib import Path
@@ -41,36 +13,13 @@ from ..metrics.miou import (SegMetric, single_image_miou, attack_rates,
                             compare as miou_compare)
 from .lap import magnitude_report
 
-# Where every training entry point parks its per-step / per-epoch patch
-# snapshots. They are progress, not results: a 1000-step run at log_every=10
-# drops a hundred PNGs, and loose in the run directory they bury best.pt,
-# final.pt and the diagnostics the run is actually read for. One name, defined
-# once, so overfit.py, train.py and anything scanning a run agree on it.
 INTERMEDIATE_DIR = "intermediate_patches"
 
 
 def prepare(model, img, patch, img_h: int, img_w: int,
             from_image: bool = False, mean_t=None, std_t=None,
             cam=None, label=None, log=None) -> torch.Tensor:
-    r"""
-    Clean forward -> sensitivity map -> resolve_placement -> image-derived base.
-
-    ORDERING IS LOAD-BEARING AND IS THE REASON THIS IS A FUNCTION. Semantic
-    placement reads the CLEAN PREDICTION and gradcam placement reads the
-    SENSITIVITY MAP, so neither can be resolved before the model has seen the
-    image; done backwards, placement silently falls back to centre and every
-    downstream number is quietly about a different patch position.
-    set_reference_from_image() then has its own ordering constraint on top —
-    it needs the resolved placement to know which region to copy, which is why
-    --from_image and --placement gradcam compose correctly only in this order.
-
-    cam : a segmentation_cam.SegmentationCAM, required for placement='gradcam'.
-          Its forward pass also returns the clean logits, so the CAM path costs
-          ONE backward rather than an extra forward — the clean pass is reused
-          rather than repeated.
-
-    Returns the clean logits, upsampled to the label resolution.
-    """
+    """Clean forward -> sensitivity map -> resolve_placement -> image-derived base."""
     score_map = None
     if patch.cfg.placement == "gradcam":
         if cam is None:
@@ -92,8 +41,6 @@ def prepare(model, img, patch, img_h: int, img_w: int,
     patch.resolve_placement(img_h, img_w, clean_logits.argmax(1)[0],
                             score_map=score_map)
     if from_image:
-        # Only changes behaviour for modes that treat the reference as a BASE
-        # (csf); every pre-existing mode ignores it.
         patch.set_reference_from_image(img, mean_t, std_t)
         if log:
             log(f"[patch] base      : image region at {patch.placement} "
@@ -119,67 +66,7 @@ def attack_image(model, img, label, patch, *,
                  save_best: bool = True,
                  verbose: bool = True,
                  log=print) -> dict:
-    r"""
-    Optimise `patch` against ONE image. Returns the result record.
-
-    `patch` is left holding its FINAL parameter. The BEST parameter — by remote
-    mIoU drop — is written to out_dir/best.pt when `save_best`, because a run
-    that saturates late otherwise destroys the result it had already achieved.
-    project() exists to make that rare; best.pt exists because rare is not
-    never, and one observed run reached a 17.5-point drop at step 660 and was
-    inert by step 700.
-
-    `save_step_images` writes a PNG every log_every steps, into
-    out_dir/intermediate_patches/ rather than out_dir itself — hundreds of
-    patch_step*.png beside best.pt bury the files a run is actually read for.
-    Right for a single interactive run, catastrophic across hundreds of images
-    — it is off by default and overfit.py turns it on.
-
-    `classes` selects which classes enter the mIoU mean, and 'gt' is the only
-    safe default for an ATTACK measurement. Under 'union' a class with no
-    ground truth that the model predicts anywhere scores IoU 0 and drags the
-    nanmean down; suppress that prediction and the class leaves the denominator
-    and the mean jumps by ~mean/(n-1). Clean and attacked are then averaged over
-    different class sets and their difference is not a measurement — this is the
-    bug that made a 150-epoch run report drop_remote = -3.63. The record carries
-    the union figures too, so runs from before that fix stay comparable and any
-    divergence stays visible rather than silent.
-
-    `optimiser` selects the step rule — 'adam' (every run to date) or
-    'sign', the update PGD takes. See patchreach/optim.py for why the
-    two are matched at EQUAL lr rather than at equal gradient norm. It
-    composes with PatchConfig.pixel_param, which selects the other half
-    of PGD's recipe: 'sign' + pixel_param='direct' is a PGD step with a
-    projection onto the feasible pixel box, which is as close to PGD as
-    a patch threat model reaches (there is no epsilon-ball).
-
-    `lr_schedule` anneals the step size to zero across the run, and 'cosine'
-    is the answer to a MEASURED failure rather than a tidiness preference. Four
-    runs of one identical single-image config (segformer, csf, tau 0.25, lr 0.2,
-    400 steps, image 420) returned remote drops of 48.19, 44.02, 41.65 and
-    38.60 — mean 43.1, sd 4.1, range 9.6, with no code change between them.
-    Adam's update is on the order of `lr` per coordinate whatever the gradient
-    magnitude, so a FLAT lr is still taking full-size steps at step 400: the run
-    never settles, it wanders, and the reported number is wherever the walk
-    happened to be when the step counter ran out. The spread was not smooth
-    jitter either — any_flip_rate came out bimodal at 97-98% and 68-69% with
-    nothing in between, i.e. two basins, and float-level nondeterminism decided
-    which one each run found (the bilinear-upsample backward in upsample_to
-    accumulates with atomics and has no deterministic CUDA kernel, so even a
-    fixed seed does not repeat bitwise — two seed-42 reruns differed at step 1
-    in the sixth decimal). Annealing does not remove the basins; it stops the
-    tail of the run from hopping between them, so the endpoint is decided by the
-    basin rather than by the step counter.
-
-    The default is 'none' so that every number produced before this existed
-    keeps its meaning. Callers opt in, and the choice is recorded in the
-    returned record, so a run always states which regime it was.
-
-    NOTE ON COMPARABILITY, inherited from overfit.py and still true: a
-    single-image attack is a much EASIER problem than a universal patch trained
-    across the dataset. Numbers from here belong beside per-image published
-    numbers, never beside universal-patch ones.
-    """
+    """Optimise `patch` against ONE image."""
     hw = label.shape[-2:]
     if clean_logits is None:
         with torch.no_grad():
@@ -196,9 +83,6 @@ def attack_image(model, img, label, patch, *,
 
     objective = adversarial.build(
         loss_fn, target_class if loss_fn == "ipatch_cospgd" else 8)
-    # tsallis needs its q schedule, which the two-argument build() cannot
-    # carry. Rebound ONLY on this branch and read off patch.cfg, so no other
-    # loss_fn and no existing call site of attack_image() is touched.
     if loss_fn == "tsallis":
         objective = adversarial.build(
             loss_fn, 8,
@@ -209,9 +93,6 @@ def attack_image(model, img, label, patch, *,
             tsallis_total_steps=steps)
         if verbose:
             log(f"[loss ] {objective!r}")
-    # margin scores against the CLEAN PREDICTION, which only exists here.
-    # Rebound on this branch alone, exactly like tsallis above; void is set to
-    # 255 so the loss excludes the same pixels any_flip_rate excludes.
     if loss_fn in ("margin", "cos_margin"):
         ref = upsample_to(clean_logits, hw).argmax(1)
         ref[label == 255] = 255
@@ -220,9 +101,6 @@ def attack_image(model, img, label, patch, *,
         if verbose:
             log(f"[loss ] {loss_fn} vs clean prediction, "
                 f"kappa={margin_kappa:g}")
-    # betas PASSED EXPLICITLY, not defaulted: this loop has always used
-    # (0.9, 0.999) and train.py (0.5, 0.999), and routing both through
-    # one builder must not quietly move either.
     opt = optim_mod.build(optimiser, [patch.param], lr,
                           betas=(0.9, 0.999))
     if verbose and optimiser != "adam":
@@ -242,8 +120,6 @@ def attack_image(model, img, label, patch, *,
     history, best_drop = [], -1e9
     la = None
     for step in range(1, steps + 1):
-        # `step` is 1-BASED here, so step-1 is the 0-based progress counter the
-        # schedule is defined on (t = 0 at the first step, 1 at the last).
         if hasattr(objective, "on_step_begin"):
             objective.on_step_begin(step - 1, steps)
         opt.zero_grad()
@@ -293,9 +169,6 @@ def attack_image(model, img, label, patch, *,
         patched, fp = patch.apply(img)
         adv_logits = upsample_to(model(patched), hw)
 
-        # Both class sets, via the shared helper, so a population run reports
-        # exactly what train.py and evaluate.py report and a moved class set is
-        # visible rather than buried in the mean.
         pc = upsample_to(clean_logits, hw).argmax(1)
         pa = adv_logits.argmax(1)
         mc_all, ma_all = (SegMetric(num_classes, device=logits.device),
@@ -317,22 +190,10 @@ def attack_image(model, img, label, patch, *,
                              target_class if loss_fn == "ipatch_cospgd"
                              else None)
 
-    # The END-OF-RUN patch statistics, promoted into the record.
-    # For csf that is realised visibility — tau is an INTENT, this is the
-    # OUTCOME, and only the outcome is reportable. It previously lived solely
-    # in `history`, which the population scripts strip before writing
-    # summary.json, so a population run could not report the one number the
-    # whole CSF family's claim rests on. For raw it carries frac_at_clip,
-    # which is the early warning for saturation collapse across a population.
     final_stats = {f"final_{k}": v for k, v in patch.stats().items()}
 
     degraded = best_drop > (clean_rem - final_rem) + 1.0
     if degraded and verbose:
-        # NAME THE RIGHT STAT. csf never touches the sigmoid — render() adds a
-        # spectral residual to a base — and its stats() has no frac_at_clip, so
-        # the original message sent a csf user looking for a key that does not
-        # exist in their history. The csf failure with the same signature is
-        # spectral saturation, and frac_at_bound is what shows it.
         hint = ("frac_at_bound in the history (-> 1 means the spectral "
                 "allocation\n  is frozen and the run can only rotate phase; "
                 "under --csf_param squash that is\n  expected and --csf_param "
@@ -344,11 +205,6 @@ def attack_image(model, img, label, patch, *,
             f"  The run degraded after its peak — check {hint},\n"
             f"  and use best.pt rather than final.pt.")
 
-    # WHERE the patch ended up is part of the result, not bookkeeping. Under
-    # --placement gradcam it varies per image, so a population run cannot be
-    # interpreted without it: a drop measured at the image centre and one
-    # measured at a near-field hotspot are not the same measurement, and the
-    # distance from centre is what separates them.
     H, W = hw
     p_side = patch.side(H, W)
     top, left = (patch.placement if patch.placement is not None
@@ -369,9 +225,6 @@ def attack_image(model, img, label, patch, *,
                 ((top - ctop) ** 2 + (left - cleft) ** 2) ** 0.5),
             "placement_on_border": bool(on_border),
             "classes": classes,
-            # The 'union' figures, kept so pre-fix runs stay comparable. A gap
-            # between drop_remote and drop_remote_union means a rare class moved
-            # in or out of the denominator, which is a diagnostic in itself.
             "drop_all_union": cmp_all["drop_union"],
             "drop_remote_union": cmp_rem["drop_union"],
             "n_classes_gt": cmp_rem["n_classes_gt"],
@@ -380,13 +233,8 @@ def attack_image(model, img, label, patch, *,
             "class_set_moved": bool(cmp_rem["n_classes_clean_union"]
                                     != cmp_rem["n_classes_adv_union"]),
             "lr_schedule": lr_schedule,
-            # Recorded on EVERY run, including the default, so a row in
-            # the index that predates the flag is distinguishable from
-            # one that chose adam rather than silently merged with it.
             "optimiser": optimiser,
             "pixel_param": patch.cfg.pixel_param,
-            # tsallis ONLY, so the record schema for every other loss_fn is
-            # byte-for-byte what it was and downstream parsers do not move.
             **({"tsallis_q": objective.q} if loss_fn == "tsallis" else {}),
             **final_stats, **rates, "history": history}
 

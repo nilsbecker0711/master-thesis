@@ -1,46 +1,5 @@
 #!/usr/bin/env python
-r"""
-Do the patches transfer to SAM 3? Prompt-conditioned cross-paradigm transfer.
-
-    python scripts/sam3_transfer.py --checkpoint results/.../best.pt \
-        --cityscapes_root $CS --img_h 1024 --img_w 2048 --from_image
-
-RUNS IN THE SAM 3 ENV, NOT THE MMSEG ENV. Nothing here imports mmseg, mmcv or
-patchreach.models — only patchreach.patch (torch-only), patchreach.data and
-patchreach.metrics. Keep the two environments apart: mmcv 1.x and a recent
-transformers/torch stack do not coexist.
-
-WHAT IS AND IS NOT MEASURED HERE. SAM 3 has no Cityscapes-trained classifier.
-Its "semantic segmentation" is 19 promptable-concept queries merged into one
-label map by a rule THIS SCRIPT DEFINES (see merge_prompts). That rule is a
-per-pixel argmax over prompt scores, so it is part of the attack surface: a
-patch that nudges scores slightly can flip the argmax a lot or not at all
-depending on how the merge is written. The rule is therefore a recorded
-parameter, not an implementation detail, and `results.json` carries it.
-
-THREE THINGS MAKE A NULL RESULT READABLE, and all three are on by default:
-
-  * the FLOOR (--floor grey|random). A grey square of identical footprint.
-    If SAM 3 moves as much under the floor as under the patch, there is no
-    transfer, there is occlusion sensitivity. Without this row the table
-    cannot be interpreted at all.
-  * the HEADROOM AUDIT. Per-class clean IoU is dumped before any attack
-    number is quoted. A class SAM 3 never predicts has ~0 clean IoU, so its
-    drop is structurally 0 and "no effect" is indistinguishable from "nothing
-    left to break". Only classes with headroom enter the claim.
-  * the GRADED READOUT. mIoU here is a thresholded argmax and will be
-    insensitive. Per-prompt score means inside and outside the footprint are
-    logged clean-vs-patched, so a perturbation that does not cross the argmax
-    boundary is still visible, and presence suppression (a prompt returning
-    no instances at all) is counted separately from a score shift.
-
-THE PATCH IS BUILT IN PIXEL SPACE AND HANDED OVER AS A PIL IMAGE. Patch.apply
-composites in NORMALISED space, so the image is normalised with the SAME
-IMG_MEAN/IMG_STD the patch was trained under, patched, then denormalised and
-clamped. The pixel patch SAM 3 sees is therefore bit-identical to the one the
-mmseg eval sees — which is the only reason the transfer number means anything.
-Do not "simplify" this by normalising with SAM 3's own statistics.
-"""
+"""Do the patches transfer to SAM 3?"""
 from __future__ import annotations
 
 import argparse
@@ -60,22 +19,8 @@ from patchreach.metrics.miou import SegMetric, compare
 from patchreach.patch.spec import Patch
 from patchreach.utils import get_device, increment_path, seed_everything
 
-# The ten fixed val images every number in the thesis is reported on. Imported
-# rather than copied: two lists that must agree and are maintained separately
-# is the drift this repo keeps paying for.
 from _common import FIXED10, image_indices
 
-# ── prompts ──────────────────────────────────────────────────────────────────
-# NOT patchreach.data.cityscapes.NAMES. Those are display abbreviations ("veg",
-# "moto", "light") and make poor noun phrases for a text-conditioned model.
-#
-# THE PROMPT WORDING IS A FREE PARAMETER AND IT IS PART OF THE RESULT. Two of
-# these are outright interpretations of the Cityscapes definition — class 8
-# 'vegetation' is trees and bushes, class 9 'terrain' is grass and soil — and
-# class 12 'rider' is a person-in-a-role that no single noun names. Fix this
-# table once, record it in results.json (it is written there automatically),
-# and if you change it, rerun the clean baseline too: a prompt change moves the
-# denominator of every drop below.
 PROMPTS = {
     0:  "road",
     1:  "sidewalk",
@@ -85,11 +30,11 @@ PROMPTS = {
     5:  "pole",
     6:  "traffic light",
     7:  "traffic sign",
-    8:  "tree",                                  # Cityscapes 'vegetation'
-    9:  "grass",                                 # Cityscapes 'terrain'
+    8:  "tree",
+    9:  "grass",
     10: "sky",
     11: "person",
-    12: "person riding a bicycle or motorcycle",  # Cityscapes 'rider'
+    12: "person riding a bicycle or motorcycle",
     13: "car",
     14: "truck",
     15: "bus",
@@ -98,44 +43,17 @@ PROMPTS = {
     18: "bicycle",
 }
 
-K_GT = 19          # Cityscapes trainIds 0..18
-UNASSIGNED = 19    # pixels no prompt claimed
+K_GT = 19
+UNASSIGNED = 19
 
-# SegMetric is built with K_GT + 1 so UNASSIGNED has somewhere to land.
-# classes='gt' keeps only rows with gt > 0, and class 19 never appears in the
-# ground truth, so it is NaN and drops out of the mean — while a GT pixel
-# predicted UNASSIGNED still loses its true class a true positive. The penalty
-# is counted, the phantom class is not averaged in. No special-casing needed.
 K_METRIC = K_GT + 1
 
-
-# ── SAM 3 ────────────────────────────────────────────────────────────────────
 
 BPE_ASSET = "assets/bpe_simple_vocab_16e6.txt.gz"
 
 
 def find_bpe(explicit: str | None) -> str | None:
-    r"""
-    Locate the BPE vocab the text encoder needs, WITHOUT pkg_resources.
-
-    WHY THIS EXISTS. build_sam3_image_model() falls back to
-    pkg_resources.resource_filename("sam3", <asset>) when bpe_path is None, and
-    that call dies with
-
-        TypeError: expected str, bytes or os.PathLike object, not NoneType
-
-    whenever sys.modules['sam3'] is a NAMESPACE package — namespace packages
-    have __file__ = None, and resource_filename takes os.path.dirname of it.
-    A clone sitting at <repo>/sam3/ (the repo root, no __init__.py) next to the
-    real package at <repo>/sam3/sam3/ can resolve exactly that way, and this
-    script putting the repo root on sys.path makes it more likely rather than
-    less. Passing bpe_path explicitly skips the fallback and the whole problem.
-
-    importlib.resources is NOT used as the fallback here on purpose: for a
-    namespace package files() returns a MultiplexedPath, which does not
-    str()-ify to a filesystem path, so it would trade one TypeError for
-    another. A plain filesystem probe is the thing that actually works.
-    """
+    """Locate the BPE vocab the text encoder needs, WITHOUT pkg_resources."""
     if explicit:
         p = Path(explicit)
         if not p.is_file():
@@ -143,14 +61,13 @@ def find_bpe(explicit: str | None) -> str | None:
         return str(p)
 
     root = Path(__file__).resolve().parents[1]
-    for cand in (root / "sam3" / "sam3" / BPE_ASSET,     # clone at <repo>/sam3
-                 root / "sam3" / BPE_ASSET,              # package at <repo>/sam3
-                 Path("sam3") / "sam3" / BPE_ASSET):     # cwd-relative clone
+    for cand in (root / "sam3" / "sam3" / BPE_ASSET,
+                 root / "sam3" / BPE_ASSET,
+                 Path("sam3") / "sam3" / BPE_ASSET):
         if cand.is_file():
             print(f"[sam3] bpe vocab {cand}")
             return str(cand)
 
-    # Let the upstream fallback try. It works when 'sam3' is a regular package.
     print("[sam3] bpe vocab not found on disk; falling back to "
           "pkg_resources (fails if 'sam3' resolves as a namespace package — "
           "pass --sam3_bpe <path to bpe_simple_vocab_16e6.txt.gz>)")
@@ -159,26 +76,7 @@ def find_bpe(explicit: str | None) -> str | None:
 
 def load_sam3(ckpt: str | None, version: str, resolution: int, conf: float,
               hw, bpe: str | None = None):
-    """
-    Build the image model + processor. Imported late so --help works in an env
-    without SAM 3 installed.
-
-    CHECKPOINT: build_sam3_image_model() defaults to load_from_HF=True with
-    checkpoint_path=None, which calls hf_hub_download twice. A SLURM COMPUTE
-    NODE USUALLY HAS NO OUTBOUND INTERNET, so that is a connection error unless
-    the files are already in the HF cache. Pass --sam3_ckpt with a path
-    downloaded on the login node, or pre-warm the cache there and export
-    HF_HUB_OFFLINE=1.
-
-    RESOLUTION is the one number that decides what SAM 3 actually sees.
-    Sam3Processor resizes the frame to `resolution` (default 1008) internally,
-    and _forward_grounding interpolates the masks back to the ORIGINAL size
-    before returning them — so the returned mask shape always matches the input
-    and cannot reveal the rescaling. It is reported here instead, because a
-    1024x2048 frame at resolution 1008 means the patch reaches the model
-    smaller than it was trained, and that is a protocol deviation rather than
-    a detail.
-    """
+    """Build the image model + processor."""
     from sam3.model_builder import build_sam3_image_model, download_ckpt_from_hf
     from sam3.model.sam3_image_processor import Sam3Processor
 
@@ -194,9 +92,6 @@ def load_sam3(ckpt: str | None, version: str, resolution: int, conf: float,
     proc = Sam3Processor(model, resolution=resolution, device=device,
                          confidence_threshold=conf)
 
-    # The frame is squeezed into `resolution` on the way in. Say by how much,
-    # per axis: the squeeze is ANISOTROPIC on a 1:2 Cityscapes frame, so a
-    # square patch does not stay square inside the model.
     sy, sx = resolution / hw[0], resolution / hw[1]
     print(f"[sam3] internal resolution {resolution} vs frame {hw[0]}x{hw[1]} "
           f"-> scale y={sy:.3g} x={sx:.3g}"
@@ -208,19 +103,14 @@ def load_sam3(ckpt: str | None, version: str, resolution: int, conf: float,
 
 
 def _as_prob(masks: torch.Tensor, hw) -> torch.Tensor:
-    """[N,H,W] in [0,1] at the image resolution.
-
-    SAM 3 may hand back booleans, probabilities or raw logits, at its own
-    working resolution. Normalising that here rather than at the call site
-    keeps one place to fix when the API shifts under us.
-    """
-    if masks.ndim == 4:                       # [N,1,h,w]
+    """[N,H,W] in [0,1] at the image resolution."""
+    if masks.ndim == 4:
         masks = masks.squeeze(1)
     m = masks.float()
     if m.dtype == torch.bool or ((m.min() >= 0.0) and (m.max() <= 1.0)):
-        pass                                  # already bool-as-float or prob
+        pass
     else:
-        m = torch.sigmoid(m)                  # logits
+        m = torch.sigmoid(m)
     if m.shape[-2:] != tuple(hw):
         m = F.interpolate(m.unsqueeze(1), size=tuple(hw), mode="bilinear",
                           align_corners=False).squeeze(1)
@@ -229,32 +119,7 @@ def _as_prob(masks: torch.Tensor, hw) -> torch.Tensor:
 
 @torch.no_grad()
 def prompt_all(processor, pil: Image.Image, hw, prompts=PROMPTS):
-    """
-    One image, 19 prompts -> per-class score map [K_GT,H,W] + presence flags.
-
-    set_image ONCE and prompt the same state repeatedly: the image embedding is
-    the expensive half and re-encoding per prompt would be 19x the cost. If a
-    future SAM 3 release makes prompting stateful (one prompt leaking into the
-    next) this is the line to revisit — check it by prompting one image twice in
-    opposite orders and diffing the score maps.
-
-    BF16 AUTOCAST IS MANDATORY, not an optimisation. SAM 3's weights load as
-    fp32 but parts of the ViT trunk run in bf16, so without autocast the
-    forward dies partway through an MLP block with
-
-        RuntimeError: mat1 and mat2 must have the same dtype,
-                      but got BFloat16 and Float
-
-    Autocast casts input AND weight together, which is what makes the mixed
-    state consistent. Every notebook under sam3/examples/ opens with
-    `torch.autocast("cuda", dtype=torch.bfloat16).__enter__()`; the README's
-    image snippet omits it, and that omission is this traceback.
-
-    BOTH calls must be inside it. set_image stores bf16 activations in `state`
-    and set_text_prompt consumes them, so autocasting only the first would move
-    the same error into the decoder.
-    """
-    # enabled=False on CPU, so the fp32 path still works for local testing.
+    """One image, 19 prompts -> per-class score map [K_GT,H,W] + presence flags."""
     with torch.autocast("cuda", dtype=torch.bfloat16,
                         enabled=torch.cuda.is_available()):
         return _prompt_all_inner(processor, pil, hw, prompts)
@@ -271,10 +136,8 @@ def _prompt_all_inner(processor, pil, hw, prompts):
         if masks is None or len(masks) == 0:
             present[c], n_inst[c] = False, 0
             continue
-        m = _as_prob(torch.as_tensor(masks), hw)                   # [N,H,W]
-        s = torch.as_tensor(scores).float().view(-1, 1, 1)        # [N,1,1]
-        # max over instances: a pixel's evidence for class c is the best
-        # instance claiming it, weighted by that instance's confidence.
+        m = _as_prob(torch.as_tensor(masks), hw)
+        s = torch.as_tensor(scores).float().view(-1, 1, 1)
         score[c] = (m * s).amax(0)
         present[c], n_inst[c] = True, int(len(m))
 
@@ -282,44 +145,22 @@ def _prompt_all_inner(processor, pil, hw, prompts):
 
 
 def merge_prompts(score: torch.Tensor, thresh: float):
-    """
-    THE MERGE RULE. Per-pixel argmax over prompt scores; pixels whose best
-    score is below `thresh` go to UNASSIGNED rather than being forced into the
-    least-bad class.
-
-    Forcing them would hide exactly the failure mode worth measuring — a patch
-    that suppresses every prompt in a region produces no winner, and that is
-    a different event from a patch that swaps the winner. UNASSIGNED keeps the
-    two distinguishable in the confusion matrix.
-    """
+    """THE MERGE RULE."""
     best, idx = score.max(0)
     return torch.where(best >= thresh, idx,
                        torch.full_like(idx, UNASSIGNED))
 
 
-# ── patch application ────────────────────────────────────────────────────────
-
 def build_patched(patch, img, mean_t, std_t, H, W, from_image: bool,
                   floor: str = "none"):
-    """
-    (patched_normalised [1,3,H,W], footprint [1,H,W]).
-
-    ORDER IS LOAD-BEARING and matches optimise.prepare() and evaluate.py:
-    resolve_placement THEN set_reference_from_image. The reference is the image
-    region at the RESOLVED placement, so reversing these copies the wrong
-    window and a csf patch becomes a residual on top of the wrong base.
-    """
-    patch.resolve_placement(H, W)            # clean_pred=None; guarded by caller
+    """(patched_normalised [1,3,H,W], footprint [1,H,W])."""
+    patch.resolve_placement(H, W)
     if from_image:
         patch.set_reference_from_image(img, mean_t, std_t)
     patched, fp = patch.apply(img)
 
     if floor != "none":
-        # THE CONTROL. Identical footprint, no optimised content. Built from the
-        # patch's own footprint so a cutout shape is honoured rather than
-        # replaced by a square — the floor has to match the patch in area AND
-        # silhouette or it is not a floor for this patch.
-        m = fp[0].unsqueeze(0).unsqueeze(0).float()               # [1,1,H,W]
+        m = fp[0].unsqueeze(0).unsqueeze(0).float()
         if floor == "grey":
             fill01 = torch.full_like(img, 0.5)
         elif floor == "random":
@@ -332,37 +173,11 @@ def build_patched(patch, img, mean_t, std_t, H, W, from_image: bool,
 
 
 def to_pil(normalised: torch.Tensor, mean_t, std_t) -> Image.Image:
-    """Normalised [1,3,H,W] -> 8-bit PIL.
-
-    denormalise() drops the batch dim, clamps to [0,1] and moves to CPU, so it
-    returns [3,H,W] and needs no indexing here. Its clamp is where a residual
-    that ran off the representable range gets truncated: _apply_residual already
-    clamps in [0,1] for universal_csf, so for that mode it is a no-op, and for
-    the others it is the only clamp there is.
-
-    The round-to-uint8 is a REAL quantisation of the patch — 1/255 is coarse
-    next to a CSF budget at low tau — and it is unavoidable, because SAM 3 is
-    being handed an image file. The mmseg eval does not quantise, so a tiny
-    clean-vs-patched difference here is expected and is a property of the
-    handover, not of the model. Quantify it once with --save_png if a low-tau
-    row looks suspiciously flat.
-    """
+    """Normalised [1,3,H,W] -> 8-bit PIL."""
     x = denormalise(normalised, mean_t, std_t)
     arr = (x * 255.0).round().to(torch.uint8).permute(1, 2, 0).numpy()
     return Image.fromarray(arr)
 
-
-# ── visualisation ────────────────────────────────────────────────────────────
-# SAME FIGURES AS THE TRAINING SCRIPT, not a parallel implementation.
-# overfit.py writes report.run(..., out_dir / "diagnostics", ...) and
-# evaluate.py writes report.save_panels(...); this calls the same helpers into
-# the same directory name, so a SAM 3 panel and a SegFormer panel can sit side
-# by side in the thesis without the reader re-learning the legend, the
-# change-map greys or the panel lettering.
-#
-# NEEDS MATPLOTLIB, which is not a SAM 3 dependency. The import is deferred and
-# its failure names the fix rather than throwing from six frames inside
-# report.py.
 
 _NO_MPL = """
 The diagnostics panels need matplotlib, which is not a SAM 3 dependency and so
@@ -375,32 +190,13 @@ Underlying error: {err}
 
 
 def _onehot(lbl: torch.Tensor, K: int = K_METRIC) -> torch.Tensor:
-    """[H,W] labels -> [1,K,H,W] one-hot, standing in for logits.
-
-    report.save_panels() consumes its two logit arguments ONLY through
-    upsample_to(...).argmax(1), so a one-hot round-trips to exactly the label
-    map it came from. That is what lets SAM 3 — which emits masks and scores,
-    never a logit volume — produce the identical figure set.
-
-    K is K_METRIC (20), not 19: UNASSIGNED has to survive the round trip, or
-    the change map would silently read "no prompt claimed this" as class 0.
-    """
+    """[H,W] labels -> [1,K,H,W] one-hot, standing in for logits."""
     return F.one_hot(lbl.long(), K).permute(2, 0, 1).unsqueeze(0).float()
 
 
 def save_diagnostics(out_dir, img, label, patched, pc, pa, fp, patch,
                      mean_t, std_t):
-    """The training script's panel set, for one image, under diagnostics/.
-
-    Writes a_clean, b_clean_prediction, c_patched, d_adv_prediction,
-    e_change_map, f_ground_truth, patch, panel.png and per_class_iou.png — the
-    same names overfit.py and evaluate.py produce.
-
-    UNASSIGNED (19) renders BLACK in the overlays: label_to_colour() blacks out
-    everything >= 19 and _legend_handles() filters it from the key. That is the
-    one place these panels differ in meaning from a SegFormer panel — black
-    here is "no prompt claimed this pixel", not void. Say so in the caption.
-    """
+    """The training script's panel set, for one image, under diagnostics/."""
     try:
         from patchreach.diagnostics import report
     except ImportError as e:                               # pragma: no cover
@@ -408,19 +204,12 @@ def save_diagnostics(out_dir, img, label, patched, pc, pa, fp, patch,
 
     out_dir.mkdir(parents=True, exist_ok=True)
     lc, la = _onehot(pc), _onehot(pa)
-    # DETACH. Patch.apply() builds a differentiable chain from the patch
-    # parameter, so `patched` arrives carrying a graph and report.save_panels()
-    # calls .numpy() on it. to_pil() survives the same tensor only by accident:
-    # its .to(torch.uint8) drops the graph, because integer tensors cannot
-    # require grad. Nothing downstream of here needs gradients.
     report.save_panels(img.detach(), label, patched.detach(), lc, la,
                        fp.unsqueeze(0), patch, mean_t, std_t, out_dir)
     return report.per_class_iou_figure(
         lc, la, label, K_METRIC, out_dir / "per_class_iou.png", None,
         title="SAM 3, per-class IoU")
 
-
-# ── main ─────────────────────────────────────────────────────────────────────
 
 def main():
     p = argparse.ArgumentParser(description=__doc__,
@@ -492,7 +281,6 @@ def main():
         raise SystemExit(f"prompts must cover trainIds 0..{K_GT - 1}, "
                          f"got {sorted(prompts)}")
 
-    # ── patch, with the two refusals evaluate.py makes ───────────────────────
     ck = torch.load(a.checkpoint, map_location="cpu")
     pcfg = ck["config"]
     mode = pcfg.get("mode")
@@ -514,9 +302,6 @@ def main():
 
     patch = Patch.load(a.checkpoint, device, mean_t, std_t)
 
-    # resolve() SILENTLY CENTRES for placement='semantic' when clean_pred is
-    # None (placement.py:186). There is no segmentation model in this env to
-    # supply one, so refuse rather than report a semantic run that was centred.
     policy = pcfg.get("placement", "center")
     if a.placement:
         top, left = (int(v) for v in a.placement.replace(",", " ").split())
@@ -537,13 +322,6 @@ def main():
     print(f"\n[patch] {a.checkpoint}")
     patch.describe(H, W)
 
-    # RESAMPLING WARNING. The parameter grid is cfg.size; the pasted footprint
-    # is side(H,W). When they differ, apply() interpolates — and resampling a
-    # spectrally-budgeted residual RESAMPLES ITS SPECTRUM, so tau stops
-    # describing the tensor SAM 3 is shown. universal_csf refuses outright
-    # (_apply_residual). csf does not refuse, which is exactly why this warns:
-    # at native 1024x2048 a patch trained at 512x1024 is silently 2x upsampled
-    # and every visibility claim attached to it is void.
     side = patch.side(H, W)
     if mode in ("csf", "universal_csf") and side != pcfg.get("size"):
         print(f"\n  !! parameter grid {pcfg.get('size')} != pasted footprint "
@@ -580,7 +358,7 @@ def main():
     for i in idxs:
         img, label = ds[i]
         img = img.unsqueeze(0).to(device)
-        label = label.unsqueeze(0)                                # [1,H,W] cpu
+        label = label.unsqueeze(0)
         hw = tuple(label.shape[-2:])
 
         patched, fp = build_patched(patch, img, mean_t, std_t, H, W,
@@ -600,8 +378,6 @@ def main():
 
         fp_cpu = fp.cpu()
 
-        # The panel goes here rather than beside the raw PNG dump above,
-        # because it needs pc/pa, which do not exist until after prompt_all.
         if a.save_png:
             save_diagnostics(out_dir / "diagnostics" / f"img{i:04d}",
                              img, label, patched, pc[0], pa[0], fp_cpu[0],
@@ -612,17 +388,11 @@ def main():
         m["adv_all"].update(pa, label)
         m["adv_rem"].update(pa, label, exclude=fp_cpu)
 
-        # Per-image remote mIoU, on its own confusion matrix so it is not
-        # contaminated by the dataset pool.
         one = {k: SegMetric(K_METRIC) for k in ("c", "a")}
         one["c"].update(pc, label, exclude=fp_cpu)
         one["a"].update(pa, label, exclude=fp_cpu)
         cr, ar = one["c"].compute(), one["a"].compute()
 
-        # THE GRADED READOUT. mIoU is an argmax and can sit still while the
-        # scores underneath it move; these cannot. 'remote' is outside the
-        # footprint, which is the only place transfer is a claim about reach
-        # rather than about occlusion.
         rem = ~fp_cpu[0]
         for c in range(K_GT):
             score_rows.append({
@@ -630,9 +400,6 @@ def main():
                 "clean_score_remote": float(sc_c[c][rem].mean()),
                 "adv_score_remote": float(sc_a[c][rem].mean()),
                 "clean_n_inst": nin_c[c], "adv_n_inst": nin_a[c],
-                # presence SUPPRESSION: the prompt fired on the clean frame and
-                # returned nothing on the patched one. A different event from a
-                # score that merely slid, and invisible in mIoU.
                 "presence_lost": bool(pres_c[c] and not pres_a[c]),
                 "presence_gained": bool(pres_a[c] and not pres_c[c]),
             })
@@ -647,7 +414,6 @@ def main():
               f"drop {cr - ar:+6.2f} ({row['rel_drop_remote']:+5.1f}%)  "
               f"presence_lost {lost}/{K_GT}")
 
-    # ── headroom audit, printed BEFORE the aggregate ─────────────────────────
     ciou, aiou = m["clean_rem"].per_class(), m["adv_rem"].per_class()
     print(f"\n{'=' * 72}")
     print("  HEADROOM AUDIT — read this before quoting any drop.")
@@ -669,8 +435,6 @@ def main():
     drops = torch.tensor([r["drop_remote"] for r in per_image])
     n_lost = sum(r["presence_lost"] for r in per_image)
 
-    # Restricted mIoU: only the classes that had somewhere to fall. This is the
-    # number the transfer claim is allowed to rest on.
     keep = [c for c in range(K_GT)
             if not torch.isnan(ciou[c]) and ciou[c].item() >= 10.0]
     c_keep = float(ciou[keep].nanmean()) if keep else float("nan")
@@ -681,8 +445,6 @@ def main():
           f"adv {agg['adv_rem']:6.2f}   drop {agg['rem_drop']:+.2f}")
     print(f"  WITH HEADROOM ONLY ({len(keep)}/{K_GT} classes)  "
           f"{c_keep:6.2f} -> {a_keep:6.2f}   drop {c_keep - a_keep:+.2f}")
-    # torch.std is unbiased, so n=1 gives nan. Print the count instead of a nan
-    # that reads like a failed computation rather than "no spread is defined".
     spread = (f"+/- {drops.std():.2f}" if len(per_image) > 1
               else "(n=1, no spread)")
     print(f"  per-image drop  mean {drops.mean():+.2f} {spread}")

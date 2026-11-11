@@ -1,28 +1,4 @@
-r"""
-Visualisation for the image-conditioned generator.
-
-The question a number cannot answer: does the generator learn CONTEXTUAL
-REALISM, or does it just paint a conspicuous adversarial texture over the
-reference? Only the side-by-side shows that, and it has to be looked at
-regularly rather than once at the end — a run whose drop_remote climbs while
-the patch degenerates into noise is a result about the attack loss, not about
-the hypothesis.
-
-Panels per image:
-    a_clean            original x_i
-    b_reference        r_i = Resize(CenterCrop(x_i))
-    c_sensitivity      M_i, with the chosen placement window drawn on it
-    d_patch            p_i = G_theta(...)
-    e_patched          x_i^adv
-    f_clean_prediction argmax f(x_i)
-    g_adv_prediction   argmax f(x_i^adv)
-    panel.png          all of the above in one strip
-
-Existing figure machinery is reused wherever it applies (label_to_colour,
-blend, denormalise). save_panels() in report.py is NOT reused directly: it
-takes a `patch` object and calls patch.render(), which assumes one patch for
-the batch — the assumption this attack family exists to break.
-"""
+"""Visualisation for the image-conditioned generator."""
 from __future__ import annotations
 
 from pathlib import Path
@@ -42,13 +18,7 @@ def _plt():
 
 def heatmap_overlay(img01: torch.Tensor, cam: torch.Tensor,
                     alpha: float = 0.5) -> torch.Tensor:
-    """
-    [3,H,W] photo blended with M_i under `inferno`.
-
-    Uses the same blend() the segmentation overlays use, so the sensitivity
-    panel is visually comparable with the prediction panels rather than being
-    on its own arbitrary scale.
-    """
+    """[3,H,W] photo blended with M_i under `inferno`."""
     from matplotlib import cm as mcm
     m = cam.detach().float().clamp(0, 1).cpu().numpy()
     rgb = torch.from_numpy(mcm.inferno(m)[..., :3]).permute(2, 0, 1).float()
@@ -60,11 +30,7 @@ def save_conditional_panels(img, label, patched, patch01, reference01, cam,
                             mean_t, std_t, out_dir: Path,
                             target_class: Optional[int] = None,
                             title: str = ""):
-    """
-    One image's full story. Every tensor is a SINGLE-image slice:
-        img/patched [1,3,H,W] normalised   patch01/reference01 [3,S,S] in [0,1]
-        cam [H,W] in [0,1]                 label [1,H,W]
-    """
+    """One image's full story."""
     plt = _plt()
     import matplotlib.patches as mpatches
     from torchvision.utils import save_image
@@ -90,7 +56,6 @@ def save_conditional_panels(img, label, patched, patch01, reference01, cam,
     save_image(clean_ov, out_dir / "f_clean_prediction.png")
     save_image(adv_ov, out_dir / "g_adv_prediction.png")
 
-    # ── combined strip ───────────────────────────────────────────────────────
     top, left = placement
     fig = plt.figure(figsize=(26, 9))
     gs = fig.add_gridspec(2, 4, hspace=0.12, wspace=0.05)
@@ -103,9 +68,6 @@ def save_conditional_panels(img, label, patched, patch01, reference01, cam,
         ax.set_title(ttl, fontsize=10)
         ax.axis("off")
         if i in (1, 2):
-            # Draw the footprint so placement is auditable by eye. A gradcam
-            # placement that always lands in the same corner is a bug, and it
-            # is invisible in the numbers.
             ax.add_patch(mpatches.Rectangle((left, top), p, p, fill=False,
                                             edgecolor="cyan", lw=1.8))
 
@@ -137,13 +99,7 @@ def save_conditional_panels(img, label, patched, patch01, reference01, cam,
 
 
 def lpips_histogram(values: Sequence[float], out_path, title="LPIPS(r_i, p_i)"):
-    """
-    The DISTRIBUTION, not just the mean.
-
-    A mean hides the case this experiment most needs to detect: most patches
-    barely moving while a minority blow up into high-distortion textures. Those
-    are different phenomena and they average to the same number.
-    """
+    """The DISTRIBUTION, not just the mean."""
     if not values:
         return None
     import numpy as np

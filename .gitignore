@@ -20,3 +20,10 @@ slurm-*.out
 *.csv
 *.md
 shekhar/
+# ...but the environment specification IS part of the submission. These are
+# negations of the blanket *.txt / *.md rules above and must stay below them.
+!requirements.txt
+!envs/README.md
+!envs/requirements-main.txt
+!envs/requirements-perceptual.txt
+!envs/requirements-sam3.txt

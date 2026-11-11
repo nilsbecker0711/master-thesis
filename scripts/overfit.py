@@ -1,33 +1,5 @@
 #!/usr/bin/env python
-r"""
-Single-image overfit — the sanity check before any multi-hour run.
-
-    python scripts/overfit.py --arch segformer_b0 --cityscapes_root $CS \
-        --patch_mode raw --loss_fn cospgd --image 2 --steps 300
-
-If mIoU on ONE image drops sharply, the pipeline is correct — scale up. If it
-does not, there is a bug, and finding it here costs two minutes instead of five
-hours. This isolates "is the attack possible at all?" from "does it generalise?".
-
-ONE IMAGE IS AN ANECDOTE. For a result rather than a check, run the same attack
-over a population and report the distribution:
-
-    python scripts/overfit_population.py --images random --n_images 100 ...
-
-Both scripts call patchreach.patch.optimise.attack_image(), so the procedure is
-identical by construction and a change to one cannot silently fail to reach the
-other.
-
-ONE RUN IS ALSO AN ANECDOTE — see --seeds. At a flat lr the same invocation was
-measured swinging 9.6 mIoU points across four runs with no code change between
-them, so a number from a single run is one sample from a distribution rather
-than a measurement.
-
-NOTE ON COMPARABILITY: a single-image overfit is a much EASIER problem than a
-universal patch trained across the dataset. Yuan et al.'s numbers come from
-per-image patches at 400 iterations; ours are universal. Do not compare a
-result from this script against a published universal-patch number.
-"""
+"""Single-image overfit — the sanity check before any multi-hour run."""
 from __future__ import annotations
 
 import argparse
@@ -50,52 +22,22 @@ from patchreach.utils import (get_device, seed_everything, increment_path,
                              tee_output)
 
 
-# The keys a repeat run aggregates. Deliberately a FIXED list rather than
-# "every numeric key in the record": averaging a placement coordinate or a
-# class count produces a number that looks like a result and means nothing.
-# Keys absent from a record — target_hit_rate outside a targeted run, the csf
-# visibilities outside csf mode — are skipped rather than defaulted to zero.
 AGGREGATE_KEYS = ("drop_remote", "drop_all", "best_drop_remote",
                   "final_remote", "final_all",
                   "any_flip_rate", "target_hit_rate",
                   "final_visibility", "final_visibility_local",
                   "final_resid_rms", "final_frac_at_clip",
-                  # csf reports these instead of frac_at_clip -- it never
-                  # touches the sigmoid. Without them a repeated run could not
-                  # report whether its spectral allocation had frozen, which is
-                  # the one number that distinguishes a converged run from a
-                  # stalled one.
                   "final_frac_at_bound", "final_spend_mean",
                   "wall_clock_s")
 
 
 def run_one(a, seed: int, model, img, label, device, mean_t, std_t, G,
             out_dir: Path, run_diagnostics: bool) -> dict:
-    """
-    ONE complete attack, from a fresh patch, into its own directory.
-
-    Seeding happens HERE rather than once in main(), because the seed's whole
-    job is to set the patch initialisation and a repeat run needs a different
-    one per repeat.
-
-    Note what the seed does NOT buy: reproducibility. Two seed-42 runs of one
-    identical config were measured differing from step 1 onward, because the
-    bilinear upsample in the loss path has a backward that accumulates with
-    atomics and has no deterministic CUDA kernel. The seed controls the
-    initialisation; the arithmetic varies on its own, and --seeds samples both
-    sources of spread together rather than pretending to control either.
-    """
+    """ONE complete attack, from a fresh patch, into its own directory."""
     seed_everything(seed)
     t0 = time.time()
     patch = build_patch(a, device, mean_t, std_t, generator=G)
 
-    # ORDERING: clean forward -> resolve_placement -> first apply().
-    # Semantic placement reads the CLEAN PREDICTION, so it cannot be resolved
-    # before the model has seen an image. Backwards, it silently uses centre.
-    # --placement gradcam needs the sensitivity map. Built here rather than
-    # inside prepare() so the hook is registered once and closed once; the CAM
-    # holds a forward hook on the backbone and leaking one per repeat would
-    # accumulate hooks across a --seeds run.
     cam = None
     if a.placement == "gradcam":
         cam = segmentation_cam.build(
@@ -118,11 +60,6 @@ def run_one(a, seed: int, model, img, label, device, mean_t, std_t, G,
         clean_logits=clean_logits, out_dir=out_dir,
         save_step_images=True, save_best=True, verbose=True)
 
-    # ── calibration for stage 2 ──────────────────────────────────────────────
-    # L_rat at step 1 is ~0 by construction: a stage-1 run starts AT the
-    # reference, so ||q - c|| = 0 and any weight derived from it is a division
-    # by zero. The meaningful scale is the DRIFT the attack produced — measured
-    # here, at the end. Set alpha from this row, not from the step-1 one.
     if patch.cfg.mode == "lap" and patch.reference is not None:
         print("\n[lap] END-OF-RUN magnitudes — set stage-2 alpha from THIS "
               "rat row,\n      not from the step-1 report (where L_rat is 0 "
@@ -148,10 +85,6 @@ def run_one(a, seed: int, model, img, label, device, mean_t, std_t, G,
         patched, fp = patch.apply(img)
         adv_logits = upsample_to(model(patched), label.shape[-2:])
 
-    # COST IS PART OF THE RESULT for a per-image attack: the whole trade
-    # against a universal patch is strength bought with per-image compute,
-    # and analysis/build_index.py has carried a wall_clock_s column since it
-    # was written -- empty on every overfit run until now.
     res["wall_clock_s"] = time.time() - t0
     out = {"config": vars(a), "seed": seed, **res}
     if patch.cfg.mode == "lap":
@@ -161,14 +94,6 @@ def run_one(a, seed: int, model, img, label, device, mean_t, std_t, G,
     with open(out_dir / "results.json", "w") as f:
         json.dump(out, f, indent=2)
 
-    # FIGURES SHOW best.pt, NOT THE FINAL STATE. results.json and final.pt above
-    # stay the final patch; everything below is the qualitative picture, and a
-    # run that degraded after its peak would otherwise illustrate the patch it
-    # lost rather than the one it reported as best_drop_remote. Same choice as
-    # overfit_population.py. The parameter is swapped IN PLACE rather than via
-    # Patch.load(), because load() does not restore the reference (--from_image,
-    # lap) and render() would silently fall back to grey. Placement is fixed
-    # for the whole run, so the param is the only thing that differs.
     best_ck = out_dir / "best.pt"
     if best_ck.exists():
         with torch.no_grad():
@@ -185,10 +110,6 @@ def run_one(a, seed: int, model, img, label, device, mean_t, std_t, G,
         a.target_class if a.loss_fn == "ipatch_cospgd" else None,
         title=f"val image {a.image}")
 
-    # The suite runs ONCE per invocation, not once per repeat. It is the
-    # expensive part of the script and it characterises the attack
-    # qualitatively; N copies of the same figure set is cost without
-    # information.
     if run_diagnostics and not a.no_diagnostics:
         report.run(model, img, label, patch, out_dir / "diagnostics",
                    a.loss_fn, a.num_classes,
@@ -198,20 +119,7 @@ def run_one(a, seed: int, model, img, label, device, mean_t, std_t, G,
 
 
 def summarise(rows, out_dir: Path) -> dict:
-    """
-    Mean and SAMPLE standard deviation across repeats, plus the raw rows.
-
-    Sample sd (n-1), not population sd: these repeats are a sample from the
-    attack's outcome distribution, not the whole of it. With n = 1 the sd is
-    undefined and is reported as null rather than as 0.0, because a zero there
-    reads as "perfectly reproducible" — the exact opposite of what one run
-    establishes.
-
-    min and max are carried so the SHAPE stays visible. The spread that
-    motivated this was bimodal — any_flip_rate at 97-98% and at 68-69% with
-    nothing in between — and a mean with an sd describes that badly. If max
-    minus min is several times the sd, look at per_seed before quoting either.
-    """
+    """Mean and SAMPLE standard deviation across repeats, plus the raw rows."""
     stats = {}
     for k in AGGREGATE_KEYS:
         vals = [r[k] for r in rows if r.get(k) is not None]
@@ -282,15 +190,6 @@ def main():
     if a.seeds < 1:
         p.error("--seeds must be at least 1")
 
-    # RESOLVED BEFORE THE MODEL IS BUILT, so run.log below captures the whole
-    # invocation -- the checkpoint that was loaded, the classes present in the
-    # image, the CSF budget table -- rather than only the part after the first
-    # attack step. The directory name depends on the ARGUMENTS alone, so
-    # nothing here needs the model or the dataset.
-    # The optimiser and parameterisation enter the directory name ONLY
-    # when they are non-default, so every path produced before this
-    # flag existed is still the path it was and results/overfit does
-    # not fork into two naming conventions.
     arm = "_".join(x for x in
                    ["" if a.optimiser == "adam" else a.optimiser,
                     "" if a.pixel_param == "sigmoid" else a.pixel_param]
@@ -298,18 +197,6 @@ def main():
     tag = "_".join(x for x in [a.arch, a.patch_mode, a.loss_fn,
                                f"img{a.image}", arm, tsallis_tag(a),
                                a.tag] if x)
-    # ABSOLUTE, and this is not tidiness. The path was relative, and it is
-    # written to from three places separated by a model build: mkdir here,
-    # run.log in tee_output, config.json and results.json inside _run. Anything
-    # that changes the process working directory in between -- and mmcv's
-    # config machinery is entitled to -- silently redirects the later writes,
-    # which surfaces as FileNotFoundError on a directory this function has
-    # already created. Observed on the cluster: run.log opened, then
-    # config.json failed with ENOENT in the same directory.
-    #
-    # It also fixes the child/parent split in sweep_operating_point.py, which
-    # launches this script with cwd=REPO while resolving --out_root against its
-    # own working directory. Absolute paths make the two agree by construction.
     out_dir = Path(increment_path(Path(a.out_root) / tag)).resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -319,14 +206,7 @@ def main():
 
 
 def _run(a, out_dir: Path):
-    """
-    The invocation proper, with stdout and stderr already mirrored into
-    out_dir/run.log.
-
-    Split out of main() rather than indented inside a `with` block there, so
-    the tee covers model setup and data loading as well and the body stays at
-    one indentation level.
-    """
+    """The invocation proper, with stdout and stderr already mirrored into out_dir/run.log."""
     seed_everything(a.seed)
     device = get_device()
     model, n_ch, n_act, spec = setup_model(a)
@@ -351,19 +231,11 @@ def _run(a, out_dir: Path):
         for q in G.parameters():
             q.requires_grad_(False)
 
-    # The full argument namespace, written ONCE per invocation instead of only
-    # inside each repeat's results.json. analysis/build_index.py prefers this
-    # file when it exists, and a --seeds run otherwise had to be read through
-    # seed*/results.json to recover the config it was launched under.
     with open(out_dir / "config.json", "w") as f:
         json.dump({**vars(a), "bracket": spec.bracket,
                    "backbone_channels": n_ch,
                    "backbone_active_channels": n_act}, f, indent=2)
 
-    # --seeds 1 keeps the ORIGINAL layout — results.json directly in out_dir,
-    # no nesting, no summary — so everything that already reads these runs
-    # (analysis/pick_lr.py globs for them) keeps working unchanged. Only a
-    # repeat run nests, because only a repeat run has something to nest.
     rows = []
     for i in range(a.seeds):
         seed = a.seed + i

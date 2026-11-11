@@ -1,8 +1,4 @@
-"""
-Is the regulariser-driven oscillation PATCH-SIZE dependent, as the 2026-10-23
-log entry claims via D3? dR/d(delta_j) = sens_j * sign(delta_j - base_j) has no
-dependence on the number of terms in the sum, so it should NOT be.
-"""
+"""Is the regulariser-driven oscillation PATCH-SIZE dependent, as the 2026-10-23 log entry claims via D3? dR/d(delta_j) = sens_j * sign(delta_j - base_j) has no dependence on the number of terms in the sum, so it should NOT be."""
 import sys
 from pathlib import Path
 

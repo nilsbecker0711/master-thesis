@@ -1,14 +1,4 @@
-r"""
-Diagnostic orchestrator + every figure the thesis needs.
-
-Dispatches on loss_fn: targeted runs get the semantic suite (margin, target
-probability, contestability), untargeted runs get the confusion suite. The
-geometric suite runs for BOTH, because it is the shared control.
-
-Every figure is written as a STANDALONE png with its own title and legend, so
-any single one drops into the thesis without cropping a composite. A combined
-`panel.png` and `overview.png` exist for quick inspection, not for publication.
-"""
+"""Diagnostic orchestrator + every figure the thesis needs."""
 from __future__ import annotations
 
 import json
@@ -52,26 +42,9 @@ def _add_legend(ax, handles, ncol=3, loc="lower left"):
               labelspacing=0.3, columnspacing=0.8)
 
 
-# ═════════════════════════════════════════════════════════════════════════════
-#  Panels
-# ═════════════════════════════════════════════════════════════════════════════
-
 def save_panels(img, label, patched, clean_logits, adv_logits, footprint,
                 patch, mean_t, std_t, out_dir: Path, target_class=None):
-    """
-    a_clean, b_clean_prediction, c_patched, d_adv_prediction, e_change_map,
-    f_ground_truth, patch, panel.png
-
-    PANEL (b) IS THE CLEAN PREDICTION, NOT THE GROUND TRUTH. The attack's effect
-    is (clean pred -> adv pred). Scoring the panel against GT folds the model's
-    own errors into what reads as attack damage — which matters when per-image
-    clean mIoU can sit near 50. GT is still written as (f) for reference.
-
-    The change map colours flipped pixels by DISTANCE from the patch, which
-    makes perspective effects legible: in a dashcam frame the bottom of the
-    image is NEARBY road, so a flood that appears to span the scene is often
-    entirely within a few hundred pixels of the patch.
-    """
+    """a_clean, b_clean_prediction, c_patched, d_adv_prediction, e_change_map, f_ground_truth, patch, panel.png"""
     plt = _plt()
     from matplotlib import cm as mcm
     import matplotlib.patches as mpatches
@@ -93,8 +66,6 @@ def save_panels(img, label, patched, clean_logits, adv_logits, footprint,
     save_image(patched_photo, out_dir / "c_patched.png")
     save_image(patch.render().cpu(), out_dir / "patch.png")
 
-    # Legend covers GT + BOTH predictions, so (b) and (d) share one colour key
-    # and any class the attack introduced is included.
     cls = sorted(set(label[0][label[0] != 255].unique().tolist())
                  | set(pc.cpu().unique().tolist())
                  | set(pa.cpu().unique().tolist()))
@@ -111,22 +82,11 @@ def save_panels(img, label, patched, clean_logits, adv_logits, footprint,
         _add_legend(ax, handles, ncol=4)
         _save(fig, out_dir / f"{name}.png")
 
-    # ── change map, coloured by distance ─────────────────────────────────────
     from ..losses.reach import centroid, distance_map
     H, W = hw
     dist = distance_map(H, W, *centroid(footprint), pc.device)
     remote = (label[0] != 255) & (~footprint[0])
     changed = (pc != pa) & remote
-    # FOUR regions, and every one of them is named. The canvas starts black,
-    # so anything left black is neither remote nor footprint — i.e. GROUND
-    # TRUTH VOID (label 255: ego-vehicle hood, image borders, and every id
-    # remap() sends outside trainIds 0..18). Void is excluded from mIoU, from
-    # the flip rate and from the reach curves.
-    #
-    # The footprint was previously 0.25 grey, close enough to the black void
-    # that the two read as one region and the caption named only the footprint.
-    # 0.45 separates the three greys unambiguously: 0.00 void < 0.45 footprint
-    # < 0.85 unchanged.
     VOID, FOOT, UNCHANGED = 0.0, 0.45, 0.85
     rgb = np.full((H, W, 3), VOID)
     rgb[remote.cpu().numpy()] = [UNCHANGED] * 3
@@ -135,9 +95,6 @@ def save_panels(img, label, patched, clean_logits, adv_logits, footprint,
     ch = changed.cpu().numpy()
     if ch.any():
         nd = np.clip(dist.cpu().numpy()[ch] / max(max_d, 1), 0, 1)
-        # 1 - nd, so pixels NEAR the patch are bright: the attack's epicentre
-        # should glow. The colour bar below must be reversed to match, which is
-        # the whole reason this is spelled out.
         rgb[ch] = mcm.plasma(1.0 - nd)[:, :3]
     flip_pct = 100.0 * changed.sum().item() / max(int(remote.sum()), 1)
 
@@ -147,10 +104,6 @@ def save_panels(img, label, patched, clean_logits, adv_logits, footprint,
     ax.set_title(f"(e) prediction changes — {flip_pct:.1f}% of remote pixels",
                  fontsize=11)
 
-    # plasma_r, NOT plasma. The image paints near = bright via plasma(1 - nd),
-    # so a bar built from plain plasma over Normalize(0, max_d) reads 0 px as
-    # dark purple and max as yellow — the exact reverse of the image. That
-    # mislabelled every change map the repository has produced.
     sm = plt.cm.ScalarMappable(cmap="plasma_r", norm=plt.Normalize(0, max_d))
     sm.set_array([])
     fig.colorbar(sm, ax=ax, fraction=0.025,
@@ -168,7 +121,6 @@ def save_panels(img, label, patched, clean_logits, adv_logits, footprint,
         borderpad=0.5, labelspacing=0.35)
     _save(fig, out_dir / "e_change_map.png")
 
-    # ── combined, shared legend strip underneath ─────────────────────────────
     fig = plt.figure(figsize=(30, 8))
     gs = fig.add_gridspec(2, 5, height_ratios=[6, 1], hspace=0.05, wspace=0.04)
     for i, (t, ttl) in enumerate([
@@ -190,13 +142,9 @@ def save_panels(img, label, patched, clean_logits, adv_logits, footprint,
     return flip_pct
 
 
-# ═════════════════════════════════════════════════════════════════════════════
-#  Figures
-# ═════════════════════════════════════════════════════════════════════════════
-
 def _iou_figure(clean_iou, adv_iou, present, out_path, target_class=None,
                 title=None):
-    """Per-class IoU, clean vs patched. Bars in the class's own palette colour."""
+    """Per-class IoU, clean vs patched."""
     plt = _plt()
     names = [class_name(c) for c in present]
     c_vals = [clean_iou[c].item() for c in present]
@@ -227,17 +175,7 @@ def _iou_figure(clean_iou, adv_iou, present, out_path, target_class=None,
 
 def per_class_iou_figure(clean_logits, adv_logits, label, K, out_path,
                          target_class=None, title=None, log=None):
-    """
-    Per-class IoU chart, clean vs patched, plus the numbers as a dict.
-
-    Public wrapper over _iou_figure that does the metric computation too, so a
-    caller holding only logits does not have to build SegMetrics itself.
-
-    Returns {class_name: {"clean": .., "adv": .., "drop": ..}} — aggregate mIoU
-    hides WHICH classes the attack destroyed, and that per-class breakdown is
-    what reveals structured single-channel collapse (e.g. one class losing ~68
-    IoU while everything else moves by <5).
-    """
+    """Per-class IoU chart, clean vs patched, plus the numbers as a dict."""
     import torch
     hw = label.shape[-2:]
     mc = SegMetric(K, device=label.device)
@@ -341,10 +279,7 @@ def _flip_rate_figure(rates, out_path):
 
 
 def _flows_figure(flows, out_path):
-    """
-    Top source->destination flows. A single dominant bar means the untargeted
-    loss is acting as an implicit class selector rather than a broad disruptor.
-    """
+    """Top source->destination flows."""
     if not flows:
         return
     plt = _plt()
@@ -368,19 +303,7 @@ def _flows_figure(flows, out_path):
 def panels_for_images(model, dataset, indices, patch, out_dir, mean_t, std_t,
                       K: int = 19, target_class=None, img_h=None, img_w=None,
                       log=print):
-    """
-    Labelled panels + a per-class IoU chart for several images.
-
-    Cheap: two forward passes per image and no ERF probe, so it is affordable
-    at the end of every training run. A finished run should leave FIGURES
-    behind, not only JSON — the numbers say how much degraded, the panels say
-    where and into what.
-
-    Placement is re-resolved per image, because semantic placement depends on
-    scene content and a cached offset from another image would be wrong.
-
-    Returns {image_index: {"flip_pct": ..., "per_class_iou": {...}}}.
-    """
+    """Labelled panels + a per-class IoU chart for several images."""
     import torch
     out_dir = Path(out_dir)
     out = {}
@@ -419,20 +342,10 @@ def panels_for_images(model, dataset, indices, patch, out_dir, mean_t, std_t,
     return out
 
 
-# ═════════════════════════════════════════════════════════════════════════════
-#  Orchestrator
-# ═════════════════════════════════════════════════════════════════════════════
-
 def run(model, img, label, patch, out_dir, loss_fn: str, K: int = 19,
         target_class=None, mean_t=None, std_t=None, n_probes: int = 16,
         skip_geometric: bool = False, log=print):
-    """
-    Full diagnostic suite on ONE image. Writes panels, figures and
-    diagnostics.json.
-
-    skip_geometric: the ERF probe costs n_probes forward passes; skip it when
-    looping over many images and you only need it once.
-    """
+    """Full diagnostic suite on ONE image."""
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     hw = label.shape[-2:]
@@ -460,7 +373,6 @@ def run(model, img, label, patch, out_dir, loss_fn: str, K: int = 19,
                                       adv_logits, fp, patch, mean_t, std_t,
                                       out_dir / "panels", target_class)
 
-    # ── per-class IoU, clean vs patched ──────────────────────────────────────
     mc, ma = SegMetric(K, device=img.device), SegMetric(K, device=img.device)
     mc.update(clean_logits.argmax(1), label)
     ma.update(adv_logits.argmax(1), label)
@@ -475,20 +387,15 @@ def run(model, img, label, patch, out_dir, loss_fn: str, K: int = 19,
                                             "adv": float(aiou[c])}
                             for c in present}
 
-    # ── geometric: the shared control ────────────────────────────────────────
     if not skip_geometric:
         _, stats = geometric.receptive_field(model, img, patch, n_probes, log=L)
         geometric.plot_erf(stats, out_dir / "receptive_field.png")
-        # 'rate' stays the CEILING so every earlier diagnostics.json keeps the
-        # same key meaning; 'null_rate' is the tau-matched probe, which is what
-        # the old 'rate' had silently been for csf runs.
         res["receptive_field"] = [{"lo": lo, "hi": hi,
                                    "rate": c, "null_rate": n}
                                   for lo, hi, c, n in stats]
 
     curves = []
 
-    # ── regime-specific ──────────────────────────────────────────────────────
     if loss_fn == "ipatch_cospgd" and target_class is not None:
         d, r = targeted_reach(adv_logits, target_class, fp)
         print_curve(d, r, f"reach — % predicted class {target_class}", L)

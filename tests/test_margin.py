@@ -1,11 +1,4 @@
-"""
-margin loss: the properties the objective exists for.
-
-  1. a pixel flipped by >= kappa contributes zero loss AND zero gradient
-  2. an unflipped pixel's gradient is unit size on exactly two logits
-  3. void (ref == 255) and the support mask are excluded
-  4. build() without the clean prediction fails loudly on use
-"""
+"""margin loss: the properties the objective exists for."""
 import pytest
 import torch
 
@@ -14,12 +7,11 @@ from patchreach.losses.adversarial import (build, cos_margin_loss,
 
 
 def _logits(*cols):
-    # cols: one logit vector per pixel -> (1, C, 1, N)
     return torch.tensor(cols, dtype=torch.float32).T[None, :, None, :]
 
 
 def test_flipped_pixel_has_zero_loss_and_gradient():
-    lg = _logits([1.0, 9.0, 0.0]).requires_grad_()   # ref 0, challenger 1 by 8
+    lg = _logits([1.0, 9.0, 0.0]).requires_grad_()
     ref = torch.tensor([[[0]]])
     loss = margin_loss(lg, ref, kappa=5.0)
     loss.backward()
@@ -28,7 +20,7 @@ def test_flipped_pixel_has_zero_loss_and_gradient():
 
 
 def test_unflipped_pixel_unit_gradient_on_two_logits():
-    lg = _logits([9.0, 2.0, 1.0]).requires_grad_()   # ref 0 leads by 7
+    lg = _logits([9.0, 2.0, 1.0]).requires_grad_()
     ref = torch.tensor([[[0]]])
     loss = margin_loss(lg, ref, kappa=5.0)
     loss.backward()
@@ -38,7 +30,6 @@ def test_unflipped_pixel_unit_gradient_on_two_logits():
 
 
 def test_worked_example_mean_over_pixels():
-    # A road 8 vs 3, B road 4 vs 6, C sky 1 vs 9, D building 9 vs 2
     lg = _logits([8, 3, 0], [4, 6, 0], [9, 1, 0], [0, 9, 2])
     ref = torch.tensor([[[0, 0, 1, 1]]])
     assert margin_loss(lg, ref, kappa=5.0).item() == pytest.approx(
@@ -49,14 +40,13 @@ def test_void_and_support_excluded():
     lg = _logits([9.0, 0.0], [9.0, 0.0], [0.0, 9.0])
     ref = torch.tensor([[[0, 255, 1]]])
     support = torch.tensor([[[True, True, False]]])
-    # pixel 1 is void, pixel 2 is outside support -> only pixel 0 scored
     assert margin_loss(lg, ref, support, kappa=5.0).item() == pytest.approx(14)
 
 
 def test_build_binds_clean_prediction_and_ignores_labels():
     lg = _logits([9.0, 0.0])
     ref = torch.tensor([[[0]]])
-    gt = torch.tensor([[[1]]])                        # deliberately different
+    gt = torch.tensor([[[1]]])
     f = build("margin", margin_ref=ref, margin_kappa=5.0)
     assert f(lg, gt, None, None).item() == pytest.approx(14)
 
@@ -106,15 +96,8 @@ def test_attack_image_runs_margin_end_to_end(loss_fn):
     assert not torch.allclose(patch.param.detach(), start)
 
 
-# ═════════════════════════════════════════════════════════════════════════════
-#  cos_margin — the cosine weight on the same hinge
-# ═════════════════════════════════════════════════════════════════════════════
-
 def test_cos_margin_leaves_confident_holdouts_at_full_weight():
-    """
-    The property plain CosPGD lacks. p_ref ~ 1 -> w ~ 1, so the hinge is
-    essentially unweighted where the collapse leaves its holdouts.
-    """
+    """The property plain CosPGD lacks. p_ref ~ 1 -> w ~ 1, so the hinge is essentially unweighted where the collapse leaves its holdouts."""
     lg = _logits([12.0, 0.0, 0.0])
     ref = torch.tensor([[[0]]])
     plain = margin_loss(lg, ref, kappa=5.0).item()
@@ -124,7 +107,7 @@ def test_cos_margin_leaves_confident_holdouts_at_full_weight():
 
 def test_cos_margin_releases_a_just_flipped_pixel_early():
     """Between the boundary and kappa the cosine is the whole difference."""
-    lg = _logits([0.0, 1.0, 0.0])                  # flipped by 1, kappa 5
+    lg = _logits([0.0, 1.0, 0.0])
     ref = torch.tensor([[[0]]])
     plain = margin_loss(lg, ref, kappa=5.0).item()
     cos = cos_margin_loss(lg, ref, kappa=5.0).item()

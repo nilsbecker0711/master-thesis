@@ -1,19 +1,4 @@
-r"""
-Reach curves — attack effect as a function of distance from the patch.
-
-Two variants, because targeted and untargeted attacks succeed differently:
-
-  targeted   : % of ring pixels predicted as target_class
-  untargeted : % of ring pixels whose argmax changed AT ALL
-
-Both exclude the footprint and derive the centre from the footprint itself, so
-they remain correct under non-central placement.
-
-INTERPRETING THE PLATEAU: its height equals the fraction of non-target pixels
-the SCENE leaves contestable, not the attack's raw power. Road plateauing at
-50% means "every nearly-road pixel became road", not "everything became road" —
-the other half were high-margin obstacles the attack correctly failed to claim.
-"""
+"""Reach curves — attack effect as a function of distance from the patch."""
 from __future__ import annotations
 
 from typing import List, Tuple

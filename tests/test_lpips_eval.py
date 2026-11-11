@@ -1,10 +1,4 @@
-"""
-scripts/lpips_eval.py without the lpips package.
-
-The metric is swapped for a mean-absolute-difference stand-in: what is under
-test is the reconstruction (right crop, right base, residual actually applied)
-and the run discovery, not LPIPS itself.
-"""
+"""scripts/lpips_eval.py without the lpips package."""
 import json
 import sys
 from pathlib import Path
@@ -56,7 +50,7 @@ def _csf_patch(size, tau=4.0, seed=0):
 def test_box_matches_apply_footprint():
     """The crop the metric sees must be the pixels apply() replaced."""
     patch = _csf_patch(32)
-    patch.placement = (5, 90)                   # right edge: gets clamped
+    patch.placement = (5, 90)
     _, fp = patch.apply(_img())
     top, left, p = le.footprint_box(patch.placement, H, W, 0.5)
     mask = torch.zeros(H, W, dtype=torch.bool)
@@ -66,11 +60,7 @@ def test_box_matches_apply_footprint():
 
 @pytest.mark.parametrize("ref", ["height", "area"])
 def test_box_matches_apply_footprint_under_both_scale_rules(ref):
-    """
-    Under --patch_scale_ref area, apply() pastes at int(scale*sqrt(H*W)). A box
-    cut by the height rule would score the wrong region with no error — on this
-    2:1 input that is 32px against a 45px patch.
-    """
+    """Under --patch_scale_ref area, apply() pastes at int(scale*sqrt(H*W))."""
     patch = Patch(PatchConfig(mode="raw", size=16, scale=0.5, scale_ref=ref),
                   DEV, MEAN, STD)
     patch.resolve_placement(H, W)
@@ -81,7 +71,7 @@ def test_box_matches_apply_footprint_under_both_scale_rules(ref):
     mask[top:top + p, left:left + p] = True
     assert torch.equal(fp[0], mask)
     assert p == {"height": 32, "area": 45}[ref]
-    if ref == "area":                       # the bug this guards against
+    if ref == "area":
         _, _, p_old = le.footprint_box(patch.placement, H, W, 0.5)
         assert p_old != p
 
@@ -92,12 +82,9 @@ def test_residual_is_scored_and_outside_is_untouched():
     row, views = le.evaluate_image(patch, img, MEAN, STD, METRICS,
                                     {"from_image": True}, 0.25, True)
     assert row["lpips_alex_crop"] > 0
-    # size == p, so the zero-residual composite is the clean crop exactly
     assert row["lpips_alex_floor_crop"] == pytest.approx(0.0, abs=1e-6)
     assert row["lpips_alex_floor_full"] == pytest.approx(0.0, abs=1e-6)
-    # dilution: the full frame averages the same change over 4x the area
     assert row["lpips_alex_full"] < row["lpips_alex_crop"]
-    # no blur, so the residual-only composite IS the patched frame
     assert row["lpips_alex_resid_full"] == pytest.approx(
         row["lpips_alex_full"], abs=1e-6)
     assert "visibility" in row
@@ -126,13 +113,12 @@ def test_base_only_restores_render():
     patch = _csf_patch(32)
     patch.set_reference_from_image(_img(), MEAN, STD)
     le.composite(patch, _img(), MEAN, STD, True, base_only=True)
-    assert "render" not in vars(patch)          # shadow removed again
+    assert "render" not in vars(patch)
 
 
 def test_discover_layouts(tmp_path):
     ck = _csf_patch(32)
 
-    # overfit.py, --seeds 2
     ov = tmp_path / "ov"
     (ov / "seed42").mkdir(parents=True)
     (ov / "seed43").mkdir()
@@ -144,14 +130,12 @@ def test_discover_layouts(tmp_path):
                                                      (420, "best.pt")]
     assert len(le.discover(ov, "final", [])) == 1
 
-    # overfit_population.py
     pop = tmp_path / "pop"
     for i in (7, 12):
         ck.save(pop / "patches" / f"img{i:04d}" / "best.pt")
     (pop / "config.json").write_text(json.dumps({"images": [7, 12]}))
     assert [j.image for j in le.discover(pop, "auto", [])] == [7, 12]
 
-    # train.py — shared patch over the requested images
     tr = tmp_path / "tr"
     ck.save(tr / "final.pt")
     (tr / "config.json").write_text(json.dumps({"epochs": 20}))
@@ -177,17 +161,11 @@ def test_parse_images():
     assert le.parse_images("4, 9 11", 0) == [4, 9, 11]
 
 
-# 16: resampled base, floor > 0. area: on this 2:1 frame the patch is pasted
-# at 45 px, not 32, and the box must follow -- with and without a checkpoint.
 @pytest.mark.parametrize("size,ref,with_ckpt", [
     (32, "height", True), (16, "height", True),
     (16, "area", True), (16, "area", False)])
 def test_png_source_matches_checkpoint_source(tmp_path, size, ref, with_ckpt):
-    """
-    The PNGs report.py writes and the frames rebuilt from the checkpoint are
-    the same image, so every shared column must agree -- including the blur
-    control, which the PNG path rebuilds from geometry alone.
-    """
+    """The PNGs report.py writes and the frames rebuilt from the checkpoint are the same image, so every shared column must agree -- including the blur control, which the PNG path rebuilds from geometry alone."""
     from torchvision.utils import save_image
     from patchreach.data.cityscapes import denormalise
 
@@ -230,7 +208,7 @@ class _SpatialMAD(torch.nn.Module):
     """Stand-in for lpips.LPIPS(spatial=True): a [B,1,H,W] map."""
     def __init__(self):
         super().__init__()
-        self.dummy = torch.nn.Parameter(torch.zeros(1))    # for .device
+        self.dummy = torch.nn.Parameter(torch.zeros(1))
 
     def forward(self, a, b):
         return (a - b).abs().mean(dim=1, keepdim=True)
@@ -267,10 +245,7 @@ def _snapshot(root: Path):
 
 
 def test_evaluation_never_touches_existing_run_files(tmp_path, monkeypatch):
-    """
-    The whole point: scoring a run must leave every file the attack wrote
-    byte-identical, and write nothing outside <run>/lpips_<tag>/.
-    """
+    """The whole point: scoring a run must leave every file the attack wrote byte-identical, and write nothing outside <run>/lpips_<tag>/."""
     monkeypatch.setattr(le, "build_metrics", lambda names, device,
                         spatial=False: (
                             {"lpips_alex": le.Metric("lpips_alex",
@@ -341,10 +316,7 @@ def _run_with_pngs(tmp_path, png_from: str):
 
 @pytest.mark.parametrize("png_from", ["best", "final"])
 def test_png_provenance_is_detected_not_assumed(tmp_path, png_from):
-    """
-    overfit.py diagnostics showed the FINAL patch before 2aee5ef and show
-    best.pt since. The script must tell which, from the pixels.
-    """
+    """overfit.py diagnostics showed the FINAL patch before 2aee5ef and show best.pt since."""
     run, cfg = _run_with_pngs(tmp_path, png_from)
     job = le.discover_pngs(run, cfg)[0]
     shows = le.png_shows(job, cfg, le.load_png(job.clean, DEV),
@@ -362,11 +334,11 @@ def test_png_provenance_unknown_without_checkpoint(tmp_path):
 
 
 @pytest.mark.parametrize("argv,shows,png", [
-    ([], ["final"], True),                          # auto/auto: PNGs as they are
-    (["--checkpoint", "best"], ["best"], True),     # new runs: PNGs ARE best
-    (["--checkpoint", "best"], ["final"], False),   # old runs: fall back
+    ([], ["final"], True),
+    (["--checkpoint", "best"], ["best"], True),
+    (["--checkpoint", "best"], ["final"], False),
     (["--checkpoint", "final"], ["best"], False),
-    (["--checkpoint", "best"], ["unknown"], True),  # nothing to compare with
+    (["--checkpoint", "best"], ["unknown"], True),
     (["--checkpoint", "best"], ["best=final"], True),
     (["--source", "png", "--checkpoint", "best"], ["final"], True),
     (["--source", "checkpoint"], ["best"], False)])
@@ -392,11 +364,7 @@ def test_main_scores_best_pngs_when_best_is_asked_for(tmp_path, monkeypatch):
 def test_missing_directory_is_not_reported_as_missing_config(tmp_path,
                                                              capsys,
                                                              monkeypatch):
-    """
-    A mistyped arch name (deeplab101 for deeplab_101) must say the path does
-    not exist, name the near miss, and exit non-zero -- not report a config
-    that was never there and return success.
-    """
+    """A mistyped arch name (deeplab101 for deeplab_101) must say the path does not exist, name the near miss, and exit non-zero -- not report a config that was never there and return success."""
     monkeypatch.setattr(le, "build_metrics", lambda names, device,
                         spatial=False: _mad_metrics())
     (tmp_path / "deeplab_101_csf_cospgd_img464_t2").mkdir()
@@ -434,7 +402,6 @@ def test_a_successful_run_returns_zero(tmp_path, monkeypatch):
 def test_metric_selection_and_aliases():
     assert le.parse_args(["r"]).metrics == le.DEFAULT_METRICS
     assert le.parse_args(["r", "--metrics", "all"]).metrics == le.ALL_METRICS
-    # the deprecated --nets still maps onto the lpips package metrics
     assert le.parse_args(["r", "--nets", "alex", "vgg"]).metrics == [
         "lpips_alex", "lpips_vgg"]
     assert le.parse_args(["r", "--metrics", "dists", "cvvdp"]).metrics == [
@@ -442,12 +409,7 @@ def test_metric_selection_and_aliases():
 
 
 def test_unknown_metric_is_named_and_never_silently_scored(capsys):
-    """
-    A typo must say so. It ends the run only because nothing else was asked
-    for here -- with a real metric alongside it, the run continues without it.
-    (The lpips package is not installed in the test env, so this cannot ask
-    for one.)
-    """
+    """A typo must say so."""
     with pytest.raises(SystemExit):
         le.build_metrics(["definitely_not_a_metric"], DEV)
     out = capsys.readouterr().out
@@ -455,11 +417,7 @@ def test_unknown_metric_is_named_and_never_silently_scored(capsys):
 
 
 def test_a_failing_metric_is_skipped_at_that_size_only(capsys):
-    """
-    A metric that OOMs on the full frame must not end the run, and must not
-    lose the sizes it CAN do: niqe fails on a 64px crop and is fine on the
-    frame.
-    """
+    """A metric that OOMs on the full frame must not end the run, and must not lose the sizes it CAN do: niqe fails on a 64px crop and is fine on the frame."""
     def picky(ref, dist):
         if ref.shape[-1] == 8:
             raise RuntimeError("CUDA out of memory")
@@ -469,10 +427,10 @@ def test_a_failing_metric_is_skipped_at_that_size_only(capsys):
     small = le.score_pair(metrics, torch.zeros(1, 3, 8, 8),
                           torch.ones(1, 3, 8, 8))
     assert "lpips_alex" in small and "picky" not in small
-    assert "picky" in metrics                    # the metric itself survives
+    assert "picky" in metrics
     big = le.score_pair(metrics, torch.zeros(1, 3, 16, 16),
                         torch.ones(1, 3, 16, 16))
-    assert big["picky"] == 0.5                   # still scored where it works
+    assert big["picky"] == 0.5
     assert (8, 8) in metrics["picky"].failed
     assert "skipping that size" in capsys.readouterr().out
 
@@ -487,12 +445,10 @@ def test_no_reference_metrics_score_clean_and_patched_separately():
         c = row[f"fakeniqe_{region}_clean"]
         pt = row[f"fakeniqe_{region}_patched"]
         assert row[f"fakeniqe_{region}_delta"] == pytest.approx(pt - c)
-    # a no-reference score is NOT a distance: it never enters the FR columns
     assert "fakeniqe_floor_crop" not in row
 
 
 def test_ppd_matches_the_runs_viewing_geometry():
-    # 0.0114 cm pixel at 50 cm -- the CSFlow default PatchConfig carries
     assert le.ppd_from_cfg({}) == pytest.approx(76.56, abs=0.5)
     far = le.ppd_from_cfg({"csf_pixel_size_cm": 0.0114,
                            "csf_viewing_distance_cm": 100.0})
@@ -509,11 +465,7 @@ def test_tag_components_are_validated_too(tmp_path, argv):
 
 
 def test_full_reference_metrics_get_clean_first_modified_second():
-    """
-    pyiqa and cvvdp take the DISTORTED frame first; score_pair hands over
-    (clean, modified). An asymmetric metric would be silently inverted if the
-    wrapper got this backwards, so pin the order the callers rely on.
-    """
+    """pyiqa and cvvdp take the DISTORTED frame first; score_pair hands over (clean, modified)."""
     seen = {}
 
     def asymmetric(ref, dist):

@@ -1,11 +1,4 @@
-r"""
-Tsallis cross-entropy attack objective. Run with: pytest -q tests/test_tsallis.py
-
-test_existing_losses_unchanged is the guard on the whole integration: the
-golden numbers in it were captured from ce_loss/cospgd_loss/ipatch_cospgd_loss
-BEFORE any edit was made, so a regression in the shared _reduce() or in the
-build() dispatch shows up here rather than three weeks later in a results CSV.
-"""
+"""Tsallis cross-entropy attack objective."""
 import pytest
 
 torch = pytest.importorskip("torch")
@@ -32,10 +25,6 @@ def _batch(K=19, B=2, H=12, W=20, seed=1234, dtype=torch.float32):
     return logits, labels, support
 
 
-# ═════════════════════════════════════════════════════════════════════════════
-#  1. the CE limit
-# ═════════════════════════════════════════════════════════════════════════════
-
 @pytest.mark.parametrize("K", [2, 5, 19, 40])
 def test_ce_limit(K):
     """q -> 1 IS cross-entropy: same reduction, same ignore mask, same value."""
@@ -48,10 +37,7 @@ def test_ce_limit(K):
 
 
 def test_ce_limit_gradients_match_and_point_the_same_way():
-    """
-    The sign check Step 1 asks for: one Adam step from Tsallis at q -> 1 must
-    move the parameter the SAME direction as one step from the existing ce.
-    """
+    """The sign check Step 1 asks for: one Adam step from Tsallis at q -> 1 must move the parameter the SAME direction as one step from the existing ce."""
     logits, labels, support = _batch()
 
     a = logits.clone().requires_grad_(True)
@@ -61,27 +47,19 @@ def test_ce_limit_gradients_match_and_point_the_same_way():
     TsallisCELoss(q=1.0 - 1e-7)(b, labels, None, support).backward()
 
     assert torch.allclose(a.grad, b.grad, atol=1e-6)
-    # not merely close in norm — every coordinate agrees in sign
     nz = a.grad.abs() > 1e-9
     assert torch.equal(torch.sign(a.grad[nz]), torch.sign(b.grad[nz]))
 
 
 def test_closed_form_agrees_with_ce_just_outside_the_fallback():
-    """
-    The fallback makes q = 1 - 1e-7 exact by construction. This checks the
-    expm1 branch itself converges to CE, at a q the fallback does NOT catch.
-    """
+    """The fallback makes q = 1 - 1e-7 exact by construction."""
     logits, labels, support = _batch(dtype=torch.float64)
     q = 1.0 - 1e-4
-    assert abs(1.0 - q) > CE_LIMIT_EPS            # the closed form really runs
+    assert abs(1.0 - q) > CE_LIMIT_EPS
     got = TsallisCELoss(q=q)(logits, labels, None, support)
     ref = ce_loss(logits, labels, support)
     assert got.item() == pytest.approx(ref.item(), abs=1e-3)
 
-
-# ═════════════════════════════════════════════════════════════════════════════
-#  2. the gradient re-weighting — the mechanism the whole method rests on
-# ═════════════════════════════════════════════════════════════════════════════
 
 @pytest.mark.parametrize("q", QS)
 @pytest.mark.parametrize("p_val", [0.05, 0.2, 0.5, 0.8, 0.99])
@@ -102,10 +80,7 @@ def test_gradient_reweighting(q, p_val):
 @pytest.mark.parametrize("q,expected", [(0.0, 0.5), (-1.0, 2.0 / 3.0),
                                         (-2.0, 0.75), (-3.0, 0.8)])
 def test_gradient_peak(q, expected):
-    """
-    Grid-search the gradient-norm lower-bound proxy p^(2(1-q)) (1-p)^2 and
-    confirm its argmax is p* = (1-q)/(2-q).
-    """
+    """Grid-search the gradient-norm lower-bound proxy p^(2(1-q)) (1-p)^2 and confirm its argmax is p* = (1-q)/(2-q)."""
     p = torch.linspace(1e-4, 1.0 - 1e-4, 200001, dtype=torch.float64)
     proxy = p ** (2.0 * (1.0 - q)) * (1.0 - p) ** 2
     p_star = float(p[int(proxy.argmax())])
@@ -113,16 +88,9 @@ def test_gradient_peak(q, expected):
     assert p_star == pytest.approx(expected, abs=1e-4)
 
 
-# ═════════════════════════════════════════════════════════════════════════════
-#  3. masking — 255 must be inert, not merely small
-# ═════════════════════════════════════════════════════════════════════════════
-
 @pytest.mark.parametrize("q", QS)
 def test_ignore_index(q):
-    """
-    Void pixels contribute EXACTLY zero gradient, and the loss equals the loss
-    of the masked subset computed on its own.
-    """
+    """Void pixels contribute EXACTLY zero gradient, and the loss equals the loss of the masked subset computed on its own."""
     logits, labels, _ = _batch()
     void = labels == 255
     assert void.any()
@@ -130,10 +98,8 @@ def test_ignore_index(q):
     a = logits.clone().requires_grad_(True)
     val = TsallisCELoss(q=q)(a, labels, None, None)
     val.backward()
-    # [B,K,H,W] gradient, [B,H,W] mask -> broadcast over the class axis
     assert torch.count_nonzero(a.grad[void.unsqueeze(1).expand_as(a.grad)]) == 0
 
-    # same number from the valid subset alone
     per_pixel = tsallis_per_pixel(logits, labels, q)
     manual = -per_pixel[~void].mean()
     assert val.item() == pytest.approx(manual.item(), rel=1e-6)
@@ -141,10 +107,7 @@ def test_ignore_index(q):
 
 @pytest.mark.parametrize("q", QS)
 def test_support_mask_is_the_ce_masks_intersection(q):
-    """
-    The spatial mask (reach restriction, footprint exclusion) composes exactly
-    as it does for ce_loss — one shared expression, not a second copy.
-    """
+    """The spatial mask (reach restriction, footprint exclusion) composes exactly as it does for ce_loss — one shared expression, not a second copy."""
     logits, labels, support = _batch()
     val = TsallisCELoss(q=q)(logits, labels, None, support)
     valid = (labels != 255) & support
@@ -162,19 +125,10 @@ def test_footprint_argument_is_accepted_and_ignored():
         loss(logits, labels, None, support).item())
 
 
-# ═════════════════════════════════════════════════════════════════════════════
-#  4. numerical stability
-# ═════════════════════════════════════════════════════════════════════════════
-
 @pytest.mark.parametrize("q", list(QS) + [1.0 - CE_LIMIT_EPS,
                                           1.0 - CE_LIMIT_EPS / 2.0, 1.0])
 def test_numerical_stability(q):
-    """
-    Logits scaled to +/-50. p_y bottoms out around 1e-22 there, which is enough
-    that the naive route p_y**(1-q) flushes to EXACTLY 0 at q = -3 — the
-    gradient weight is destroyed before it is applied. Loss and gradients must
-    be finite for every q regardless.
-    """
+    """Logits scaled to +/-50. p_y bottoms out around 1e-22 there, which is enough that the naive route p_y**(1-q) flushes to EXACTLY 0 at q = -3 — the gradient weight is destroyed before it is applied."""
     logits, labels, support = _batch()
     logits = (logits / logits.abs().max() * 50.0).requires_grad_(True)
 
@@ -190,14 +144,10 @@ def test_numerical_stability(q):
 
 @pytest.mark.parametrize("q", list(QS) + [1.0 - CE_LIMIT_EPS / 2.0])
 def test_survives_probabilities_that_underflow_to_exactly_zero(q):
-    """
-    The hard case: p_y == 0 in float32, so log(softmax(.)) is -inf and any
-    probability-space implementation returns inf or nan. log_softmax keeps a
-    finite ~-123 and L_q lands on its true supremum 1/(1-q).
-    """
+    """The hard case: p_y == 0 in float32, so log(softmax(.)) is -inf and any probability-space implementation returns inf or nan. log_softmax keeps a finite ~-123 and L_q lands on its true supremum 1/(1-q)."""
     K = 19
     logits = torch.full((1, K, 4, 4), 60.0)
-    logits[:, 0] = -60.0                      # ground-truth class, 120 below
+    logits[:, 0] = -60.0
     labels = torch.zeros(1, 4, 4, dtype=torch.long)
 
     p_y = F.softmax(logits, 1).gather(1, labels.unsqueeze(1)).squeeze(1)
@@ -222,10 +172,6 @@ def test_fallback_boundary_is_continuous():
         logits, labels, None, support).item()
     assert below == pytest.approx(above, abs=1e-4)
 
-
-# ═════════════════════════════════════════════════════════════════════════════
-#  5. the q schedule
-# ═════════════════════════════════════════════════════════════════════════════
 
 def test_schedule_linear_hits_both_endpoints_and_is_monotone():
     T = 50
@@ -257,10 +203,7 @@ def test_schedule_single_step_does_not_divide_by_zero():
 
 
 def test_schedule_clamps_rather_than_overshooting_q_end():
-    """
-    A 1-based loop, or one that overruns its announced length, must not walk
-    past q_end — at q_end = 1 that would enter the rejected q > 1 regime.
-    """
+    """A 1-based loop, or one that overruns its announced length, must not walk past q_end — at q_end = 1 that would enter the rejected q > 1 regime."""
     assert schedule_q(99, 10, schedule="linear", q_start=-2.0,
                       q_end=1.0) == pytest.approx(1.0)
     assert schedule_q(-5, 10, schedule="linear", q_start=-2.0,
@@ -286,10 +229,6 @@ def test_schedule_changes_the_loss_value():
     last = loss(logits, labels, None, support).item()
     assert first != pytest.approx(last)
 
-
-# ═════════════════════════════════════════════════════════════════════════════
-#  6. q > 1 is rejected
-# ═════════════════════════════════════════════════════════════════════════════
 
 @pytest.mark.parametrize("q", [1.0 + 1e-6, 1.5, 2.0, 10.0])
 def test_rejects_q_above_one(q):
@@ -325,12 +264,8 @@ def test_patch_config_rejects_q_above_one_at_config_time():
     from patchreach.patch.spec import PatchConfig
     with pytest.raises(ValueError, match="q <= 1"):
         PatchConfig(tsallis_q=2.0).validate()
-    PatchConfig(tsallis_q=0.0).validate()               # the default is fine
+    PatchConfig(tsallis_q=0.0).validate()
 
-
-# ═════════════════════════════════════════════════════════════════════════════
-#  7. dispatch and config reachability
-# ═════════════════════════════════════════════════════════════════════════════
 
 def test_build_returns_a_stateful_callable():
     obj = build("tsallis", 8, tsallis_q=-1.0, tsallis_schedule="linear",
@@ -342,20 +277,13 @@ def test_build_returns_a_stateful_callable():
 
 
 def test_existing_losses_do_not_grow_a_step_hook():
-    """
-    The hasattr guard in the loops is only a proof of non-interference if the
-    pre-existing objectives really have no on_step_begin.
-    """
+    """The hasattr guard in the loops is only a proof of non-interference if the pre-existing objectives really have no on_step_begin."""
     for name in ("ce", "cospgd", "ipatch_cospgd"):
         assert not hasattr(build(name), "on_step_begin")
 
 
 def test_tsallis_fields_are_reachable_from_the_cli():
-    """
-    PatchConfig fields with no argparse pathway are dead config. This walks the
-    real parser rather than trusting the mapping by eye — the repo has shipped
-    a missing pathway before.
-    """
+    """PatchConfig fields with no argparse pathway are dead config."""
     pytest.importorskip("torchvision")
     import argparse
     import sys
@@ -393,13 +321,6 @@ def test_tsallis_defaults_match_between_cli_and_config():
         assert getattr(a, k) == getattr(d, k), k
 
 
-# ═════════════════════════════════════════════════════════════════════════════
-#  8. THE GUARD — golden values captured before any edit was made
-# ═════════════════════════════════════════════════════════════════════════════
-
-# ce_loss / cospgd_loss / ipatch_cospgd_loss on _batch() at seed 1234, float32
-# CPU. Captured on the pre-change tree; any drift in _reduce(), in the masking
-# expression, or in build()'s dispatch breaks this and nothing else has to.
 GOLDEN = {
     ("ce", False): (-3.3223705291748047, 0.048807259649038315),
     ("ce", True): (-3.3132686614990234, 0.052603162825107574),
@@ -447,10 +368,6 @@ def test_build_still_returns_the_same_numbers(name):
         pytest.approx(direct.item(), rel=1e-9)
 
 
-# ═════════════════════════════════════════════════════════════════════════════
-#  9. every entry point — the wiring, not the maths
-# ═════════════════════════════════════════════════════════════════════════════
-
 TSALLIS_FLAGS = ("--tsallis_q", "--tsallis_schedule", "--tsallis_q_start",
                  "--tsallis_q_end")
 
@@ -469,11 +386,7 @@ def _option_strings(parser):
 
 @pytest.mark.parametrize("group", ["add_patch_args", "add_generator_args"])
 def test_every_argument_group_exposes_tsallis(group):
-    """
-    add_patch_args feeds train.py / overfit.py / overfit_population.py;
-    add_generator_args feeds train_conditional_generator.py. Between them they
-    cover every parser that builds an attack objective.
-    """
+    """add_patch_args feeds train.py / overfit.py / overfit_population.py; add_generator_args feeds train_conditional_generator.py."""
     pytest.importorskip("torchvision")
     _scripts_on_path()
     import argparse
@@ -506,10 +419,7 @@ def test_cam_objective_accepts_tsallis():
 
 
 def test_tsallis_kwargs_maps_namespace_and_dict_identically():
-    """
-    export_conditional_patches.py resolves against a saved config DICT while
-    every other caller passes an argparse namespace. One mapping, both shapes.
-    """
+    """export_conditional_patches.py resolves against a saved config DICT while every other caller passes an argparse namespace."""
     pytest.importorskip("torchvision")
     _scripts_on_path()
     import argparse
@@ -532,7 +442,7 @@ def test_tsallis_kwargs_defaults_on_a_legacy_config():
     assert kw == {"tsallis_q": 0.0, "tsallis_schedule": "const",
                   "tsallis_q_start": -2.0, "tsallis_q_end": 1.0,
                   "tsallis_total_steps": 1}
-    assert build("ce", 8, **kw) is not None          # and it is build()-shaped
+    assert build("ce", 8, **kw) is not None
 
 
 def test_tsallis_kwargs_round_trips_into_a_scheduled_loss():
@@ -557,13 +467,7 @@ def test_segmentation_cam_build_forwards_tsallis():
 
 
 def test_every_optimisation_loop_installs_the_step_hook():
-    """
-    THE INVARIANT THIS PINS. A module that runs an optimisation loop calls
-    .backward(); a scheduled loss is only scheduled if that loop calls
-    on_step_begin(). Add a fourth training entry point and forget the hook, and
-    --tsallis_schedule linear silently pins q at q_start for the whole run —
-    a wrong result with no error. This fails instead.
-    """
+    """THE INVARIANT THIS PINS."""
     from pathlib import Path
     root = Path(__file__).resolve().parents[1]
     scanned = 0
@@ -614,11 +518,7 @@ def test_tsallis_tag_encodes_the_active_schedule(kw, expected):
 
 
 def test_a_q_sweep_produces_distinct_run_directories():
-    """
-    THE FAILURE THIS PINS. Without a q bit every arm of a sweep resolves to the
-    same name and increment_path disambiguates with _2, _3 — the data survives
-    but the path stops saying which q produced it.
-    """
+    """THE FAILURE THIS PINS."""
     pytest.importorskip("torchvision")
     _scripts_on_path()
     import argparse

@@ -1,12 +1,4 @@
-"""
-The tau guarantee on the residual that SURVIVES compositing.
-
-Every other csf test bounds the residual we intend to add. These bound what an
-observer actually sees, which is clamp(base + delta) - base, and which was
-measured at 2.77x tau (worst seed 4.52x) on a real run before csf_enforce
-existed. The clamp is the leak: it bends the residual rather than scaling it,
-and a bent peak is broadband.
-"""
+"""The tau guarantee on the residual that SURVIVES compositing."""
 import sys
 from pathlib import Path
 
@@ -33,14 +25,7 @@ def _csf(size=S):
 
 
 def _hostile_base(size=S, seed=0):
-    """
-    Content that FORCES clipping: half blown to white, half crushed to black.
-
-    A mid-grey base has headroom everywhere and would let any residual through
-    untouched, so it cannot exercise the path under test. Cityscapes frames
-    contain genuinely saturated regions -- blown sky, black shadow -- which is
-    why this matters outside the test suite.
-    """
+    """Content that FORCES clipping: half blown to white, half crushed to black."""
     g = torch.Generator().manual_seed(seed)
     base = torch.rand(1, 3, size, size, generator=g) * 0.06
     base[:, :, : size // 2] = 1.0 - base[:, :, : size // 2]
@@ -48,7 +33,7 @@ def _hostile_base(size=S, seed=0):
 
 
 def test_clipping_really_does_inflate_visibility():
-    """The premise. If this fails, csf_enforce is solving a non-problem."""
+    """The premise."""
     csf, budget = _csf()
     g = torch.Generator().manual_seed(1)
     delta = csf_mod.csf_residual(torch.randn(1, 3, S, S, generator=g),
@@ -87,7 +72,7 @@ def test_a_compliant_residual_is_returned_untouched():
     g = torch.Generator().manual_seed(2)
     delta = csf_mod.csf_residual(torch.randn(1, 3, S, S, generator=g),
                                  budget, csf, TAU)
-    base = torch.full((1, 3, S, S), 0.5)          # headroom everywhere
+    base = torch.full((1, 3, S, S), 0.5)
 
     fitted = csf_mod.fit_to_visibility(delta, base, csf, TAU)
     assert torch.equal(fitted, delta)
@@ -109,10 +94,7 @@ def test_the_scale_is_detached_so_gradients_still_flow():
 
 
 def test_shared_scale_keeps_one_residual_for_the_batch():
-    """
-    universal_csf must not acquire a per-image scale by the back door -- that
-    is the adaptation the whole mode exists to do without.
-    """
+    """universal_csf must not acquire a per-image scale by the back door -- that is the adaptation the whole mode exists to do without."""
     csf, budget = _csf()
     g = torch.Generator().manual_seed(3)
     delta = csf_mod.csf_residual(torch.randn(1, 3, S, S, generator=g),
@@ -148,9 +130,6 @@ def test_patch_csf_mode_end_to_end(enforce, must_hold):
 
     if must_hold:
         assert realised <= TAU + 1e-6, f"realised {realised:.6f} > tau {TAU}"
-    # The nominal arm is not asserted to violate -- whether it does depends on
-    # the content. It is parametrised so a regression that silently enforced
-    # everywhere would still show up as this case changing behaviour.
     assert torch.isfinite(rendered).all()
     assert float(rendered.min()) >= 0.0 and float(rendered.max()) <= 1.0
 

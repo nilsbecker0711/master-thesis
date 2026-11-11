@@ -1,17 +1,4 @@
-r"""
-mIoU and attack-effect metrics.
-
-REMOTE vs ALL — the distinction the whole thesis rests on. drop_all conflates
-occlusion (the patch physically covering pixels) with genuine adversarial
-influence; drop_remote excludes the footprint and measures only the latter.
-Report remote.
-
-PER-IMAGE vs DATASET mIoU — these are NOT comparable. Per-image mIoU averages
-IoU over classes present in ONE image, so a rare class covering a few hundred
-pixels scores near zero and drags the mean down hard; 50 per-image is normal
-for a model that scores 76 on the dataset. Dataset mIoU accumulates one
-confusion matrix across many images. Published numbers are always dataset mIoU.
-"""
+"""mIoU and attack-effect metrics."""
 from __future__ import annotations
 
 from typing import Optional
@@ -25,38 +12,7 @@ CLASS_SETS = ("gt", "union")
 
 
 class SegMetric:
-    r"""
-    Confusion-matrix mIoU. iou_c = TP/(TP+FP+FN).
-
-    WHICH CLASSES ENTER THE MEAN — this decides whether a clean/attacked
-    comparison is valid at all.
-
-      'gt'    (default) count a class iff it has GROUND TRUTH in the evaluated
-              pixels. The set then depends only on the labels, which are
-              identical for the clean and the attacked pass, so both means run
-              over the SAME denominator.
-
-      'union' count a class iff it has ground truth OR is predicted anywhere.
-              The historical behaviour, kept so earlier runs stay reproducible.
-
-    WHY 'union' BREAKS ATTACK EVALUATION. Under 'union' a class with no ground
-    truth that the model nevertheless predicts scores IoU = 0 and drags the
-    nanmean down. Suppress that spurious prediction and the class becomes NaN,
-    leaves the denominator, and the mean JUMPS — by roughly mean/(n-1), about
-    3.7 points at 18 classes. Clean and attacked are then averaged over
-    different class sets and the difference between them is not a measurement.
-
-    Observed: a 150-epoch run reported drop_remote = -3.63, i.e. the attack
-    apparently IMPROVED mIoU by 3.6 points, entirely because one rare class
-    (no GT in the 20 val images, a handful of predicted pixels) stopped being
-    counted. A toy case makes the sensitivity plain: 5 spurious pixels in
-    40,000 move mIoU by 33 points.
-
-    'gt' cannot do this: a class absent from the ground truth is not evaluated
-    in either pass, so nothing can move in or out. The cost is that spurious
-    predictions of a GT-absent class are no longer penalised — but they were
-    only ever penalised by an unstable all-or-nothing term.
-    """
+    """Confusion-matrix mIoU. iou_c = TP/(TP+FP+FN)."""
 
     def __init__(self, K: int, ignore_index: int = 255, device="cpu"):
         self.K, self.ig = K, ignore_index
@@ -79,31 +35,15 @@ class SegMetric:
             raise ValueError(f"classes must be one of {CLASS_SETS}, got {classes!r}")
         cm = self.cm.float()
         tp = cm.diagonal()
-        gt = cm.sum(1)                       # ground-truth pixels per class
-        denom = cm.sum(0) + gt - tp          # GT + predicted - TP
-        # gt > 0 implies denom > 0, so the division is safe either way.
+        gt = cm.sum(1)
+        denom = cm.sum(0) + gt - tp
         keep = (gt > 0) if classes == "gt" else (denom > 0)
         return torch.where(keep, tp / denom.clamp(min=1.0),
                            torch.full_like(tp, float("nan"))) * 100.0
 
     @torch.no_grad()
     def per_class_acc(self) -> torch.Tensor:
-        r"""
-        Per-class RECALL, tp / gt — the quantity averaged into mAcc.
-
-        NO `classes` ARGUMENT, unlike per_class(). Accuracy is normalised by
-        the ground-truth pixel count, so a class with gt == 0 is 0/0 and the
-        'union' set (denom > 0, which admits classes that were only ever
-        PREDICTED) has no defined value for it. mAcc is a gt-set quantity by
-        construction and pretending otherwise would emit a second number that
-        looks comparable to mIoU-union and is not.
-
-        Reported because Nesti et al. (WACV 2022) and Rossolini et al. (TNNLS
-        2024) quote mIoU AND mAcc, and their patch numbers cannot be entered
-        into the same table without it. It shares the confusion matrix with
-        per_class(), so it costs nothing and cannot drift from the mIoU it
-        sits beside.
-        """
+        """Per-class RECALL, tp / gt — the quantity averaged into mAcc."""
         cm = self.cm.float()
         tp, gt = cm.diagonal(), cm.sum(1)
         return torch.where(gt > 0, tp / gt.clamp(min=1.0),
@@ -133,16 +73,7 @@ def single_image_miou(logits, labels, K: int,
 
 @torch.no_grad()
 def compare(clean: SegMetric, adv: SegMetric, prefix: str = "") -> dict:
-    r"""
-    Clean vs attacked under BOTH class sets, plus the class counts that make
-    any divergence between them legible.
-
-    Reporting both is deliberate. 'gt' is the number to trust; 'union' is kept
-    so runs recorded before this distinction existed remain comparable, and
-    because the GAP between them is itself a diagnostic — a large gap means a
-    rare class moved in or out of the denominator, which says something about
-    the attack that neither number says alone.
-    """
+    """Clean vs attacked under BOTH class sets, plus the class counts that make any divergence between them legible."""
     out = {}
     for cs in CLASS_SETS:
         suffix = "" if cs == "gt" else "_union"
@@ -150,10 +81,6 @@ def compare(clean: SegMetric, adv: SegMetric, prefix: str = "") -> dict:
         out[f"{prefix}clean{suffix}"] = c
         out[f"{prefix}adv{suffix}"] = a
         out[f"{prefix}drop{suffix}"] = c - a
-    # mAcc, gt set only — see SegMetric.per_class_acc for why there is no
-    # union variant. Added for the Nesti/Rossolini benchmark table; every
-    # earlier key above is untouched, so runs recorded before this exist
-    # unchanged and simply lack the three acc_ columns.
     ca, aa = clean.compute_acc(), adv.compute_acc()
     out[f"{prefix}clean_acc"] = ca
     out[f"{prefix}adv_acc"] = aa
@@ -167,16 +94,7 @@ def compare(clean: SegMetric, adv: SegMetric, prefix: str = "") -> dict:
 @torch.no_grad()
 def attack_rates(clean_logits, adv_logits, labels, footprint,
                  target_class: Optional[int] = None) -> dict:
-    """
-    any_flip_rate   : % of remote pixels whose argmax changed at all.
-    target_hit_rate : % of NON-target remote pixels flipped TO target_class.
-
-    The hit-rate denominator excludes pixels already predicted target on the
-    CLEAN image — they cannot be flipped TO a class they already are. Without
-    that exclusion, attacking a scene-dominant class (road, ~50% prior) looks
-    like a strong attack when the scene simply handed you the win. This is the
-    metric that separates "network overpowered" from "network agreed".
-    """
+    """any_flip_rate : % of remote pixels whose argmax changed at all. target_hit_rate : % of NON-target remote pixels flipped TO target_class."""
     hw = labels.shape[-2:]
     pc = upsample_to(clean_logits, hw).argmax(1)
     pa = upsample_to(adv_logits, hw).argmax(1)

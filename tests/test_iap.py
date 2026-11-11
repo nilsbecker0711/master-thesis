@@ -1,32 +1,4 @@
-r"""
-The IAP port, pinned against a LITERAL TRANSCRIPTION of the reference.
-
-WHY THIS FILE IS SHAPED THIS WAY. Every one of IAP's four parts is a short
-arithmetic expression that can be wrong in a way that produces a plausible
-patch and no error:
-
-  the sensitivity map     a centred window instead of an anchored one, or the
-                          biased std instead of the unbiased one, moves the map
-                          by a pixel and changes its scale — and the map is
-                          what gates the whole update.
-  the window search       the reference maximises a SUM and this repository's
-                          helper maximises a MEAN. They agree only because the
-                          window size is constant, which is an argument, not a
-                          fact, until it is tested.
-  the regulariser         sum vs mean is a factor of p**2 * 3, which at 256px
-                          is 196608. A run with the wrong one converges to the
-                          clean image and reports a null result.
-  the update rule         the three factors broadcast against each other in
-                          four dimensions. Any one of them silently reducing
-                          over the wrong axis still runs.
-
-So the reference loops are transcribed here, verbatim in structure, and the
-vectorised port is held equal to them. They are deliberately slow and
-deliberately ugly: that is what makes them a reference rather than a second
-implementation that could drift the same way.
-
-Run with: pytest -q tests/test_iap.py
-"""
+"""The IAP port, pinned against a LITERAL TRANSCRIPTION of the reference."""
 from __future__ import annotations
 
 import sys
@@ -47,17 +19,8 @@ from patchreach.patch.placement import find_max_response_placement
 K = 19
 
 
-# ═════════════════════════════════════════════════════════════════════════════
-#  the reference, transcribed from github.com/subratkishoredutta/IAP/src/utils.py
-# ═════════════════════════════════════════════════════════════════════════════
-
 def ref_get_std(input_tensor, subset_size_y, subset_size_x):
-    """
-    get_std_x (1x3) and get_std_y (3x1) in one body — they differ only in the
-    window. Structure, loop bounds and the zero initialisation are the
-    reference's; note that the window is anchored at (i, j) and that the loop
-    stops short of the right/bottom edge, leaving those entries at zero.
-    """
+    """get_std_x (1x3) and get_std_y (3x1) in one body — they differ only in the window."""
     image = input_tensor.clone()
     stride = 1
     stdten = torch.zeros(input_tensor.shape[2], input_tensor.shape[3])
@@ -92,19 +55,9 @@ def ref_find_location(mask, window_size):
 
 
 def ref_step(delta, grad, sens, lr):
-    """
-    The released update, as one expression:
-
-        delta.data - learning_rate*delta.grad.mean(dim=1)*delta.data*(1/sens)
-
-    delta is [1,3,p,p] here (the reference's layout) and sens is [p,p].
-    """
+    """The released update, as one expression"""
     return delta - lr * grad.mean(dim=1) * delta * (1.0 / sens)
 
-
-# ═════════════════════════════════════════════════════════════════════════════
-#  1. the sensitivity map
-# ═════════════════════════════════════════════════════════════════════════════
 
 def test_sensitivity_matches_the_reference_loops():
     torch.manual_seed(0)
@@ -113,28 +66,16 @@ def test_sensitivity_matches_the_reference_loops():
 
 
 def test_sensitivity_matches_on_near_constant_content():
-    """
-    THE CASE THE SUM-OF-SQUARES SHORTCUT GETS WRONG. A near-flat window makes
-    S2 and S^2/n agree to six digits, so var = (S2 - S^2/n)/(n-1) is fp32
-    noise there — and a flat region is exactly where sens is large and the
-    whole invisibility mechanism lives. window_std() stacks the samples
-    instead, so it stays exact.
-    """
+    """THE CASE THE SUM-OF-SQUARES SHORTCUT GETS WRONG."""
     x = torch.full((1, 3, 9, 9), 0.4)
     x[0, :, 4, 4] += 1e-4
     got, want = iap.sensitivity(x), ref_sens(x)[None]
     assert torch.allclose(got, want, rtol=1e-4)
-    # and it must actually reach the ceiling, not merely agree on a wrong value
     assert float(got.max()) == pytest.approx(1.0 / iap.SENS_EPS, rel=1e-3)
 
 
 def test_sensitivity_border_band_is_the_reference_artefact():
-    """
-    D7, pinned. The reference's loops leave a two-pixel band at the right and
-    bottom at zero std, so sens = 1/eps = 1000 there and the update's 1/sens
-    factor freezes those pixels. This is reproduced, not fixed: the published
-    numbers were produced with it.
-    """
+    """D7, pinned."""
     torch.manual_seed(1)
     s = iap.sensitivity(torch.rand(1, 3, 10, 12))[0]
     ceiling = 1.0 / iap.SENS_EPS
@@ -148,7 +89,7 @@ def test_window_std_is_the_unbiased_estimator():
     x = torch.tensor([[0.0, 0.5, 1.0]]).view(1, 1, 1, 3).expand(1, 3, 1, 3)
     got = float(iap.window_std(x, 1, 3)[0, 0, 0])
     assert got == pytest.approx(float(torch.tensor([0.0, 0.5, 1.0]).std()))
-    assert got == pytest.approx(0.5)            # biased would be 0.408
+    assert got == pytest.approx(0.5)
 
 
 def test_sensitivity_refuses_a_non_batched_image():
@@ -156,16 +97,8 @@ def test_sensitivity_refuses_a_non_batched_image():
         iap.sensitivity(torch.rand(3, 8, 8))
 
 
-# ═════════════════════════════════════════════════════════════════════════════
-#  2. localisation
-# ═════════════════════════════════════════════════════════════════════════════
-
 def test_localise_matches_the_reference_window_search():
-    """
-    The reference maximises the window SUM; find_max_response_placement
-    maximises the window MEAN. Equal argmax only because the window size is
-    constant over the search — which is the claim this test exists to hold.
-    """
+    """The reference maximises the window SUM; find_max_response_placement maximises the window MEAN."""
     torch.manual_seed(2)
     for _ in range(5):
         cam = torch.rand(20, 28)
@@ -176,11 +109,7 @@ def test_localise_matches_the_reference_window_search():
 
 
 def test_localise_delegates_to_the_shared_placement_helper():
-    """
-    D1/D2 plumbing: IAP localisation and --placement gradcam must resolve the
-    same window from the same map, or the per-image ablation and the generator
-    ablation stop measuring the same thing.
-    """
+    """D1/D2 plumbing: IAP localisation and --placement gradcam must resolve the same window from the same map, or the per-image ablation and the generator ablation stop measuring the same thing."""
     torch.manual_seed(3)
     cam, sens = torch.rand(16, 24), torch.rand(16, 24) + 0.5
     assert iap.localise(cam, sens, 6, score="cam") == \
@@ -188,11 +117,7 @@ def test_localise_delegates_to_the_shared_placement_helper():
 
 
 def test_the_two_localisation_scores_disagree():
-    """
-    D1 is a real fork in the procedure, not a cosmetic one: the paper's J/Sens
-    and the released code's J put the patch in different places. If this ever
-    passes trivially the flag has stopped doing anything.
-    """
+    """D1 is a real fork in the procedure, not a cosmetic one: the paper's J/Sens and the released code's J put the patch in different places."""
     torch.manual_seed(4)
     cam = torch.rand(24, 24)
     sens = torch.rand(24, 24) * 50 + 1.0
@@ -202,14 +127,10 @@ def test_the_two_localisation_scores_disagree():
 
 
 def test_cam_over_sens_prefers_texture_at_equal_cam():
-    """
-    The mechanism, isolated: with a FLAT Grad-CAM the paper's score is decided
-    by 1/sens alone, so it must land on the textured half (low sens) and not on
-    the smooth one.
-    """
+    """The mechanism, isolated: with a FLAT Grad-CAM the paper's score is decided by 1/sens alone, so it must land on the textured half (low sens) and not on the smooth one."""
     cam = torch.ones(16, 16)
-    sens = torch.full((16, 16), 100.0)      # smooth: perturbation shows
-    sens[:, 8:] = 1.0                       # textured: it hides
+    sens = torch.full((16, 16), 100.0)
+    sens[:, 8:] = 1.0
     top, left = iap.localise(cam, sens, 8, score="cam_over_sens")
     assert left == 8 and top == 0
 
@@ -219,12 +140,7 @@ def test_localise_centre_ablation_needs_no_cam():
 
 
 def test_localise_diverges_from_the_reference_on_a_degenerate_map():
-    """
-    DELIBERATE, and declared. The reference's `max_sum = 0` with a strict `>`
-    returns the TOP-LEFT corner for an all-zero map, which reads as a placement
-    and is not one; centre_if_constant=True falls back to the documented
-    default position instead. Pinned so the divergence stays visible.
-    """
+    """DELIBERATE, and declared."""
     cam = torch.zeros(16, 16)
     assert ref_find_location(cam, 8) == (0, 0)
     assert iap.localise(cam, torch.ones(16, 16), 8, score="cam") == (4, 4)
@@ -235,10 +151,6 @@ def test_localise_rejects_an_unknown_score():
         iap.localise(torch.rand(8, 8), torch.rand(8, 8), 4, score="gradcam")
 
 
-# ═════════════════════════════════════════════════════════════════════════════
-#  3. the regulariser
-# ═════════════════════════════════════════════════════════════════════════════
-
 def test_regulariser_matches_the_reference_expression():
     torch.manual_seed(5)
     d, b = torch.rand(3, 9, 9), torch.rand(3, 9, 9)
@@ -248,11 +160,7 @@ def test_regulariser_matches_the_reference_expression():
 
 
 def test_regulariser_sum_is_the_one_that_scales_with_area():
-    """
-    D3, pinned as arithmetic. 'sum' grows with p**2 and that is why w3 = 3 is
-    not the same operating point at 256px that it was at 84px; 'sum84' undoes
-    exactly that factor; 'mean' is free of it and is not IAP.
-    """
+    """D3, pinned as arithmetic."""
     p = 42
     d = torch.full((3, p, p), 0.6)
     b = torch.full((3, p, p), 0.5)
@@ -270,41 +178,24 @@ def test_regulariser_carries_a_gradient_to_delta_only():
     s = (torch.rand(8, 8) + 1).requires_grad_(True)
     iap.regulariser(d, b, s, "sum").backward()
     assert d.grad is not None and float(d.grad.abs().sum()) > 0
-    # sens is a property of the CLEAN image; a gradient through it would be a
-    # gradient through a constant that happens to be computed from a tensor.
     assert s.grad is None
 
 
 def test_the_released_regulariser_has_no_gradient():
-    r"""
-    D9, AND THE LARGEST DISCREPANCY IN THE PORT. The reference builds its
-    reference patch as
-
-        delta = torch.nn.Parameter(delta)
-        temp  = delta.clone()
-
-    and clone() on a grad-requiring leaf is DIFFERENTIABLE, so autograd walks
-    two paths into delta — `+sens*sign(d-t)` through delta and `-sens*sign(d-t)`
-    through temp — which cancel exactly. The term is reported (it is the
-    paper's "human distance") and optimises nothing.
-
-    This test holds the finding on the REFERENCE'S OWN EXPRESSION, so it stays
-    true independently of anything in iap.py and cannot be explained away as a
-    porting artefact.
-    """
+    """D9, AND THE LARGEST DISCREPANCY IN THE PORT."""
     torch.manual_seed(11)
     base = torch.rand(1, 3, 8, 8)
     sens = torch.rand(8, 8) * 20 + 1
 
     delta = torch.nn.Parameter(base.clone())
-    temp = delta.clone()                       # the reference, verbatim
+    temp = delta.clone()
     assert temp.requires_grad and temp.grad_fn is not None
-    delta.data.add_(0.1)                       # so sign(d - t) = +1, not 0
+    delta.data.add_(0.1)
     r = 3 * (sens.detach() * torch.abs(delta - temp)).sum()
     r.backward()
 
-    assert float(r) > 0                        # the term is worth something
-    assert float(delta.grad.abs().sum()) == 0.0    # and none of it is gradient
+    assert float(r) > 0
+    assert float(delta.grad.abs().sum()) == 0.0
 
 
 def test_the_ported_regulariser_does_have_a_gradient():
@@ -319,18 +210,9 @@ def test_the_ported_regulariser_does_have_a_gradient():
 
 
 def test_reg_grad_released_reports_the_value_but_not_the_gradient():
-    """
-    The reproduction must match the released code on BOTH counts: identical
-    loss value, zero gradient. A mode that simply dropped the term would match
-    the gradient and not the value, and the "human distance" column would stop
-    being comparable between the two arms.
-    """
+    """The reproduction must match the released code on BOTH counts: identical loss value, zero gradient."""
     logits, label, fp = _scene()
     sup = ~fp
-    # The adversarial terms need a graph of their own, or detaching the
-    # regulariser leaves the total with no grad_fn and backward() raises. In
-    # the real loop the patch IS upstream of the logits; here the two are
-    # independent on purpose, so `d.grad` isolates the regulariser's path.
     logits = logits.clone().requires_grad_(True)
     b = torch.rand(3, 6, 6)
     s = torch.rand(6, 6) * 10 + 1
@@ -345,9 +227,8 @@ def test_reg_grad_released_reports_the_value_but_not_the_gradient():
         val[mode], total[mode], grad[mode] = (parts["reg"],
                                               float(parts["total"]), d.grad)
 
-    assert val["live"] == pytest.approx(val["released"])      # same value
-    assert total["live"] == pytest.approx(total["released"])  # same total
-    # live: the paper's gradient. released: NOTHING reached the patch.
+    assert val["live"] == pytest.approx(val["released"])
+    assert total["live"] == pytest.approx(total["released"])
     assert torch.allclose(grad["live"],
                           iap.IAP_W3 * s * torch.ones(3, 6, 6), atol=1e-4)
     assert grad["released"] is None
@@ -364,10 +245,6 @@ def test_regulariser_rejects_an_unknown_reduction():
                         torch.ones(4, 4), "l2")
 
 
-# ═════════════════════════════════════════════════════════════════════════════
-#  4. the colour-constant update
-# ═════════════════════════════════════════════════════════════════════════════
-
 def _param_with_grad(p=7, seed=6):
     torch.manual_seed(seed)
     param = (torch.rand(3, p, p) * 0.8 + 0.1).requires_grad_(True)
@@ -377,11 +254,7 @@ def _param_with_grad(p=7, seed=6):
 
 
 def test_step_matches_the_reference_expression():
-    """
-    The reference works on [1,3,p,p] and this repository's Patch parameter is
-    [3,p,p], so the channel axis is 1 there and -3 here. A mean over the wrong
-    axis still runs and still produces a patch.
-    """
+    """The reference works on [1,3,p,p] and this repository's Patch parameter is [3,p,p], so the channel axis is 1 there and -3 here."""
     param, sens = _param_with_grad()
     want = ref_step(param.detach()[None], param.grad[None], sens, 0.09)[0]
     iap.colour_constant_step_(param, sens, 0.09)
@@ -389,30 +262,18 @@ def test_step_matches_the_reference_expression():
 
 
 def test_step_is_colour_constant():
-    """
-    THE PAPER'S TITLE CLAIM, as an invariant. Every channel of a pixel is
-    scaled by the SAME relative amount, so the pixel moves along its own colour
-    direction and its RGB ratios survive. Compare with Adam, which updates each
-    channel independently and recolours the patch.
-    """
+    """THE PAPER'S TITLE CLAIM, as an invariant."""
     param, sens = _param_with_grad()
     before = param.detach().clone()
     iap.colour_constant_step_(param, sens, 0.05)
-    ratio = param.detach() / before                 # step / value, per channel
+    ratio = param.detach() / before
     assert torch.allclose(ratio[0], ratio[1], atol=1e-6)
     assert torch.allclose(ratio[1], ratio[2], atol=1e-6)
-    # and it is not a no-op, which would satisfy the above vacuously
     assert float((param.detach() - before).abs().max()) > 1e-6
 
 
 def test_step_freezes_smooth_regions():
-    """
-    THE INVISIBILITY MECHANISM. 1/sens = sqrt(min std) + eps, so a perfectly
-    flat neighbourhood (sens at its 1/eps ceiling) moves by ~eps times what a
-    textured one moves, under the SAME gradient. Invisibility is not bought by
-    penalising harder where it would show; it is bought by not listening to the
-    attack there.
-    """
+    """THE INVISIBILITY MECHANISM."""
     param = torch.full((3, 2, 2), 0.5).requires_grad_(True)
     param.grad = torch.ones(3, 2, 2)
     sens = torch.tensor([[1.0 / iap.SENS_EPS, 1.0 / iap.SENS_EPS],
@@ -425,11 +286,7 @@ def test_step_freezes_smooth_regions():
 
 
 def test_step_leaves_a_zero_pixel_frozen():
-    """
-    The documented corner of the multiplicative update: `* param` makes 0 an
-    absorbing state. It is why the parameter must be initialised from image
-    content and never from zeros.
-    """
+    """The documented corner of the multiplicative update: `* param` makes 0 an absorbing state."""
     param = torch.zeros(3, 2, 2).requires_grad_(True)
     param.grad = torch.ones(3, 2, 2)
     iap.colour_constant_step_(param, torch.ones(2, 2), 0.2)
@@ -449,10 +306,6 @@ def test_step_refuses_a_non_finite_gradient():
         iap.colour_constant_step_(param, torch.ones(4, 4), 0.1)
 
 
-# ═════════════════════════════════════════════════════════════════════════════
-#  the loss
-# ═════════════════════════════════════════════════════════════════════════════
-
 def _scene(h=8, w=12, seed=7):
     torch.manual_seed(seed)
     logits = torch.randn(1, K, h, w)
@@ -463,11 +316,7 @@ def _scene(h=8, w=12, seed=7):
 
 
 def test_objective_decomposes_exactly_into_its_three_terms():
-    """
-    The port is a SUBSTITUTION, so the total has to equal the weighted sum of
-    this repository's own losses plus the regulariser — with no sign flip
-    anywhere, which is the claim Objective's docstring makes.
-    """
+    """The port is a SUBSTITUTION, so the total has to equal the weighted sum of this repository's own losses plus the regulariser — with no sign flip anywhere, which is the claim Objective's docstring makes."""
     logits, label, fp = _scene()
     sup = ~fp
     d = torch.rand(3, 5, 5)
@@ -488,12 +337,7 @@ def test_objective_decomposes_exactly_into_its_three_terms():
 
 
 def test_objective_untargeted_term_is_the_reference_minus_ce():
-    """
-    IAP's second term is `- criterion(pred, class_id)` — an explicit minus on a
-    cross-entropy. adversarial.ce_loss already returns -CE, so the port must
-    ADD it with a positive weight. A second negation would make the attack
-    optimise toward the ground truth and still converge.
-    """
+    """IAP's second term is `- criterion(pred, class_id)` — an explicit minus on a cross-entropy. adversarial.ce_loss already returns -CE, so the port must ADD it with a positive weight."""
     logits, label, fp = _scene()
     import torch.nn.functional as F
     ce = F.cross_entropy(logits, label, reduction="none", ignore_index=255)
@@ -520,10 +364,6 @@ def test_objective_refuses_a_margin_loss_without_the_clean_prediction():
         iap.Objective(untar="margin")
 
 
-# ═════════════════════════════════════════════════════════════════════════════
-#  the early stop
-# ═════════════════════════════════════════════════════════════════════════════
-
 def _onehot(pred, k=K):
     lg = torch.zeros(1, k, *pred.shape[-2:])
     lg.scatter_(1, pred.unsqueeze(1), 8.0)
@@ -531,14 +371,11 @@ def _onehot(pred, k=K):
 
 
 def test_progress_rate_is_the_reported_metric_divided_by_100():
-    """
-    The stop criterion must be a quantity that appears in the results table, or
-    a run that stopped early stopped on something nobody can check.
-    """
+    """The stop criterion must be a quantity that appears in the results table, or a run that stopped early stopped on something nobody can check."""
     label = torch.zeros(1, 6, 6, dtype=torch.long)
     pc = torch.zeros(1, 6, 6, dtype=torch.long)
     pa = torch.zeros(1, 6, 6, dtype=torch.long)
-    pa[:, :3, :] = 16                      # half the frame driven to class 16
+    pa[:, :3, :] = 16
     fp = torch.zeros(1, 6, 6, dtype=torch.bool)
     lc, la = _onehot(pc), _onehot(pa)
 
@@ -574,10 +411,6 @@ def test_progress_rate_drop_needs_the_clean_baseline():
         iap.progress_rate(lg, lg, label, fp, "drop")
 
 
-# ═════════════════════════════════════════════════════════════════════════════
-#  the refusals that keep a run from silently being a different procedure
-# ═════════════════════════════════════════════════════════════════════════════
-
 def _cfg(**kw):
     from patchreach.patch.spec import PatchConfig
     base = dict(mode="raw", pixel_param="direct", size=16, scale=0.25,
@@ -595,26 +428,16 @@ def _patch(cfg):
 
 
 def test_prepare_refuses_a_resampled_patch():
-    """
-    THE PASTE-SIDE RULE, as a refusal. side(H,W) = int(H*scale) and the
-    parameter is size x size; when they differ, Patch.apply interpolates, and
-    three of IAP's four parts are then computed on a signal that is not the one
-    pasted. Both checks run before the model is touched, which is why this test
-    needs no segmentor.
-    """
-    patch = _patch(_cfg(size=16, scale=0.25))         # 16 vs int(64*0.25)=16
-    img = torch.zeros(1, 3, 100, 100)                 # int(100*0.25) = 25
+    """THE PASTE-SIDE RULE, as a refusal. side(H,W) = int(H*scale) and the parameter is size x size; when they differ, Patch.apply interpolates, and three of IAP's four parts are then computed on a signal that is not the one pasted."""
+    patch = _patch(_cfg(size=16, scale=0.25))
+    img = torch.zeros(1, 3, 100, 100)
     with pytest.raises(ValueError, match="parameter resolution"):
         iap.prepare(None, img, patch, mean_t=0.0, std_t=1.0,
                     label=torch.zeros(1, 100, 100, dtype=torch.long), cam=None)
 
 
 def test_prepare_refuses_a_sigmoid_parameterisation():
-    """
-    Not a preference. The update multiplies by `delta`; under a sigmoid
-    parameterisation that factor is a LOGIT, negative for any pixel below 0.5,
-    so the step reverses sign for half the patch and the run still completes.
-    """
+    """Not a preference."""
     patch = _patch(_cfg(size=16, scale=0.25, pixel_param="sigmoid"))
     img = torch.zeros(1, 3, 64, 64)
     with pytest.raises(ValueError, match="pixel_param direct"):
@@ -639,24 +462,13 @@ def test_attack_image_rejects_an_empty_ladder():
                          mean_t=0.0, std_t=1.0, cam=None, lrs=[])
 
 
-# ═════════════════════════════════════════════════════════════════════════════
-#  invisibility
-# ═════════════════════════════════════════════════════════════════════════════
-
 def test_invisibility_separates_footprint_from_frame():
-    """
-    BOTH REGIONS OR NEITHER. These metrics are spatial means, so a patch
-    covering 3% of the frame is diluted ~32x in the global figure: a change
-    that is obvious inside the footprint still scores as near-perfect
-    globally. The paper reports local and global for every metric for exactly
-    this reason, and a table quoting only the global column would say an attack
-    is invisible when it is not.
-    """
+    """BOTH REGIONS OR NEITHER."""
     pytest.importorskip("torchmetrics")
     torch.manual_seed(8)
     clean = torch.rand(1, 3, 64, 64)
     adv = clean.clone()
-    adv[:, :, 8:24, 8:24] = torch.rand(1, 3, 16, 16)      # 6.25% of the frame
+    adv[:, :, 8:24, 8:24] = torch.rand(1, 3, 16, 16)
     v = iap.invisibility(clean, adv, (8, 8, 16))
     assert v["ssim_patch"] < v["ssim_image"]
     assert v["psnr_patch"] < v["psnr_image"]
@@ -670,16 +482,8 @@ def test_invisibility_is_perfect_on_an_unchanged_frame():
     assert v["ssim_image"] == pytest.approx(1.0, abs=1e-5)
 
 
-# ═════════════════════════════════════════════════════════════════════════════
-#  slide inference — what IAP can and cannot do under a tiled model
-# ═════════════════════════════════════════════════════════════════════════════
-
 def _stub_segmentor():
-    """
-    An mmseg-shaped segmentor: a .backbone returning a TUPLE of feature maps,
-    and encode_decode(x, metas). Enough for WrappedSegModel and
-    SlidingWindowSegModel to wrap, and for the CAM to try to hook.
-    """
+    """An mmseg-shaped segmentor: a .backbone returning a TUPLE of feature maps, and encode_decode(x, metas)."""
     import torch.nn as nn
 
     class Backbone(nn.Module):
@@ -707,26 +511,7 @@ def _stub_segmentor():
 
 
 def test_the_cam_refuses_a_tiled_model():
-    r"""
-    THE FAILURE THIS REPLACES WAS SILENT, not a crash. SlidingWindowSegModel
-    calls the segmentor once per window, so the CAM's forward hook fires
-    n_windows times and `self._feats = out` ASSIGNS rather than appends: only
-    the LAST window's feature map survives. Everything downstream then
-    describes the whole frame, and nothing checks the two agree.
-
-    Measured on a tiled model whose encode_decode returns input-sized logits,
-    as mmseg's does: a 4-D backbone yields a CAM built from one tile and
-    stretched across the full frame (0.055 mean abs away from the whole-frame
-    map, no error), and a token backbone is worse still — _token_grid
-    factorises the WINDOW's token count against the FRAME's dimensions, finds a
-    grid that is not the real one, and reshapes the tokens into a transposed
-    map. Also no error.
-
-    So this guard converts a plausible-but-wrong placement into a refusal,
-    which is the failure class segmentation_cam.py's own header exists to
-    prevent. It also covers overfit.py / overfit_population.py, which accept
-    `--placement gradcam --inference auto` with nothing refusing the pair.
-    """
+    """THE FAILURE THIS REPLACES WAS SILENT, not a crash."""
     from patchreach.models.wrapper import (SlidingWindowSegModel,
                                            WrappedSegModel)
     from patchreach.patch import segmentation_cam
@@ -737,7 +522,6 @@ def test_the_cam_refuses_a_tiled_model():
     with pytest.raises(ValueError, match="cannot run on a SlidingWindowSegModel"):
         segmentation_cam.build(tiled, "ce")
 
-    # ... and the un-tiled model is still fine, so the guard is not a blanket.
     cam = segmentation_cam.build(whole, "ce")
     m, logits = cam(torch.rand(1, 3, 64, 128),
                     torch.randint(0, K, (1, 64, 128)))
@@ -746,22 +530,7 @@ def test_the_cam_refuses_a_tiled_model():
 
 
 def test_slide_checkpoint_is_no_longer_refused_for_any_localisation():
-    r"""
-    THE HISTORY MATTERS HERE, because this guard has been wrong twice.
-
-      v1  refused --slide_checkpoint outright. That blocked the one
-          combination that works at native resolution, since centre placement
-          builds no CAM at all.
-      v2  conditional on --iap_locate, refusing it for cam / cam_over_sens.
-      v3  (D10) no refusal. The CAM runs on the UN-TILED model, so nothing
-          calls autograd.grad through a checkpointed window whatever
-          --iap_locate says.
-
-    A guard that over-refuses is as wrong as one that under-refuses: it sends
-    the run to a mode the baseline is not in. The combination that genuinely
-    cannot work — a CAM on the tiled model — is no longer expressible, because
-    SegmentationCAM refuses it (see above).
-    """
+    """THE HISTORY MATTERS HERE, because this guard has been wrong twice."""
     _scripts_on_path()
     import iap_attack as S
 
@@ -780,23 +549,8 @@ def _scripts_on_path():
         sys.path.insert(0, d)
 
 
-# ═════════════════════════════════════════════════════════════════════════════
-#  D10 — a whole-frame CAM while the attack runs tiled
-# ═════════════════════════════════════════════════════════════════════════════
-
 def test_cam_untiled_takes_the_clean_baseline_from_the_attack_model():
-    r"""
-    THE SILENT TRAP IN D10. Everywhere else prepare() reuses the CAM's own
-    logits to save a forward, which is free when the CAM and the attack share a
-    model. Under cam_untiled they do NOT: the CAM runs whole-frame and the
-    attack runs tiled, so reusing them would measure clean mIoU under one
-    inference mode and the attacked frame under the other, making every drop in
-    the run the difference of two procedures. Off by a point or two — i.e.
-    invisible.
-
-    Pinned by giving the two models DELIBERATELY DIFFERENT outputs and
-    asserting the clean logits came from the attack model.
-    """
+    """THE SILENT TRAP IN D10."""
     import torch.nn as nn
 
     H, W, P = 32, 64, 8
@@ -811,7 +565,7 @@ def test_cam_untiled_takes_the_clean_baseline_from_the_attack_model():
         def forward(self, x):
             lg = torch.zeros(x.shape[0], K, *x.shape[-2:])
             lg[:, self.hot] = 10.0
-            return lg + 0.0 * x.sum()      # keep x in the graph
+            return lg + 0.0 * x.sum()
 
     class CamStub:
         n_degenerate = 0
@@ -819,8 +573,6 @@ def test_cam_untiled_takes_the_clean_baseline_from_the_attack_model():
         def __call__(self, imgs, labels):
             m = torch.zeros(1, 1, H, W)
             m[:, :, :, W // 2:] = 1.0
-            # logits that must be IGNORED: a different class from the attack
-            # model's, so reusing them would be visible in clean_remote.
             lg = torch.zeros(1, K, H, W)
             lg[:, 7] = 10.0
             return m, lg
@@ -835,7 +587,7 @@ def test_cam_untiled_takes_the_clean_baseline_from_the_attack_model():
     m_t, s_t = norm_tensors(dev)
     attack_model = Flat(hot=3)
     img = torch.rand(1, 3, H, W)
-    label = torch.full((1, H, W), 3, dtype=torch.long)     # matches hot=3
+    label = torch.full((1, H, W), 3, dtype=torch.long)
 
     cfg = PatchConfig(mode="raw", pixel_param="direct", size=P,
                       scale=P / H, placement="center")
@@ -850,7 +602,6 @@ def test_cam_untiled_takes_the_clean_baseline_from_the_attack_model():
         "model (class 3) — the baseline and the attacked frame would then be "
         "measured under different inference modes")
 
-    # and with cam_untiled=False the CAM's logits ARE reused, as before
     patch2 = Patch(cfg, dev, m_t, s_t)
     prep2 = iap.prepare(attack_model, img, patch2, mean_t=m_t, std_t=s_t,
                         label=label, cam=CamStub(), score="cam",
@@ -859,10 +610,7 @@ def test_cam_untiled_takes_the_clean_baseline_from_the_attack_model():
 
 
 def test_cam_untiled_is_recorded_in_the_result():
-    """
-    D10 changes what a drop MEANS, so a row that does not say whether the map
-    was whole-frame is not interpretable. Both keys, both ways.
-    """
+    """D10 changes what a drop MEANS, so a row that does not say whether the map was whole-frame is not interpretable."""
     import torch.nn as nn
 
     H, W, P = 32, 64, 8
@@ -914,22 +662,7 @@ def test_cam_untiled_is_recorded_in_the_result():
 
 
 def test_best_drop_is_reproducible_from_the_saved_patch():
-    r"""
-    THE INVARIANT: the drop a run REPORTS must be the drop its saved patch
-    ACHIEVES. Anything else makes the headline number unverifiable.
-
-    This failed before. `cur` is computed from the forward pass's logits — the
-    parameter as it stands BEFORE the update — while `best_param` used to be
-    cloned AFTER it, so each logged step credited its measured drop to a
-    different patch. Harmless under Adam + cosine, where consecutive patches
-    are near-identical, and that is why optimise.attack_image carried the same
-    pattern unnoticed. Not harmless under IAP's multiplicative update, which is
-    a limit cycle at lr*w3 >= 0.1: a real 1000-step run reported
-    best_drop_remote +12.17 while its saved parameter measured +5.13.
-
-    Forced here with a deliberately unstable lr*w3, so consecutive patches are
-    far apart and an off-by-one cannot hide inside the tolerance.
-    """
+    """THE INVARIANT: the drop a run REPORTS must be the drop its saved patch ACHIEVES."""
     import torch.nn as nn
 
     H, W, P = 48, 96, 12
@@ -974,14 +707,6 @@ def test_best_drop_is_reproducible_from_the_saved_patch():
     cfg = PatchConfig(mode="raw", pixel_param="direct", size=P, scale=P / H,
                       placement="center")
 
-    # ── the DISCRIMINATING check ────────────────────────────────────────────
-    # At step 1 the forward pass saw the patch BEFORE any update, and the patch
-    # is initialised to the image region, so the drift the history reports for
-    # step 1 must be EXACTLY zero. Under the off-by-one it is the drift after
-    # one update instead, which a large lr makes large. This is what makes the
-    # test non-vacuous: the end-to-end assertion below passes either way on a
-    # stub, because the post-loop best/final comparison overwrites the
-    # candidate when the drop is flat.
     patch0 = Patch(cfg, dev, m_t, s_t)
     prep = iap.prepare(model, img, patch0, mean_t=m_t, std_t=s_t, label=label,
                        cam=CamStub(model), score="cam", log=lambda *_: None)
@@ -1001,11 +726,9 @@ def test_best_drop_is_reproducible_from_the_saved_patch():
     patch = Patch(cfg, dev, m_t, s_t)
     rec = iap.attack_image(
         model, img, label, patch, mean_t=m_t, std_t=s_t, cam=CamStub(model),
-        num_classes=K, lrs=(0.5,), steps=40,        # lr*w3 = 1.5: unstable
+        num_classes=K, lrs=(0.5,), steps=40,
         w3=3.0, stop="none", log_every=4, verbose=False, log=lambda *_: None)
 
-    # attack_image leaves the WINNING BEST parameter in the patch, so
-    # recomputing the remote mIoU from it must reproduce best_drop_remote.
     with torch.no_grad():
         patched, fp = patch.apply(img)
         adv = upsample_to(model(patched), (H, W))
@@ -1017,24 +740,11 @@ def test_best_drop_is_reproducible_from_the_saved_patch():
         f"saved patch achieves {rec['clean_remote'] - remote:+.4f} — the "
         f"best parameter is off by one update from the drop it is credited "
         f"with")
-    # and final_remote, measured on that same patch, must agree with it
     assert rec["final_remote"] == pytest.approx(remote, abs=1e-4)
 
 
-# ═════════════════════════════════════════════════════════════════════════════
-#  ce_target — IAP's own objective, unweighted
-# ═════════════════════════════════════════════════════════════════════════════
-
 def test_ce_target_is_plain_cross_entropy_to_the_target():
-    r"""
-    IAP's adversarial half is `criterion = nn.CrossEntropyLoss()` used plainly:
-
-        1.5*criterion(pred, target) - criterion(pred, class_id) + 3*reg
-
-    So the faithful per-pixel port of the first term is an UNWEIGHTED CE toward
-    a constant target map. Held against torch's own cross_entropy so the
-    reduction and the sign are both pinned, not just the shape.
-    """
+    """IAP's adversarial half is `criterion = nn.CrossEntropyLoss()` used plainly"""
     import torch.nn.functional as F
 
     torch.manual_seed(12)
@@ -1046,16 +756,11 @@ def test_ce_target_is_plain_cross_entropy_to_the_target():
     target = torch.full((1, 6, 8), t, dtype=torch.long)
     want = F.cross_entropy(logits, target, reduction="mean")
     assert float(got) == pytest.approx(float(want), rel=1e-6)
-    # POSITIVE, i.e. minimised to attack — the same sign convention as
-    # ipatch_cospgd, and the opposite of ce_loss which returns -CE.
     assert float(got) > 0
 
 
 def test_ce_target_differs_from_the_cosine_weighted_version():
-    """
-    The two targeted objectives must not be interchangeable, or the arm that
-    measures what the cosine weight costs would measure nothing.
-    """
+    """The two targeted objectives must not be interchangeable, or the arm that measures what the cosine weight costs would measure nothing."""
     torch.manual_seed(13)
     logits = torch.randn(1, K, 6, 8) * 3
     fp = torch.zeros(1, 6, 8, dtype=torch.bool)
@@ -1065,10 +770,7 @@ def test_ce_target_differs_from_the_cosine_weighted_version():
 
 
 def test_ce_target_excludes_the_footprint_and_honours_support():
-    """
-    Same contract as ipatch_cospgd: without footprint exclusion the cheapest
-    minimiser of a targeted loss is to paint the PATCH in the target class.
-    """
+    """Same contract as ipatch_cospgd: without footprint exclusion the cheapest minimiser of a targeted loss is to paint the PATCH in the target class."""
     torch.manual_seed(14)
     logits = torch.randn(1, K, 6, 8)
     fp = torch.zeros(1, 6, 8, dtype=torch.bool)
@@ -1077,7 +779,6 @@ def test_ce_target_excludes_the_footprint_and_honours_support():
     without = float(adversarial.ce_target_loss(logits, 16, None, None))
     assert with_fp != pytest.approx(without)
 
-    # support intersects with the footprint exclusion rather than replacing it
     sup = torch.zeros(1, 6, 8, dtype=torch.bool)
     sup[:, 3:, :4] = True
     both = float(adversarial.ce_target_loss(logits, 16, fp, sup))
@@ -1102,12 +803,7 @@ def test_ce_target_is_reachable_through_build():
 
 
 def test_iap_defaults_to_iaps_own_objective():
-    r"""
-    THE DEFAULT IS THE FAITHFUL ONE. It was ipatch_cospgd first, which silently
-    substituted targeted CosPGD for IAP's plain CE — comparability bought at
-    the cost of the thing the arm exists to measure. Both are available and
-    every run records which it used; this pins which one you get for free.
-    """
+    """THE DEFAULT IS THE FAITHFUL ONE."""
     _scripts_on_path()
     import iap_attack as S
 
@@ -1119,10 +815,7 @@ def test_iap_defaults_to_iaps_own_objective():
 
 
 def test_the_targeted_arm_gets_its_own_directory():
-    """
-    The cosine-weighted arm and the faithful one are different measurements, so
-    they must not collide in results/iap. The faithful default stays unmarked.
-    """
+    """The cosine-weighted arm and the faithful one are different measurements, so they must not collide in results/iap."""
     _scripts_on_path()
     import iap_attack as S
 
@@ -1144,10 +837,7 @@ def test_the_targeted_arm_gets_its_own_directory():
 
 
 def test_the_three_iap_terms_decompose_with_the_faithful_objective():
-    """
-    With the defaults, the total must be IAP's own three terms:
-    w1*CE(pred,target) + w2*(-CE(pred,truth)) + w3*reg, no weighting.
-    """
+    """With the defaults, the total must be IAP's own three terms: w1*CE(pred,target) + w2*(-CE(pred,truth)) + w3*reg, no weighting."""
     logits, label, fp = _scene()
     sup = ~fp
     d = (torch.rand(3, 5, 5) + 0.1)

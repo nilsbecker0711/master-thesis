@@ -1,30 +1,4 @@
-r"""
-Architecture registry — one entry per CHECKPOINT, not per family.
-
-WHY PER-CHECKPOINT: mmseg needs a config that matches the exact variant.
-segformer_mit-b0_*.py will not build B5, and upernet_internimage_t_*.py will not
-build InternImage-L. Registry keys are therefore free-form (`segformer_b0`,
-`internimage_t`, ...) and `bracket` records which ERF class the entry belongs to
-so analysis can group them.
-
-RESOLUTION IS *NOT* PART OF THE CONFIG CHOICE. The numbers in an mmseg config
-name (512x1024, 1024x1024) are the TRAINING CROP. The config only builds the
-architecture; input size comes from the dataloader via --img_h/--img_w. One
-config per checkpoint covers every resolution in the transfer matrix.
-
-WHY VULNERABILITY TRACKS THE BRACKET — Yuan et al. (ACM MM 2024) Table 1:
-
-    no attention     (UPerNet/ConvNeXt)  tiny ERF   targeted attack mIoU  5.86
-    local attention  (SeMask/Swin)       mid  ERF   targeted attack mIoU 29.25
-    global attention (Segmenter/ViT)     huge ERF   targeted attack mIoU 74.57
-
-InternImage uses DCNv3 — deformable convolution, no global self-attention — so
-it sits in the small-ERF robust bracket. SegFormer's MiT backbone uses efficient
-self-attention => global ERF => vulnerable bracket. Switching arch isolates the
-GEOMETRIC factor while holding attack, data, patch size and budget constant.
-
-FILL THESE IN, or pass --cfg_path / --weights on every call.
-"""
+"""Architecture registry — one entry per CHECKPOINT, not per family."""
 from __future__ import annotations
 
 import sys
@@ -46,7 +20,7 @@ BRACKETS = {
 @dataclass
 class ArchSpec:
     name: str
-    bracket: str                      # none | local | global
+    bracket: str
     cfg: Optional[str] = None
     weights: Optional[str] = None
     note: str = ""
@@ -58,20 +32,11 @@ class ArchSpec:
 
 _W = "/pfs/work9/workspace/scratch/ma_nilbecke-thesis"
 _M = f"{_W}/checkpoints"
-#/pfs/work9/workspace/scratch/ma_nilbecke-thesis/master-thesis
 
-# Configs that are SOURCE, not a download. Every entry above takes its config
-# from _M, because the mmseg zoo ships one next to each checkpoint. PIDNet's
-# does not work here — the zoo config is mmseg 1.x — so configs/mmseg/*.py are
-# hand-written 0.x configs that declare patchreach's own PIDNet/PIDHead. They
-# are version-controlled with the code that implements them and resolved
-# relative to this file, so a fresh clone runs without copying anything into
-# the workspace. Only the .pth still has to be downloaded into _M.
 _CFG = Path(__file__).resolve().parents[2] / "configs" / "mmseg"
 
 REGISTRY = {
 
-    # ── DCNv3, no global attention ───────────────────────────────────────────
     "internimage_t": ArchSpec(
         "internimage_t", "none",
         cfg=f"{_M}/upernet_internimage_t_512x1024_160k_cityscapes.py",
@@ -81,7 +46,6 @@ REGISTRY = {
     "internimage_l": ArchSpec("internimage_l", "none"),
     "internimage_xl": ArchSpec("internimage_xl", "none"),
 
-    # ── MiT efficient self-attention ─────────────────────────────────────────
     "segformer_b0": ArchSpec(
         "segformer_b0", "global",
         cfg=f"{_M}/segformer_mit-b0_8x1_1024x1024_160k_cityscapes.py",
@@ -124,18 +88,6 @@ REGISTRY = {
         note="Dilated ResNet-18, BasicBlock, 512-channel output — the head "
             "dims differ from r50/r101, so this is not a pure depth ablation."),
 
-    # ── PIDNet: three-branch CNN, no attention ───────────────────────────────
-    # The only entries whose cfg comes from the REPO rather than from _M: the
-    # mmseg zoo config is 1.x-only, so configs/mmseg/pidnet_*.py are 0.x
-    # configs declaring patchreach/models/pidnet.py's vendored PIDNet/PIDHead.
-    # Weights are the unmodified zoo checkpoints; the download URLs are in each
-    # config's docstring.
-    #
-    # ENTRY STRIDE 2 — the gap in the lineup, between UNet's 1 and the three
-    # DeepLabs' 8, with setr_pup at 16. Output stride is 8, like DeepLab's.
-    # Clean mIoU 78.74 / 80.22 / 80.89 is the top of the no-attention bracket
-    # (every DeepLab and UNet is below it, segformer_b5's ~82 above), so a
-    # robustness result here cannot be waved away as a weak model.
     "pidnet_s": ArchSpec("pidnet_s", "none",
         cfg=str(_CFG / "pidnet_s.py"),
         weights=f"{_M}/pidnet-s_2xb6-120k_1024x1024-cityscapes_20230302_191700-bb8e3bcc.pth",
@@ -157,11 +109,6 @@ REGISTRY = {
              "wider M: num_stem_blocks=3 swaps PAPPM/LightBag for DAPPM/Bag."),
 }
 
-    # ── Swin windowed attention ──────────────────────────────────────────────
-    # Stock-mmseg alternative for the no-attention bracket — needs no custom
-    # ops. Yuan et al. Table 1 used exactly UPerNet/ConvNeXt for this row
-    # (targeted attack mIoU 5.86, their most robust model), so it is arguably
-    # the more faithful comparison point anyway.
 '''
     "convnext_t": ArchSpec(
         "convnext_t", "none",
@@ -176,28 +123,18 @@ REGISTRY = {
              "dataset-independent — so the three-bracket ERF comparison is "
              "possible even without Cityscapes training."),
 '''
-#}
 
-# Convenience aliases so short names keep working.
 REGISTRY["internimage"] = REGISTRY["internimage_t"]
 REGISTRY["segformer"] = REGISTRY["segformer_b0"]
-#REGISTRY["swin"] = REGISTRY["swin_t"]
 REGISTRY["unet"] = REGISTRY["unet_s5d16"]
-#REGISTRY["ocrnet"] = REGISTRY["ocrnet_hr48"]
-# No "ocrnet" alias: OCRNet was dropped from the lineup and its ArchSpec went
-# with it. The alias outlived the entry and raised KeyError at IMPORT time,
-# which took every script down with it — REGISTRY is imported by _common.
 REGISTRY["deeplab_101"] = REGISTRY["deeplabv3plus_r101"]
 REGISTRY["deeplab_50"] = REGISTRY["deeplabv3plus_r50"]
 REGISTRY["deeplab_18"] = REGISTRY["deeplabv3plus_r18"]
-# pidnet -> L, NOT the smallest variant: 80.89 is the number Maag & Fischer
-# Table 1 print as "PIDNet", and the short name should mean the same model the
-# protocol citation in docs/experiment_log.md leans on.
 REGISTRY["pidnet"] = REGISTRY["pidnet_l"]
 
 
 def resolve(name: str, cfg_override=None, weights_override=None):
-    """(cfg, weights, spec) with CLI overrides applied. Raises if unresolved."""
+    """(cfg, weights, spec) with CLI overrides applied."""
     if name not in REGISTRY:
         raise KeyError(f"unknown arch {name!r}. Known: "
                        f"{sorted(k for k in REGISTRY)}")
@@ -218,18 +155,13 @@ class _StubLoader(Loader):
 
     def create_module(self, spec):
         mod = types.ModuleType(spec.name)
-        mod.__path__ = []                  # so `mmengine.logging.x` resolves
+        mod.__path__ = []
         return mod
 
     def exec_module(self, module):
-        def __getattr__(name):             # PEP 562 module-level __getattr__
+        def __getattr__(name):
             if name.startswith("__"):
                 raise AttributeError(name)
-            # __module__ must name the STUB module, not this one. type()
-            # otherwise stamps the class with wherever the call site lives
-            # (patchreach.models.registry), where pickle cannot find it again
-            # -- harmless for a one-way unpickle, but it makes the synthesized
-            # classes unpicklable and the reprs lie about where they came from.
             cls = type(name, (dict,), {"__module__": module.__name__})
             setattr(module, name, cls)
             return cls
@@ -245,34 +177,7 @@ class _StubFinder(MetaPathFinder):
 
 @contextmanager
 def _mmengine_stub():
-    r"""
-    Let torch.load unpickle an mmseg **1.x** checkpoint inside an mmseg 0.x
-    environment, by standing in a fake `mmengine` package for the duration.
-
-    WHY THIS IS NEEDED. A checkpoint is a pickle of `{'state_dict': ...,
-    'meta': ...}`, and torch.load unpickles the WHOLE file -- meta included --
-    before mmcv ever looks at the weights. mmseg 1.x writes its meta through
-    mmengine, so the stream carries `mmengine.config.config.ConfigDict` and
-    `mmengine.logging.history_buffer.HistoryBuffer` instances. In this
-    project's env (mmcv 1.x + mmseg 0.x) there is no mmengine, so the load
-    dies with `ModuleNotFoundError: No module named 'mmengine'` -- AFTER
-    printing "load checkpoint from local path", which makes it look like a
-    corrupt file rather than a version artifact. The PIDNet zoo checkpoints
-    are 1.x-era and hit this; every other arch in the registry predates
-    mmengine and never touches this path.
-
-    THE WEIGHTS ARE UNAFFECTED. Tensors unpickle through torch's own
-    persistent-load machinery and know nothing about mmengine; only the meta's
-    bookkeeping objects need a class to land in, and they become plain dicts.
-    That costs the `meta['CLASSES']`/`meta['PALETTE']` convenience attributes,
-    which 1.x checkpoints do not carry under those names anyway (it is
-    `dataset_meta` there, mapped below) and which nothing in this repo reads
-    -- every palette and class name comes from patchreach.data.cityscapes.
-
-    SCOPED, so a real mmengine (if one is ever installed beside us) is not
-    shadowed: the finder is removed and every module it created is dropped
-    from sys.modules on the way out.
-    """
+    """Let torch.load unpickle an mmseg **1.x** checkpoint inside an mmseg 0.x environment, by standing in a fake `mmengine` package for the duration."""
     finder = _StubFinder()
     sys.meta_path.insert(0, finder)
     try:
@@ -290,22 +195,12 @@ def _mmengine_stub():
 
 
 def _is_mmengine_missing(exc: ModuleNotFoundError) -> bool:
-    """
-    Is this the 1.x-meta pickle failure, or a genuinely absent dependency?
-
-    Gated on the EXCEPTION, not on the arch: what decides it is which mmseg
-    WROTE the file, and --weights can point anywhere. Anything that is not
-    mmengine -- a missing mmseg_custom, a missing ops_dcnv3 -- is a real
-    install problem and must keep propagating.
-    """
+    """Is this the 1.x-meta pickle failure, or a genuinely absent dependency?"""
     return str(getattr(exc, "name", "") or "").split(".")[0] == "mmengine"
 
 
 def _load_weights(model, weights_path: str):
-    """
-    mmcv's load_checkpoint, retried under the mmengine stub if the pickle
-    needs it. Returns the checkpoint dict.
-    """
+    """mmcv's load_checkpoint, retried under the mmengine stub if the pickle needs it."""
     from mmcv.runner import load_checkpoint
 
     try:
@@ -320,15 +215,7 @@ def _load_weights(model, weights_path: str):
 
 
 def load_segmentor(cfg_path: str, weights_path: str):
-    """
-    Build + load any mmseg EncoderDecoder. Returns (model, backbone_type).
-
-    Custom backbones are registered from what the CONFIG declares, NOT from a
-    command-line flag. Gating on a flag lets --arch and --cfg_path drift apart
-    and produces an opaque "InternImage is not in the models registry" KeyError
-    three frames deep. A file named segformer_*.py can still declare
-    type='InternImage' — that has happened in this project.
-    """
+    """Build + load any mmseg EncoderDecoder."""
     from mmcv import Config
     from mmcv.runner import wrap_fp16_model
     from mmseg.models import build_segmentor
@@ -337,8 +224,6 @@ def load_segmentor(cfg_path: str, weights_path: str):
     backbone = cfg.model.get("backbone", {}).get("type", "<unknown>")
     head = cfg.model.get("decode_head", {}).get("type", "<unknown>")
 
-    # Custom backbones are registered ONLY when the config asks for them, so a
-    # repo without mmseg_custom / DCNv3 runs SegFormer and Swin perfectly well.
     if backbone == "InternImage":
         try:
             import mmseg_custom.models.backbones.intern_image   # noqa: F401
@@ -358,11 +243,6 @@ def load_segmentor(cfg_path: str, weights_path: str):
                 f"    All three give a valid ERF comparison without DCNv3."
             ) from e
 
-    # Same gate, vendored in-tree rather than out: the import REGISTERS PIDNet
-    # and PIDHead into mmseg's BACKBONES/HEADS, and mmseg 0.x has neither.
-    # Needs no custom CUDA op, so unlike InternImage it cannot fail for a
-    # missing build — only for a missing mmseg, which build_segmentor needs
-    # anyway.
     if backbone == "PIDNet":
         import patchreach.models.pidnet            # noqa: F401
 
@@ -378,10 +258,6 @@ def load_segmentor(cfg_path: str, weights_path: str):
     for k in ("CLASSES", "PALETTE"):
         if k in meta:
             setattr(model, k, meta[k])
-    # mmseg 1.x spells the same thing `dataset_meta={'classes':..,'palette':..}`.
-    # Carried over so the attributes mean the same for a 1.x-era checkpoint;
-    # the stub may have flattened dataset_meta to a plain dict, hence the
-    # defensive .get rather than attribute access.
     ds = meta.get("dataset_meta") or {}
     if isinstance(ds, dict):
         if not hasattr(model, "CLASSES") and ds.get("classes"):

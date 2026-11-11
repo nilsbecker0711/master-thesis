@@ -1,49 +1,5 @@
 #!/usr/bin/env python
-r"""
-Test-time use of a trained generator: export p_i for arbitrary images, and
-evaluate the attack. NO TRAINING, and NO GRADIENT-BASED OPTIMISATION OF p_i.
-
-    python scripts/export_conditional_patches.py \
-        --checkpoint results/conditional/<run_id>/checkpoints/best.pt \
-        --arch segformer --cityscapes_root $CS --images fixed10
-
-TEST-TIME BEHAVIOUR — THE DISTINCTION THAT DEFINES THIS THREAT MODEL
---------------------------------------------------------------------
-    1. load frozen G_theta*            (eval(), no_grad, deterministic noise)
-    2. take a previously unseen image  (--split val, or any index)
-    3. compute its sensitivity map     M_i
-    4. extract its centre crop         r_i
-    5. generate its patch              p_i = G_theta*(x_i, r_i, M_i)
-    6. place the patch                 argmax MeanPool(M_i) or centre
-    7. evaluate segmentation
-
-        x_test -> G_theta* -> p_test
-
-There is no optimiser in this file. Contrast with scripts/overfit.py, which
-RUNS gradient descent on a patch tensor for a single image — that is BASELINE
-B, an approximate upper bound on direct optimisation, and it is a different
-procedure with a different cost. Comparing the two is the point; conflating
-them is not.
-
-BASELINES
----------
-  A  --method reference   p_i = r_i, the raw centre crop, no generator.
-                          Identical placement and compositing, so the delta is
-                          attributable to G_theta alone.
-  B  scripts/overfit.py, e.g.
-
-         python scripts/overfit.py --arch segformer --cityscapes_root $CS \
-             --patch_mode raw --loss_fn cospgd --image 2 --steps 300 \
-             --patch_scale 0.25 --patch_size 128
-
-     Match --patch_scale/--patch_size to the generator run or the comparison
-     is confounded by patch AREA, which Yuan et al. Table 6 shows dominates
-     attack strength.
-  C  --method generator   this file's default — the proposed attack.
-
-Optional ablation: --gen_placement center isolates the contribution of
-sensitivity-guided localisation from the contribution of the generator.
-"""
+"""Test-time use of a trained generator: export p_i for arbitrary images, and evaluate the attack."""
 from __future__ import annotations
 
 import argparse
@@ -89,8 +45,6 @@ def build_parser():
                    help="defaults to the value stored in the checkpoint")
     p.add_argument("--target_class", type=int, default=None)
 
-    # Geometry / placement / CAM default to the checkpoint's training values;
-    # overriding one is how the placement ablation is run WITHOUT retraining.
     p.add_argument("--patch_scale", type=float, default=None)
     p.add_argument("--gen_placement", default=None,
                    choices=["center", "gradcam", "semantic", "fixed"],
@@ -127,7 +81,6 @@ def main():
     seed_everything(a.seed)
     device = get_device()
 
-    # ── the trained generator + the configuration it was trained under ──────
     generator, ck, tcfg = None, {}, {}
     if a.method == "generator":
         if not a.checkpoint:
@@ -140,7 +93,7 @@ def main():
               f"{generator.n_parameters():,} shared parameters")
         generator.cfg.describe()
         for q in generator.parameters():
-            q.requires_grad_(False)          # belt and braces: frozen at test
+            q.requires_grad_(False)
     else:
         geom = {}
         print("\n[base] BASELINE A — p_i = r_i, no generator")
@@ -176,11 +129,6 @@ def main():
 
     adv_loss = adversarial.build(
         loss_fn, target_class if loss_fn == "ipatch_cospgd" else 8)
-    # tsallis q comes from the TRAINING config, not from this CLI. There is
-    # no optimisation here -- the objective only feeds the sensitivity map --
-    # so the right q is the one the generator was trained under. Overriding
-    # it would be a transfer measurement and would have to be declared as
-    # one, the way placement and reference overrides are above.
     tsl = tsallis_kwargs(tcfg)
     if loss_fn == "tsallis":
         adv_loss = adversarial.build(loss_fn, 8, **tsl)
@@ -233,7 +181,6 @@ def main():
         label = label.unsqueeze(0).to(device)
         hw = label.shape[-2:]
 
-        # THE ENTIRE TEST-TIME ATTACK: one forward pass. No optimiser, no loop.
         with torch.no_grad():
             out = attack(img, label, deterministic_noise=True)
             lc = upsample_to(out["clean_logits"], hw)
@@ -291,7 +238,6 @@ def main():
                 out["patch_side"], mean_t, std_t, d,
                 title=f"{a.split} image {i}  method={a.method}")
 
-    # ── aggregate ───────────────────────────────────────────────────────────
     agg = {k: v.compute() for k, v in m.items()}
     agg["drop_remote_dataset"] = agg["clean_rem"] - agg["adv_rem"]
     agg["drop_all_dataset"] = agg["clean_all"] - agg["adv_all"]

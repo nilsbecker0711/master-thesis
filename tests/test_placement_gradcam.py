@@ -1,14 +1,4 @@
-r"""
-Invariants for --placement gradcam on the per-image path, and for the paired
-comparison that makes it a result rather than two numbers.
-
-The failure this file is mostly written against is SILENT CENTRING: a gradcam
-run that quietly falls back to the image centre still produces a plausible
-drop_remote, still writes a config.json saying placement=gradcam, and is
-indistinguishable from a real one in every artefact the run emits.
-
-Run with: pytest -q tests/test_placement_gradcam.py
-"""
+"""Invariants for --placement gradcam on the per-image path, and for the paired comparison that makes it a result rather than two numbers."""
 import pytest
 
 torch = pytest.importorskip("torch")
@@ -30,10 +20,6 @@ def _hotspot_map(H, W, top, left, p, peak=1.0):
     return m
 
 
-# ═════════════════════════════════════════════════════════════════════════════
-#  The policy
-# ═════════════════════════════════════════════════════════════════════════════
-
 def test_gradcam_finds_the_hotspot():
     H, W, p = 64, 128, 16
     m = _hotspot_map(H, W, 8, 40, p)
@@ -41,19 +27,13 @@ def test_gradcam_finds_the_hotspot():
 
 
 def test_gradcam_without_a_map_raises_instead_of_centring():
-    """
-    THE LOAD-BEARING TEST. Falling back to centre would report a gradcam run
-    that never ran — a plausible number for a policy that was not applied, and
-    invisible in every artefact.
-    """
+    """THE LOAD-BEARING TEST."""
     with pytest.raises(ValueError, match="needs the sensitivity map"):
         pl.resolve("gradcam", 64, 128, 16)
 
 
 def test_gradcam_on_a_constant_map_centres_explicitly():
-    """A fully-suppressed CAM carries no localisation information. argmax over
-    a constant map returns index 0 — the top-left corner — which reads as a
-    deliberate placement and is not."""
+    """A fully-suppressed CAM carries no localisation information. argmax over a constant map returns index 0 — the top-left corner — which reads as a deliberate placement and is not."""
     H, W, p = 64, 128, 16
     flat = torch.full((H, W), 0.5)
     assert pl.resolve("gradcam", H, W, p, score_map=flat) == \
@@ -61,14 +41,9 @@ def test_gradcam_on_a_constant_map_centres_explicitly():
 
 
 def test_margin_keeps_the_window_off_the_border():
-    """
-    placement.py records the measured failure: the hottest ridge in a dashcam
-    frame is the near-field road boundary along the BOTTOM, so the argmax pins
-    the patch flush against the edge, where ~half its receptive field lies
-    outside the image and can never be influenced.
-    """
+    """placement.py records the measured failure: the hottest ridge in a dashcam frame is the near-field road boundary along the BOTTOM, so the argmax pins the patch flush against the edge, where ~half its receptive field lies outside the image and can never be influenced."""
     H, W, p = 64, 128, 16
-    m = _hotspot_map(H, W, H - p, 0, p)            # hottest at the very corner
+    m = _hotspot_map(H, W, H - p, 0, p)
     assert pl.resolve("gradcam", H, W, p, score_map=m) == (H - p, 0)
 
     top, left = pl.resolve("gradcam", H, W, p, score_map=m, margin=8)
@@ -76,20 +51,14 @@ def test_margin_keeps_the_window_off_the_border():
 
 
 def test_margin_degrades_rather_than_raising_when_it_cannot_fit():
-    H, W, p = 40, 40, 32                            # only 8px of slack
+    H, W, p = 40, 40, 32
     m = _hotspot_map(H, W, 0, 0, p)
     top, left = pl.resolve("gradcam", H, W, p, score_map=m, margin=999)
     assert 0 <= top <= H - p and 0 <= left <= W - p
 
 
 def test_gradcam_matches_the_generators_batch_policy_exactly():
-    r"""
-    ANTI-DRIFT. The per-image ablation and the generator's ablation A-vs-B are
-    only comparable if both mean the same thing by 'gradcam'. Two
-    implementations of the same argmax would drift, and the drift would read
-    as a result: the generator's localisation gain would stop matching
-    baseline B's for no stated reason.
-    """
+    """ANTI-DRIFT."""
     H, W, p = 64, 128, 16
     g = torch.Generator().manual_seed(0)
     for margin in (0, 8):
@@ -103,8 +72,7 @@ def test_gradcam_matches_the_generators_batch_policy_exactly():
 
 @pytest.mark.parametrize("policy", ["center", "fixed", "semantic"])
 def test_existing_policies_are_byte_identical_with_the_new_arguments(policy):
-    """gradcam must be an ADDITION. Every pre-existing run has to resolve to
-    exactly the same corner it did before."""
+    """gradcam must be an ADDITION."""
     H, W, p = 64, 128, 16
     pred = torch.zeros(H, W, dtype=torch.long)
     pred[30:50, 20:60] = 3
@@ -113,10 +81,6 @@ def test_existing_policies_are_byte_identical_with_the_new_arguments(policy):
                    score_map=torch.rand(H, W), margin=16)
     assert a == b
 
-
-# ═════════════════════════════════════════════════════════════════════════════
-#  Wiring through Patch and prepare()
-# ═════════════════════════════════════════════════════════════════════════════
 
 class _TinySeg(nn.Module):
     """Frozen stand-in exposing `backbone` as SegmentationCAM expects."""
@@ -199,11 +163,7 @@ def test_prepare_with_a_cam_places_off_centre_and_returns_clean_logits():
 
 
 def test_record_carries_where_the_patch_actually_went():
-    """
-    Under gradcam the placement varies per image, so a population run cannot be
-    interpreted without it: a drop measured at the centre and one measured at a
-    near-field hotspot are not the same measurement.
-    """
+    """Under gradcam the placement varies per image, so a population run cannot be interpreted without it: a drop measured at the centre and one measured at a near-field hotspot are not the same measurement."""
     torch.manual_seed(0)
     model = _TinySeg()
     img = (torch.rand(1, 3, 64, 64) - MEAN) / STD
@@ -220,20 +180,12 @@ def test_record_carries_where_the_patch_actually_went():
     assert rec["placement_on_border"] is False
 
 
-# ═════════════════════════════════════════════════════════════════════════════
-#  Paired comparison
-# ═════════════════════════════════════════════════════════════════════════════
-
 def _recs(vals, start=0):
     return [{"image": i + start, "drop_remote": v} for i, v in enumerate(vals)]
 
 
 def test_paired_detects_a_consistent_shift_that_unpaired_would_miss():
-    r"""
-    THE REASON PAIRED EXISTS. Scene variance is huge (0..40) and the effect is
-    small (+2 everywhere). The paired difference cancels the scene and resolves
-    it; comparing the two means against their own spreads would not.
-    """
+    """THE REASON PAIRED EXISTS."""
     scenes = [0.0, 5.0, 12.0, 21.0, 33.0, 40.0, 8.0, 17.0, 26.0, 3.0]
     a = _recs(scenes)
     b = _recs([s + 2.0 for s in scenes])
@@ -242,7 +194,6 @@ def test_paired_detects_a_consistent_shift_that_unpaired_would_miss():
     assert out["difference"]["mean"] == pytest.approx(2.0)
     assert out["conclusive"] is True
     assert out["n_better"] == len(scenes)
-    # the unpaired spread is an order of magnitude larger than the effect
     assert P.describe(scenes)["std"] > 5 * out["difference"]["std"] + 1
 
 
@@ -255,8 +206,8 @@ def test_paired_refuses_a_verdict_when_the_ci_spans_zero():
 
 def test_paired_intersects_on_image_index():
     """Both arms must have run the SAME images; anything else is not paired."""
-    a = _recs([1.0, 2.0, 3.0], start=0)          # images 0,1,2
-    b = _recs([2.0, 3.0, 4.0], start=1)          # images 1,2,3
+    a = _recs([1.0, 2.0, 3.0], start=0)
+    b = _recs([2.0, 3.0, 4.0], start=1)
     out = P.paired_compare(a, b, log=lambda *x, **k: None)
     assert out["n"] == 2
     assert out["images"] == [1, 2]

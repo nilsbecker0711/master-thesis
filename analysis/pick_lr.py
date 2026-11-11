@@ -1,41 +1,5 @@
 #!/usr/bin/env python
-r"""
-Choose a learning rate from a set of tuning runs — unattended.
-
-    python analysis/pick_lr.py results/tune/*csf*        # -> prints e.g. 0.2
-
-WHY THIS IS NOT `argmax drop_remote`
-------------------------------------
-For a CONSTRAINED attack, the strongest run is not automatically the best one.
-A larger learning rate drives the residual harder against the [0,1] boundary,
-the final clamp injects broadband harmonics, and REALISED visibility rises
-above the tau that was requested. Selecting on drop_remote alone therefore
-rewards whichever learning rate breaks the perceptual constraint hardest, and
-calls it better optimisation.
-
-Measured on this project: at lr 0.01 realised visibility sat exactly on tau,
-while at lr 0.5 the locally-calibrated visibility reached 1.03 JND — past the
-detection threshold the whole family is defined against.
-
-So the rule is:
-
-    among runs whose realised visibility is at or below `--ceiling`,
-    take the one with the best mean `--metric`.
-
-That compares learning rates AT EQUAL PERCEPTUAL COST, which is the same
-control the frequency probe applies across bands and for the same reason.
-
-If no run qualifies, nothing is silently returned: the script says so on
-stderr, falls back to the least-visible run, and exits non-zero so a caller
-can react.
-
-UNCONSTRAINED MODES (raw, lap, gan) have no visibility statistic. There the
-ceiling cannot bind and the rule degenerates to plain argmax, which is correct
-for them — declared here rather than left implicit.
-
-OUTPUT CONTRACT: the chosen learning rate, and nothing else, on STDOUT, so a
-shell can capture it. Everything human-readable goes to STDERR.
-"""
+"""Choose a learning rate from a set of tuning runs — unattended."""
 from __future__ import annotations
 
 import argparse
@@ -44,45 +8,24 @@ import sys
 from pathlib import Path
 from statistics import mean
 
-# Preference order: the locally-calibrated number is the honest one, but it
-# only exists if the run recorded it.
 VISIBILITY_KEYS = ("final_visibility_local", "final_visibility")
 
 
 def _read(run_dir: Path):
-    r"""
-    (config, records) from any of the THREE layouts that produce tuning runs.
-
-    This existed for overfit_population.py only, and silently skipped every
-    other producer -- the "no summary.json / no records" branch fired on all of
-    them. overfit.py's own docstring says "analysis/pick_lr.py globs for them",
-    which was not true of either of its layouts:
-
-      population    summary.json {config, records}          <- the original
-      overfit n=1   results.json {config, seed, **record}   <- no summary at all
-      overfit n>1   summary.json {n_seeds, per_seed, stats} <- no config key,
-                                                                no records key
-
-    Normalising here rather than at three call sites keeps ONE selection rule.
-    The rule is the whole point of the script: picking at equal perceptual cost
-    rather than argmax, and a second reader would be a second place for that to
-    drift.
-    """
+    """(config, records) from any of the THREE layouts that produce tuning runs."""
     s = run_dir / "summary.json"
     if s.exists():
         d = json.loads(s.read_text())
-        if d.get("records"):                       # population
+        if d.get("records"):
             return d.get("config", {}), d["records"]
-        if d.get("per_seed"):                      # overfit, repeated
-            # The seed rows carry the metrics but no config -- that lives in
-            # each repeat's own results.json, so take it from the first one.
+        if d.get("per_seed"):
             cfg = {}
             for sub in sorted(run_dir.glob("seed*/results.json")):
                 cfg = json.loads(sub.read_text()).get("config", {})
                 break
             return cfg, d["per_seed"]
         return None
-    r = run_dir / "results.json"                   # overfit, single seed
+    r = run_dir / "results.json"
     if r.exists():
         d = json.loads(r.read_text())
         return d.get("config", {}), [d]
@@ -109,15 +52,7 @@ def load(run_dir: Path):
 
 
 def _write(out, best, rows, eligible, a, *, edge: bool, fell_back: bool):
-    """
-    Persist the decision. No-op without --out, so the stdout contract is
-    unchanged for anything already capturing it.
-
-    The chosen lr otherwise exists ONLY on stdout, which means the number
-    behind a headline result survives as terminal scrollback and nothing else.
-    The candidate table goes in too, so the choice can be audited later without
-    re-running the sweep.
-    """
+    """Persist the decision."""
     if out is None:
         return
     out = Path(out)
@@ -131,11 +66,7 @@ def _write(out, best, rows, eligible, a, *, edge: bool, fell_back: bool):
         "score": best.get("score"),
         "visibility": best["visibility"],
         "visibility_key": best["vis_key"],
-        # True means the grid stopped at the answer, so the answer IS the grid.
         "at_grid_edge": edge,
-        # True means NOTHING met the ceiling and this is the least-visible run
-        # rather than the best one. A caller that ignores this is quoting a
-        # fallback as if it were a choice.
         "fell_back_to_least_visible": fell_back,
         "n_eligible": len(eligible),
         "candidates": [{"lr": r["lr"], "score": r.get("score"),
@@ -217,9 +148,6 @@ def main():
           f"visibility {vis})  from {len(eligible)}/{len(rows)} eligible",
           file=sys.stderr)
 
-    # AT AN EDGE OF THE GRID the answer is where the grid stopped, not an
-    # optimum, and the two are indistinguishable from the chosen number alone.
-    # Said here because this is the last place anyone looks before quoting it.
     edge = len(rows) > 1 and best["lr"] in (rows[0]["lr"], rows[-1]["lr"])
     if edge:
         which = "LOWEST" if best["lr"] == rows[0]["lr"] else "HIGHEST"
